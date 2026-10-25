@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +130,30 @@ func TestTapGuardDoltStart_OnlyInAgentContext(t *testing.T) {
 
 // Unclosed "$( runs make the quote scanner backtrack exponentially. The guard
 // must still return within its budget, and let the command run.
+// The opencode plugin strips the shared service's session identity (GT_ROLE,
+// GT_RIG, ...) before running gt, and the deacon and dogs live at <town>/deacon
+// and <town>/deacon/dogs/<name>, which the path fallback does not cover. The
+// plugin keeps GT_TOWN_ROOT so the guard still knows it is in an agent session.
+func TestTapGuardDoltStart_OpenCodeScrubbedEnv(t *testing.T) {
+	for _, v := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS", "GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
+		t.Setenv(v, "")
+	}
+	town := t.TempDir()
+	deacon := filepath.Join(town, "deacon")
+	if err := os.MkdirAll(deacon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(deacon)
+	t.Setenv("GT_ROOT", town)
+	if isGasTownAgentContext() {
+		t.Fatal("GT_ROOT alone must not mark agent context; the plugin relies on GT_TOWN_ROOT for that")
+	}
+	t.Setenv("GT_TOWN_ROOT", town)
+	if !isGasTownAgentContext() {
+		t.Fatal("GT_TOWN_ROOT from a deacon-shaped cwd must mark agent context, or the plugin's guard call is a no-op")
+	}
+}
+
 func TestTapGuardDoltStart_FailsOpenWhenMatcherIsSlow(t *testing.T) {
 	for _, v := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS", "GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
 		t.Setenv(v, "")

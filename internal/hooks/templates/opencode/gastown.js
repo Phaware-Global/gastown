@@ -15,9 +15,11 @@ export default {
     const gtBin = process.env.GT_BIN || "{{GT_BIN}}";
     const townRoot = process.env.GT_ROOT || "";
 
-    // Promise-based context loading ensures the context hook can await the
-    // result even when several requests race at session start.
-    let primePromise = null;
+    // gt prime output per session (sessionID -> Promise<string>). One slot per
+    // session, not per location: the service outlives any one session, and a
+    // later session at this location must run its own prime (handoff marker,
+    // session ID, hook state). Replaced on compaction, dropped on deletion.
+    const primes = new Map();
     // Sessions this location has served, so the server-wide event stream only
     // triggers work for our own sessions.
     const ownSessions = new Set();
@@ -61,15 +63,26 @@ export default {
     // identity of whichever session started it (GT_ROLE, BD_ACTOR, ...).
     // Drop those so gt derives the role from the working directory, as it
     // does for a session with no GT_ROLE; town-level settings stay.
+    // The list follows config.IdentityEnvVars plus the session ID variables
+    // gt prime falls back to.
     const sessionScopedEnv =
-      /^(GT_(ROLE|RIG|SESSION|SESSION_ID|AGENT|AGENT_READY|REVIEWER|REVIEWER_GITHUB_TOKEN|RUN|POLECAT|HOOK_SOURCE|WORK_[A-Z_]+)|BD_ACTOR|GIT_AUTHOR_NAME|GIT_COMMITTER_NAME)$/;
+      /^(GT_(ROLE|RIG|CREW|DOG_NAME|SESSION|SESSION_ID|SESSION_ID_ENV|AGENT|AGENT_READY|REVIEWER|REVIEWER_GITHUB_TOKEN|RUN|POLECAT|HOOK_SOURCE|WORK_[A-Z_]+)|BD_ACTOR|BEADS_AGENT_NAME|CLAUDE_SESSION_ID|GIT_AUTHOR_NAME|GIT_COMMITTER_NAME)$/;
+    // GT_TOWN_ROOT is town-level, so it survives the scrub: it is how gt's
+    // guards (tap guard dolt-start) know they run for an agent once GT_ROLE
+    // is gone, since deacon/ and deacon/dogs/ are not on their path fallback.
     const childEnv = () => {
       const env = {};
       for (const [key, value] of Object.entries(process.env)) {
         if (!sessionScopedEnv.test(key)) env[key] = value;
       }
+      if (townRoot) env.GT_TOWN_ROOT = townRoot;
       return env;
     };
+    if (!townRoot) {
+      console.error(
+        `[gastown] GT_ROOT is not set for ${directory}: gt cannot tell this is an agent session, so the dolt-start guard will allow 'bd dolt start'`
+      );
+    }
 
     // Runs cmd through /bin/sh in this location's directory. Resolves to stdout;
     // rejects with the error carrying stdout/stderr tails and the exit code.
@@ -78,7 +91,8 @@ export default {
         execFile(
           "/bin/sh",
           ["-lc", cmd],
-          { cwd: directory, env: childEnv(), maxBuffer: 64 * 1024 * 1024 },
+          // A wedged gt (Dolt write path) must not hang a hook or the event loop.
+          { cwd: directory, env: childEnv(), maxBuffer: 64 * 1024 * 1024, timeout: 120 * 1000 },
           (err, stdout, stderr) => {
             if (err) {
               err.stdout = stdout;
@@ -138,6 +152,7 @@ export default {
       const parts = value.split("/").filter(Boolean);
       if (parts.length >= 2 && parts[1] === "polecats") return "polecat";
       if (parts.length >= 2 && parts[1] === "crew") return "crew";
+      if (parts[0] === "deacon" && parts[1] === "dogs") return parts[2] === "boot" ? "boot" : "dog";
       if (parts[0] === "mayor" || parts[0] === "deacon" || parts[0] === "assistant") return parts[0];
       if (parts.length >= 2) return parts[1];
       return parts[0];
@@ -201,16 +216,22 @@ export default {
 
     await ctx.session.hook("context", async (event) => {
       const sessionID = event?.sessionID || "";
-      if (sessionID) ownSessions.add(sessionID);
-      if (!primePromise) {
-        primePromise = loadPrime("startup", sessionID);
+      if (!sessionID) {
+        // Nothing to key the cache on: prime for this request only.
+        const context = await loadPrime("startup");
+        if (context) event.system.push({ type: "text", text: context });
+        return;
       }
-      const context = await primePromise;
+      ownSessions.add(sessionID);
+      if (!primes.has(sessionID)) {
+        primes.set(sessionID, loadPrime("startup", sessionID));
+      }
+      const context = await primes.get(sessionID);
       if (context) {
         event.system.push({ type: "text", text: context });
       } else {
-        // Reset so the next request retries instead of pushing empty forever.
-        primePromise = null;
+        // Drop the entry so the next request retries instead of pushing empty forever.
+        primes.delete(sessionID);
       }
     });
 
@@ -231,24 +252,40 @@ Keep these instructions in the summary, verbatim:
     });
 
     // The event stream is server-wide; act only on sessions this location served.
+    // Side effects are not awaited inside the loop: a hung gt would otherwise
+    // stop every later event (compaction resets, deletions) for this location.
+    // A stream that ends or fails is resubscribed with backoff until cleanup.
     const controller = new AbortController();
+    const sleep = (ms) =>
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        controller.signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+      });
     (async () => {
-      try {
-        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          const sessionID = eventSessionID(event);
-          if (!sessionID || !ownSessions.has(sessionID)) continue;
-          if (event?.type === "session.compacted") {
-            // Reset so the next context hook gets fresh context.
-            primePromise = loadPrime("compact", sessionID);
-          } else if (event?.type === "session.deleted") {
-            ownSessions.delete(sessionID);
-            await captureRun(`${gtCommand()} costs record --session ${shellQuote(sessionID)}`);
+      let delay = 1000;
+      while (!controller.signal.aborted) {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+            delay = 1000;
+            const sessionID = eventSessionID(event);
+            if (!sessionID || !ownSessions.has(sessionID)) continue;
+            if (event?.type === "session.compacted") {
+              // Replace this session's prime so its next context hook gets fresh context.
+              primes.set(sessionID, loadPrime("compact", sessionID));
+            } else if (event?.type === "session.deleted") {
+              ownSessions.delete(sessionID);
+              primes.delete(sessionID);
+              void captureRun(`${gtCommand()} costs record --session ${shellQuote(sessionID)}`);
+            }
           }
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          console.error(`[gastown] event stream failed: ${err?.message || err}`);
         }
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          console.error(`[gastown] event stream ended: ${err?.message || err}`);
-        }
+        if (controller.signal.aborted) return;
+        console.error(`[gastown] event stream ended; resubscribing in ${delay}ms`);
+        await sleep(delay);
+        delay = Math.min(delay * 2, 60 * 1000);
       }
     })();
 
