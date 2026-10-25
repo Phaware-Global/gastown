@@ -164,6 +164,25 @@ export default {
       }
     };
 
+    // opencode sessions (the deacon, dogs) do not run the Claude PreToolUse
+    // hooks, so the bash guard is asked here. It refuses 'bd dolt start' and
+    // 'dolt sql-server', which would bind the shared Dolt port to this agent's
+    // own, empty store. Only the guard's exit code 2 blocks; any other failure
+    // lets the command through.
+    const doltStartBlock = async (command) => {
+      if (typeof command !== "string" || !/dolt/.test(command)) return "";
+      const payload = JSON.stringify({ tool_name: "Bash", tool_input: { command } });
+      const guardCmd = `printf %s ${shellQuote(payload)} | ${gtCommand()} tap guard dolt-start 2>&1`;
+      try {
+        await sh(guardCmd);
+        return "";
+      } catch (err) {
+        if (exitCode(err) === 2) return outputTail(err?.stdout);
+        console.error(`[gastown] dolt-start guard failed (command allowed): ${err?.message || err}`);
+        return "";
+      }
+    };
+
     const loadPrime = async (source = "startup", sessionID = "") => {
       const env = [`GT_HOOK_SOURCE=${shellQuote(source)}`];
       if (sessionID) {
@@ -173,6 +192,12 @@ export default {
       // the deacon's await-signal backoff. Deacon wakes on beads activity.
       return captureRun(`${env.join(" ")} ${gtCommand()} prime --hook`);
     };
+
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (event?.tool !== "bash") return;
+      const blocked = await doltStartBlock(event?.input?.command);
+      if (blocked) throw new Error(blocked);
+    });
 
     await ctx.session.hook("context", async (event) => {
       const sessionID = event?.sessionID || "";

@@ -232,8 +232,8 @@ func TestOpenCodeTemplateGuardsDoltStart(t *testing.T) {
 	}
 	content := string(template)
 	for _, want := range []string{
-		`"tool.execute.before"`,
-		`input?.tool !== "bash"`,
+		`ctx.tool.hook("execute.before"`,
+		`event?.tool !== "bash"`,
 		"tap guard dolt-start",
 		"exitCode(err) === 2",
 		"throw new Error(blocked)",
