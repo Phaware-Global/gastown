@@ -1,186 +1,218 @@
 // Gas Town OpenCode plugin: hooks SessionStart/Compaction via events.
-// Injects gt prime context into the system prompt via experimental.chat.system.transform.
-export const GasTown = async ({ $, directory }) => {
-  const role = (process.env.GT_ROLE || "").toLowerCase();
-  const gtBin = process.env.GT_BIN || "gt";
-  let didInit = false;
+// Injects gt prime context into the system prompt via the session "context" hook.
+//
+// OpenCode 2.x plugin API: the module's default export is a definition with an
+// id and a setup function. One shared OpenCode service loads this file once per
+// location (the directory that holds .opencode/plugins), so the setup context,
+// not the process environment, says which session directory this instance
+// serves; process.env belongs to whichever session started the service.
+import { execFile } from "node:child_process";
 
-  // Promise-based context loading ensures the system transform hook can
-  // await the result even if session.created hasn't resolved yet.
-  let primePromise = null;
+export default {
+  id: "gastown",
+  async setup(ctx) {
+    const directory = ctx?.location?.directory || process.cwd();
+    const gtBin = process.env.GT_BIN || "{{GT_BIN}}";
+    const townRoot = process.env.GT_ROOT || "";
 
-  const outputTail = (value, maxChars = 2000) => {
-    if (value === undefined || value === null) return "<empty>";
-    let text;
-    if (typeof value === "string") {
-      text = value;
-    } else if (value instanceof Uint8Array) {
-      text = new TextDecoder().decode(value);
-    } else {
-      text = String(value);
-    }
-    text = text.trimEnd();
-    if (!text) return "<empty>";
-    if (text.length <= maxChars) return text;
-    return `...<truncated ${text.length - maxChars} chars>\n${text.slice(-maxChars)}`;
-  };
+    // Promise-based context loading ensures the context hook can await the
+    // result even when several requests race at session start.
+    let primePromise = null;
+    // Sessions this location has served, so the server-wide event stream only
+    // triggers work for our own sessions.
+    const ownSessions = new Set();
 
-  const exitCode = (err) => {
-    const candidates = [err?.exitCode, err?.exit_code, err?.status, err?.code];
-    for (const code of candidates) {
-      if (typeof code === "number") return code;
-    }
-    return null;
-  };
-
-  const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
-
-  const gtCommand = () => {
-    if (/^[A-Za-z0-9_./-]+$/.test(gtBin)) return gtBin;
-    return shellQuote(gtBin);
-  };
-
-  const isDoltBackedCommand = (cmd) =>
-    /(^|\s)(?:'[^']*\/|[^'\s]*\/)?(?:gt|bd)'?\s/.test(cmd) &&
-    !/(^|\s)(?:'[^']*\/|[^'\s]*\/)?gt'?\s+dolt\s+status(\s|$)/.test(cmd);
-
-  const captureDoltStatus = async () => {
-    const statusCmd = `timeout 10s ${gtCommand()} dolt status 2>&1`;
-    try {
-      return await $`/bin/sh -lc ${statusCmd}`.cwd(directory).text();
-    } catch (err) {
-      return [
-        `status_command: ${statusCmd}`,
-        `status_error: ${err?.message || err}`,
-        `status_stdout_tail: ${outputTail(err?.stdout)}`,
-        `status_stderr_tail: ${outputTail(err?.stderr)}`,
-      ].join("\n");
-    }
-  };
-
-  const logFailure = async (cmd, err) => {
-    const code = exitCode(err);
-    const message = err?.message || String(err);
-    const timeout = code === 124 || /exit code 124|timed?\s*out/i.test(message)
-      ? "yes (exit code 124 / timeout)"
-      : "not indicated";
-    const lines = [
-      "[gastown] command failed",
-      `command: ${cmd}`,
-      `exit_code: ${code ?? "unknown"}`,
-      `timeout: ${timeout}`,
-      `error: ${message}`,
-      `stdout_tail: ${outputTail(err?.stdout)}`,
-      `stderr_tail: ${outputTail(err?.stderr)}`,
-    ];
-    if (isDoltBackedCommand(cmd)) {
-      lines.push(`dolt_status_tail:\n${outputTail(await captureDoltStatus())}`);
-      lines.push(
-        "suggested_recovery: If Dolt is unhealthy or another gt/bd command is hanging, capture SIGQUIT and `gt dolt status` diagnostics before escalating; otherwise retry after the timeout clears."
-      );
-    } else {
-      lines.push("suggested_recovery: Inspect the command, stdout/stderr tails, and retry once the timeout or process failure is resolved.");
-    }
-    console.error(lines.join("\n"));
-  };
-
-  const simpleRole = (value) => {
-    if (!value) return "";
-    const parts = value.split("/").filter(Boolean);
-    if (parts.length >= 2 && parts[1] === "polecats") return "polecat";
-    if (parts.length >= 2 && parts[1] === "crew") return "crew";
-    if (parts.length >= 2) return parts[1];
-    return parts[0];
-  };
-
-  const eventSessionID = (event) => event?.properties?.info?.id || event?.sessionID || event?.session?.id || "";
-
-  const captureRun = async (cmd) => {
-    try {
-      // .text() captures stdout as a string and suppresses terminal echo.
-      return await $`/bin/sh -lc ${cmd}`.cwd(directory).text();
-    } catch (err) {
-      await logFailure(cmd, err);
-      return "";
-    }
-  };
-
-  const loadPrime = async (source = "startup", sessionID = "") => {
-    const env = [`GT_HOOK_SOURCE=${shellQuote(source)}`];
-    if (sessionID) {
-      env.push(`GT_SESSION_ID=${shellQuote(sessionID)}`);
-    }
-    let context = await captureRun(`${env.join(" ")} ${gtCommand()} prime --hook`);
-    // NOTE: session-started nudge to deacon removed — it interrupted
-    // the deacon's await-signal backoff. Deacon wakes on beads activity.
-    return context;
-  };
-
-  // opencode sessions (the deacon, dogs) do not run the Claude PreToolUse
-  // hooks, so the bash guard is asked here. It refuses 'bd dolt start' and
-  // 'dolt sql-server', which would bind the shared Dolt port to this agent's
-  // own, empty store. Only the guard's exit code 2 blocks; any other failure
-  // lets the command through.
-  const doltStartBlock = async (command) => {
-    if (typeof command !== "string" || !/dolt/.test(command)) return "";
-    const payload = JSON.stringify({ tool_name: "Bash", tool_input: { command } });
-    const guardCmd = `printf %s ${shellQuote(payload)} | ${gtCommand()} tap guard dolt-start 2>&1`;
-    try {
-      await $`/bin/sh -lc ${guardCmd}`.cwd(directory).quiet();
-      return "";
-    } catch (err) {
-      if (exitCode(err) === 2) return outputTail(err?.stdout);
-      console.error(`[gastown] dolt-start guard failed (command allowed): ${err?.message || err}`);
-      return "";
-    }
-  };
-
-  return {
-    "tool.execute.before": async (input, output) => {
-      if (input?.tool !== "bash") return;
-      const blocked = await doltStartBlock(output?.args?.command);
-      if (blocked) throw new Error(blocked);
-    },
-    event: async ({ event }) => {
-      if (event?.type === "session.created") {
-        if (didInit) return;
-        didInit = true;
-        // Start loading prime context early; system.transform will await it.
-        primePromise = loadPrime("startup", eventSessionID(event));
+    const outputTail = (value, maxChars = 2000) => {
+      if (value === undefined || value === null) return "<empty>";
+      let text;
+      if (typeof value === "string") {
+        text = value;
+      } else if (value instanceof Uint8Array) {
+        text = new TextDecoder().decode(value);
+      } else {
+        text = String(value);
       }
-      if (event?.type === "session.compacted") {
-        // Reset so next system.transform gets fresh context.
-        primePromise = loadPrime("compact", eventSessionID(event));
+      text = text.trimEnd();
+      if (!text) return "<empty>";
+      if (text.length <= maxChars) return text;
+      return `...<truncated ${text.length - maxChars} chars>\n${text.slice(-maxChars)}`;
+    };
+
+    const exitCode = (err) => {
+      const candidates = [err?.exitCode, err?.exit_code, err?.status, err?.code];
+      for (const code of candidates) {
+        if (typeof code === "number") return code;
       }
-      if (event?.type === "session.deleted") {
-        const sessionID = event.properties?.info?.id;
-        if (sessionID) {
-          await captureRun(`${gtCommand()} costs record --session ${shellQuote(sessionID)}`);
-        }
+      return null;
+    };
+
+    const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+
+    const gtCommand = () => {
+      if (/^[A-Za-z0-9_./-]+$/.test(gtBin)) return gtBin;
+      return shellQuote(gtBin);
+    };
+
+    const isDoltBackedCommand = (cmd) =>
+      /(^|\s)(?:'[^']*\/|[^'\s]*\/)?(?:gt|bd)'?\s/.test(cmd) &&
+      !/(^|\s)(?:'[^']*\/|[^'\s]*\/)?gt'?\s+dolt\s+status(\s|$)/.test(cmd);
+
+    // Runs cmd through /bin/sh in this location's directory. Resolves to stdout;
+    // rejects with the error carrying stdout/stderr tails and the exit code.
+    const sh = (cmd) =>
+      new Promise((resolve, reject) => {
+        execFile(
+          "/bin/sh",
+          ["-lc", cmd],
+          { cwd: directory, env: process.env, maxBuffer: 64 * 1024 * 1024 },
+          (err, stdout, stderr) => {
+            if (err) {
+              err.stdout = stdout;
+              err.stderr = stderr;
+              reject(err);
+              return;
+            }
+            resolve(stdout);
+          },
+        );
+      });
+
+    const captureDoltStatus = async () => {
+      const statusCmd = `timeout 10s ${gtCommand()} dolt status 2>&1`;
+      try {
+        return await sh(statusCmd);
+      } catch (err) {
+        return [
+          `status_command: ${statusCmd}`,
+          `status_error: ${err?.message || err}`,
+          `status_stdout_tail: ${outputTail(err?.stdout)}`,
+          `status_stderr_tail: ${outputTail(err?.stderr)}`,
+        ].join("\n");
       }
-    },
-    "experimental.chat.system.transform": async (input, output) => {
-      // If session.created hasn't fired yet, start loading now.
+    };
+
+    const logFailure = async (cmd, err) => {
+      const code = exitCode(err);
+      const message = err?.message || String(err);
+      const timeout = code === 124 || /exit code 124|timed?\s*out/i.test(message)
+        ? "yes (exit code 124 / timeout)"
+        : "not indicated";
+      const lines = [
+        "[gastown] command failed",
+        `command: ${cmd}`,
+        `exit_code: ${code ?? "unknown"}`,
+        `timeout: ${timeout}`,
+        `error: ${message}`,
+        `stdout_tail: ${outputTail(err?.stdout)}`,
+        `stderr_tail: ${outputTail(err?.stderr)}`,
+      ];
+      if (isDoltBackedCommand(cmd)) {
+        lines.push(`dolt_status_tail:\n${outputTail(await captureDoltStatus())}`);
+        lines.push(
+          "suggested_recovery: If Dolt is unhealthy or another gt/bd command is hanging, capture SIGQUIT and `gt dolt status` diagnostics before escalating; otherwise retry after the timeout clears."
+        );
+      } else {
+        lines.push("suggested_recovery: Inspect the command, stdout/stderr tails, and retry once the timeout or process failure is resolved.");
+      }
+      console.error(lines.join("\n"));
+    };
+
+    // simpleRole reduces a role path (mayor, deacon, <rig>/polecats/<name>,
+    // <rig>/witness, ...) to its display name.
+    const simpleRole = (value) => {
+      if (!value) return "";
+      const parts = value.split("/").filter(Boolean);
+      if (parts.length >= 2 && parts[1] === "polecats") return "polecat";
+      if (parts.length >= 2 && parts[1] === "crew") return "crew";
+      if (parts[0] === "mayor" || parts[0] === "deacon" || parts[0] === "assistant") return parts[0];
+      if (parts.length >= 2) return parts[1];
+      return parts[0];
+    };
+
+    // The role path comes from this location's directory under the town root.
+    // GT_ROLE in process.env names the session that started the shared service.
+    const rolePath = () => {
+      if (townRoot && directory.startsWith(townRoot + "/")) {
+        return directory.slice(townRoot.length + 1);
+      }
+      return (process.env.GT_ROLE || "").toLowerCase();
+    };
+
+    const eventSessionID = (event) =>
+      event?.properties?.info?.id || event?.properties?.sessionID || event?.sessionID || "";
+
+    const captureRun = async (cmd) => {
+      try {
+        return await sh(cmd);
+      } catch (err) {
+        await logFailure(cmd, err);
+        return "";
+      }
+    };
+
+    const loadPrime = async (source = "startup", sessionID = "") => {
+      const env = [`GT_HOOK_SOURCE=${shellQuote(source)}`];
+      if (sessionID) {
+        env.push(`GT_SESSION_ID=${shellQuote(sessionID)}`);
+      }
+      // NOTE: session-started nudge to deacon removed — it interrupted
+      // the deacon's await-signal backoff. Deacon wakes on beads activity.
+      return captureRun(`${env.join(" ")} ${gtCommand()} prime --hook`);
+    };
+
+    await ctx.session.hook("context", async (event) => {
+      const sessionID = event?.sessionID || "";
+      if (sessionID) ownSessions.add(sessionID);
       if (!primePromise) {
-        primePromise = loadPrime("startup");
+        primePromise = loadPrime("startup", sessionID);
       }
       const context = await primePromise;
       if (context) {
-        output.system.push(context);
+        event.system.push({ type: "text", text: context });
       } else {
-        // Reset so next transform retries instead of pushing empty forever.
+        // Reset so the next request retries instead of pushing empty forever.
         primePromise = null;
       }
-    },
-    "experimental.session.compacting": async ({ sessionID }, output) => {
-      const roleDisplay = simpleRole(role) || "unknown";
-      output.context.push(`
+    });
+
+    await ctx.session.hook("compaction", async (event) => {
+      if (!Array.isArray(event?.system)) return;
+      const roleDisplay = simpleRole(rolePath()) || "unknown";
+      event.system.push({
+        type: "text",
+        text: `
 ## Gas Town Multi-Agent System
 
+Keep these instructions in the summary, verbatim:
 **After Compaction:** Run \`gt prime --hook\` to restore full context.
 **Check Hook:** \`gt hook\` - if work present, execute immediately (GUPP).
 **Role:** ${roleDisplay}
-`);
-    },
-  };
+`,
+      });
+    });
+
+    // The event stream is server-wide; act only on sessions this location served.
+    const controller = new AbortController();
+    (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          const sessionID = eventSessionID(event);
+          if (!sessionID || !ownSessions.has(sessionID)) continue;
+          if (event?.type === "session.compacted") {
+            // Reset so the next context hook gets fresh context.
+            primePromise = loadPrime("compact", sessionID);
+          } else if (event?.type === "session.deleted") {
+            ownSessions.delete(sessionID);
+            await captureRun(`${gtCommand()} costs record --session ${shellQuote(sessionID)}`);
+          }
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          console.error(`[gastown] event stream ended: ${err?.message || err}`);
+        }
+      }
+    })();
+
+    return () => controller.abort();
+  },
 };
