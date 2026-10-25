@@ -15,11 +15,15 @@ export default {
     const gtBin = process.env.GT_BIN || "{{GT_BIN}}";
     const townRoot = process.env.GT_ROOT || "";
 
-    // gt prime output per session (sessionID -> Promise<string>). One slot per
-    // session, not per location: the service outlives any one session, and a
-    // later session at this location must run its own prime (handoff marker,
-    // session ID, hook state). Replaced on compaction, dropped on deletion.
+    // gt prime output per session: sessionID -> { source, promise, retryAt }.
+    // One slot per session, not per location: the service outlives any one
+    // session, and a later session at this location must run its own prime
+    // (handoff marker, session ID, hook state). Replaced on compaction,
+    // dropped on deletion. A failed prime keeps its slot for primeRetryDelay
+    // and is then retried with the same source, so a wedged gt costs one
+    // timeout a minute rather than one per request.
     const primes = new Map();
+    const primeRetryDelay = 60 * 1000;
     // Sessions this location has served, so the server-wide event stream only
     // triggers work for our own sessions.
     const ownSessions = new Set();
@@ -214,6 +218,12 @@ export default {
       if (blocked) throw new Error(blocked);
     });
 
+    const primeFor = (sessionID, source) => {
+      const entry = { source, promise: loadPrime(source, sessionID), retryAt: 0 };
+      primes.set(sessionID, entry);
+      return entry;
+    };
+
     await ctx.session.hook("context", async (event) => {
       const sessionID = event?.sessionID || "";
       if (!sessionID) {
@@ -223,15 +233,18 @@ export default {
         return;
       }
       ownSessions.add(sessionID);
-      if (!primes.has(sessionID)) {
-        primes.set(sessionID, loadPrime("startup", sessionID));
+      let entry = primes.get(sessionID);
+      if (!entry) {
+        entry = primeFor(sessionID, "startup");
+      } else if (entry.retryAt && Date.now() >= entry.retryAt) {
+        entry = primeFor(sessionID, entry.source);
       }
-      const context = await primes.get(sessionID);
+      const context = await entry.promise;
       if (context) {
         event.system.push({ type: "text", text: context });
-      } else {
-        // Drop the entry so the next request retries instead of pushing empty forever.
-        primes.delete(sessionID);
+      } else if (primes.get(sessionID) === entry) {
+        // Still the current slot (compaction has not replaced it): schedule a retry.
+        entry.retryAt = Date.now() + primeRetryDelay;
       }
     });
 
@@ -271,7 +284,7 @@ Keep these instructions in the summary, verbatim:
             if (!sessionID || !ownSessions.has(sessionID)) continue;
             if (event?.type === "session.compacted") {
               // Replace this session's prime so its next context hook gets fresh context.
-              primes.set(sessionID, loadPrime("compact", sessionID));
+              primeFor(sessionID, "compact");
             } else if (event?.type === "session.deleted") {
               ownSessions.delete(sessionID);
               primes.delete(sessionID);

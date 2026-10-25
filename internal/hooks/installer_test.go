@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -237,9 +238,25 @@ func TestOpenCodeTemplateGuardsDoltStart(t *testing.T) {
 		"tap guard dolt-start",
 		"exitCode(err) === 2",
 		"throw new Error(blocked)",
+		// The guard only knows it runs for an agent through GT_TOWN_ROOT once
+		// the plugin has scrubbed GT_ROLE from the child env.
+		"env.GT_TOWN_ROOT = townRoot",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("opencode template missing %q", want)
+		}
+	}
+	m := regexp.MustCompile(`const sessionScopedEnv =\s*/(\^.*\$)/;`).FindStringSubmatch(content)
+	if m == nil {
+		t.Fatal("opencode template: sessionScopedEnv regex not found")
+	}
+	scrub := regexp.MustCompile(m[1])
+	if scrub.MatchString("GT_TOWN_ROOT") {
+		t.Error("sessionScopedEnv must not scrub GT_TOWN_ROOT: the dolt-start guard would fail open")
+	}
+	for _, v := range []string{"GT_ROLE", "GT_RIG", "BD_ACTOR"} {
+		if !scrub.MatchString(v) {
+			t.Errorf("sessionScopedEnv must scrub %s", v)
 		}
 	}
 }
