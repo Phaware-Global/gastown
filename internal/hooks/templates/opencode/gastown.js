@@ -57,6 +57,20 @@ export default {
       /(^|\s)(?:'[^']*\/|[^'\s]*\/)?(?:gt|bd)'?\s/.test(cmd) &&
       !/(^|\s)(?:'[^']*\/|[^'\s]*\/)?gt'?\s+dolt\s+status(\s|$)/.test(cmd);
 
+    // process.env is the shared service's environment, which carries the
+    // identity of whichever session started it (GT_ROLE, BD_ACTOR, ...).
+    // Drop those so gt derives the role from the working directory, as it
+    // does for a session with no GT_ROLE; town-level settings stay.
+    const sessionScopedEnv =
+      /^(GT_(ROLE|RIG|SESSION|SESSION_ID|AGENT|AGENT_READY|REVIEWER|REVIEWER_GITHUB_TOKEN|RUN|POLECAT|HOOK_SOURCE|WORK_[A-Z_]+)|BD_ACTOR|GIT_AUTHOR_NAME|GIT_COMMITTER_NAME)$/;
+    const childEnv = () => {
+      const env = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (!sessionScopedEnv.test(key)) env[key] = value;
+      }
+      return env;
+    };
+
     // Runs cmd through /bin/sh in this location's directory. Resolves to stdout;
     // rejects with the error carrying stdout/stderr tails and the exit code.
     const sh = (cmd) =>
@@ -64,7 +78,7 @@ export default {
         execFile(
           "/bin/sh",
           ["-lc", cmd],
-          { cwd: directory, env: process.env, maxBuffer: 64 * 1024 * 1024 },
+          { cwd: directory, env: childEnv(), maxBuffer: 64 * 1024 * 1024 },
           (err, stdout, stderr) => {
             if (err) {
               err.stdout = stdout;
@@ -135,7 +149,7 @@ export default {
       if (townRoot && directory.startsWith(townRoot + "/")) {
         return directory.slice(townRoot.length + 1);
       }
-      return (process.env.GT_ROLE || "").toLowerCase();
+      return "";
     };
 
     const eventSessionID = (event) =>
