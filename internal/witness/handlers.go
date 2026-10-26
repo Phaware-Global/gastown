@@ -1835,7 +1835,7 @@ func DetectZombiePolecatsWithOptions(bd *BdCli, workDir, rigName string, router 
 		if snap != nil {
 			labels = snap.Labels
 		}
-		doneIntent := effectiveDoneIntent(bd, workDir, agentBeadID, snap, labels)
+		doneIntent := effectiveDoneIntent(bd, workDir, agentBeadID, snap, labels, !opts.NoRestart)
 
 		if sessionAlive {
 			// gt-s8bq: Idle Polecat Heresy fix. Idle polecats are HEALTHY — they
@@ -3465,7 +3465,10 @@ func closeDescendantsViaCLI(bd *BdCli, workDir, parentID string) (int, error) {
 // it restarted mid-work. A label written before the hook bead was assigned
 // belongs to an earlier task: it is ignored and every such label is cleared.
 // Without a known assignment time the labels are used as they are.
-func effectiveDoneIntent(bd *BdCli, workDir, agentBeadID string, snap *agentBeadSnapshot, labels []string) *DoneIntent {
+//
+// clearStale is false for a held (--no-restart) scan: stale labels are still
+// ignored for classification, but the agent bead is left untouched.
+func effectiveDoneIntent(bd *BdCli, workDir, agentBeadID string, snap *agentBeadSnapshot, labels []string, clearStale bool) *DoneIntent {
 	entries := parseDoneIntentLabels(labels)
 	if len(entries) == 0 {
 		return nil
@@ -3495,7 +3498,7 @@ func effectiveDoneIntent(bd *BdCli, workDir, agentBeadID string, snap *agentBead
 			current = e.intent
 		}
 	}
-	if len(stale) > 0 {
+	if clearStale && len(stale) > 0 {
 		clearDoneIntentLabels(bd, workDir, agentBeadID, stale)
 	}
 	return current

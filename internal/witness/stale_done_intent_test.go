@@ -115,6 +115,11 @@ func (f *reuseFixture) detect() *DetectZombiePolecatsResult {
 	return DetectZombiePolecats(f.bd(), f.town, "alpha", nil)
 }
 
+func (f *reuseFixture) detectHeld() *DetectZombiePolecatsResult {
+	f.t.Helper()
+	return DetectZombiePolecatsWithOptions(f.bd(), f.town, "alpha", nil, DetectZombieOptions{NoRestart: true})
+}
+
 // removedLabels returns every label a `bd update` asked to remove.
 func (f *reuseFixture) removedLabels() map[string]bool {
 	removed := map[string]bool{}
@@ -190,5 +195,23 @@ func TestDetectZombiePolecats_NewestDoneIntentDecides(t *testing.T) {
 	}
 	if !removed[f.labels[0]] {
 		t.Errorf("did not clear the leftover label %q", f.labels[0])
+	}
+}
+
+// A held (--no-restart) scan reports and flags only; it must not rewrite the
+// agent bead an operator is inspecting. The stale label is still ignored for
+// classification.
+func TestDetectZombiePolecats_NoRestartScanLeavesStaleDoneIntentLabels(t *testing.T) {
+	f := newReuseFixture(t, time.Hour, 6*24*time.Hour, 4*24*time.Hour)
+
+	res := f.detectHeld()
+	if len(f.updates) != 0 {
+		t.Errorf("held scan wrote to the agent bead: %v", f.updates)
+	}
+	if len(f.restarts) != 0 {
+		t.Errorf("held scan restarted a session: %v", f.restarts)
+	}
+	for _, z := range res.Zombies {
+		t.Errorf("held scan reported zombie %+v for a polecat on a newer assignment", z)
 	}
 }
