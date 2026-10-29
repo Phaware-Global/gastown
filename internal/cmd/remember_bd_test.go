@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBdMemoryKey(t *testing.T) {
@@ -280,4 +281,18 @@ func TestBdMemoryRoundTrip(t *testing.T) {
 			t.Errorf("error = %v, want it to name the key", err)
 		}
 	})
+}
+
+func TestBdKvListJSON_TimeoutIsDescriptive(t *testing.T) {
+	// A loaded dolt sql-server can hold `bd kv list` past the bound; the
+	// failure must say so instead of surfacing the kill as "signal: killed".
+	writeRoutingBdStub(t, "exec sleep 5\n")
+	old := bdKvListTimeout
+	bdKvListTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { bdKvListTimeout = old })
+
+	_, err := bdKvListJSON()
+	if err == nil || !strings.Contains(err.Error(), "timed out after") {
+		t.Fatalf("err = %v, want a timeout message", err)
+	}
 }
