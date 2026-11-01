@@ -30,7 +30,30 @@ stop_server() {
     SERVER_PID=""
   fi
 }
-trap 'stop_server; rm -rf "$WORK"' EXIT
+
+# cleanup runs on EXIT and must never change the suite's verdict: the assertions
+# decide the exit status, not teardown. Every background process this script
+# started (not only the one in SERVER_PID) is stopped and reaped before $WORK is
+# removed, because a process still writing into $WORK makes `rm -rf` fail with
+# "Directory not empty".
+cleanup() {
+  local status=$? pid i
+  trap - EXIT
+  set +e
+  stop_server
+  for pid in $(jobs -p); do
+    kill "$pid" 2>/dev/null
+    # Give it a few seconds to exit on SIGTERM, then force it.
+    for i in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  done
+  # Retry: a straggling flush can recreate an entry between rm's readdir and rmdir.
+  for i in 1 2 3 4 5; do rm -rf "$WORK" 2>/dev/null && break; sleep 0.2; done
+  if [[ -e "$WORK" ]]; then echo "warning: could not remove $WORK" >&2; fi
+  exit "$status"
+}
+trap cleanup EXIT
 PASS=0
 FAIL=0
 
