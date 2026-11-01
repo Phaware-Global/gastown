@@ -71,8 +71,16 @@ LDFLAGS := -s -w \
 # and prints a path that does not exist. So prefer `--installed`, then fall back
 # to the newest installed versioned keg, and accept a prefix only if it actually
 # contains unicode/regex.h. Set ICU_PREFIX in the environment to override.
+#
+# ICU_PREFIX is forced to a simple variable: a recursive one would re-run brew
+# every time make builds a recipe environment from the exported CGO_* flags.
+# A caller that already supplies CGO_CPPFLAGS/CGO_CXXFLAGS (MacPorts, no brew)
+# is trusted to provide ICU itself.
 ifeq ($(shell uname),Darwin)
-  ICU_PREFIX ?= $(shell brew --prefix --installed icu4c 2>/dev/null)
+  ifndef ICU_PREFIX
+    ICU_PREFIX := $(shell brew --prefix --installed icu4c 2>/dev/null)
+  endif
+  ICU_PREFIX := $(ICU_PREFIX)
   ifeq ($(wildcard $(ICU_PREFIX)/include/unicode/regex.h),)
     ICU_KEG := $(lastword $(shell brew list --formula 2>/dev/null | grep -E '^icu4c(@[0-9]+)?$$' | sort -t@ -k2 -n))
     ifneq ($(ICU_KEG),)
@@ -82,7 +90,7 @@ ifeq ($(shell uname),Darwin)
   ifneq ($(wildcard $(ICU_PREFIX)/include/unicode/regex.h),)
     export CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
     export CGO_LDFLAGS  += -L$(ICU_PREFIX)/lib
-  else
+  else ifeq ($(strip $(CGO_CPPFLAGS) $(CGO_CXXFLAGS)),)
     ICU_MISSING := 1
   endif
 endif
@@ -92,7 +100,7 @@ endif
 check-icu:
 ifdef ICU_MISSING
 	@echo "error: ICU4C headers (unicode/regex.h) not found under '$(ICU_PREFIX)'." >&2
-	@echo "       gt links go-icu-regex, which needs ICU. Run: brew install icu4c" >&2
+	@echo "       gt links go-icu-regex, which needs ICU. Run: brew install icu4c, or set ICU_PREFIX=<prefix>" >&2
 	@exit 1
 endif
 
