@@ -75,7 +75,9 @@ LDFLAGS := -s -w \
 # ICU_PREFIX is forced to a simple variable: a recursive one would re-run brew
 # every time make builds a recipe environment from the exported CGO_* flags.
 # A caller that already supplies CGO_CPPFLAGS/CGO_CXXFLAGS (MacPorts, no brew)
-# is trusted to provide ICU itself.
+# is trusted to provide ICU itself, including flags persisted with `go env -w`,
+# which make's environment cannot see. Only CGO_CPPFLAGS is read from go: its
+# default is empty, whereas `go env CGO_CXXFLAGS` defaults to "-O2 -g".
 ifeq ($(shell uname),Darwin)
   ifndef ICU_PREFIX
     ICU_PREFIX := $(shell brew --prefix --installed icu4c 2>/dev/null)
@@ -90,7 +92,7 @@ ifeq ($(shell uname),Darwin)
   ifneq ($(wildcard $(ICU_PREFIX)/include/unicode/regex.h),)
     export CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
     export CGO_LDFLAGS  += -L$(ICU_PREFIX)/lib
-  else ifeq ($(strip $(CGO_CPPFLAGS) $(CGO_CXXFLAGS)),)
+  else ifeq ($(strip $(CGO_CPPFLAGS) $(CGO_CXXFLAGS) $(shell go env CGO_CPPFLAGS 2>/dev/null)),)
     ICU_MISSING := 1
   endif
 endif
@@ -320,6 +322,7 @@ test: test-makefile
 
 test-makefile:
 	bash scripts/check-install-path_test.sh
+	bash scripts/check-icu_test.sh
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:
