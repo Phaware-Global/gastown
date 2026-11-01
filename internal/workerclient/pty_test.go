@@ -375,9 +375,14 @@ func TestWaitReleasing_LeavesAFlushingAgentAlone(t *testing.T) {
 	// A pump, as streamExec runs one.
 	var mu sync.Mutex
 	var out []byte
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		buf := make([]byte, 256)
 		for {
+			// A descheduled pump, as on a loaded runner: the agent's last
+			// bytes are still queued in the terminal when it exits.
+			time.Sleep(150 * time.Millisecond)
 			n, err := p.Read(buf)
 			mu.Lock()
 			out = append(out, buf[:n]...)
@@ -396,6 +401,15 @@ func TestWaitReleasing_LeavesAFlushingAgentAlone(t *testing.T) {
 	pumpExited := make(chan struct{})
 	err = waitReleasing(ctx, cmd, p, pumpExited, ptyWaitGrace, slog.Default(), "gt-demo-furiosa")
 	require.NoError(t, err, "a flushing agent must exit cleanly, not by hangup")
+
+	// On Linux the child is reaped while its last output still sits in the
+	// terminal queue, so the assertion must follow the pump's drain to EOF, as
+	// streamExec's exit frame does.
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pump never drained the terminal after the agent exited")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
