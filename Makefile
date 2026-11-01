@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install install-remote-execution-binaries dist install-artifacts check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
+.PHONY: build check-icu desktop-build desktop-run install safe-install install-remote-execution-binaries dist install-artifacts check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -65,15 +65,38 @@ LDFLAGS := -s -w \
 # ICU4C detection for macOS (required by go-icu-regex transitive dependency).
 # Homebrew installs icu4c as a keg-only package, so headers/libs aren't on the
 # default search path. Auto-detect the prefix and export CGo flags.
+#
+# `brew --prefix icu4c` is not enough: when the unversioned alias moves to a
+# newer major (e.g. icu4c@79) than the one installed (icu4c@78), it still exits 0
+# and prints a path that does not exist. So prefer `--installed`, then fall back
+# to the newest installed versioned keg, and accept a prefix only if it actually
+# contains unicode/regex.h. Set ICU_PREFIX in the environment to override.
 ifeq ($(shell uname),Darwin)
-  ICU_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
-  ifneq ($(ICU_PREFIX),)
+  ICU_PREFIX ?= $(shell brew --prefix --installed icu4c 2>/dev/null)
+  ifeq ($(wildcard $(ICU_PREFIX)/include/unicode/regex.h),)
+    ICU_KEG := $(lastword $(shell brew list --formula 2>/dev/null | grep -E '^icu4c(@[0-9]+)?$$' | sort -t@ -k2 -n))
+    ifneq ($(ICU_KEG),)
+      ICU_PREFIX := $(shell brew --prefix $(ICU_KEG) 2>/dev/null)
+    endif
+  endif
+  ifneq ($(wildcard $(ICU_PREFIX)/include/unicode/regex.h),)
     export CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
     export CGO_LDFLAGS  += -L$(ICU_PREFIX)/lib
+  else
+    ICU_MISSING := 1
   endif
 endif
 
-build:
+# Fail with an actionable message instead of a compiler error deep inside
+# go-icu-regex. Only build-type targets depend on it, so `make clean` etc. still run.
+check-icu:
+ifdef ICU_MISSING
+	@echo "error: ICU4C headers (unicode/regex.h) not found under '$(ICU_PREFIX)'." >&2
+	@echo "       gt links go-icu-regex, which needs ICU. Run: brew install icu4c" >&2
+	@exit 1
+endif
+
+build: check-icu
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-proxy-server ./cmd/gt-proxy-server
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-proxy-client ./cmd/gt-proxy-client
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-worker-agent ./cmd/gt-worker-agent
