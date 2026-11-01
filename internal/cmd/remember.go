@@ -413,19 +413,23 @@ func parseBdKvListJSON(data []byte) (map[string]string, error) {
 
 // bdKvListJSON calls bd kv list --json and returns the parsed string values.
 func bdKvListJSON() (map[string]string, error) {
-	// Bound the shell-out so callers on latency-sensitive paths (the
-	// compact/resume prime hook in particular, which must stay within tight
-	// non-Claude runtime hook timeouts) can't stall indefinitely if bd hangs.
+	// Bound the shell-out so a hung bd/dolt can't stall the command forever.
+	// Both callers (gt memories, gt memories --compact) are interactive, and a
+	// busy dolt sql-server can take several seconds to answer one query, so
+	// the bound is generous rather than tight.
 	ctx, cancel := context.WithTimeout(context.Background(), bdKvListTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bd", "kv", "list", "--json")
-	out, err := cmd.Output()
+	out, err := beads.OutputRelayed(cmd)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("bd kv list --json timed out after %s", bdKvListTimeout)
+		}
+		return nil, fmt.Errorf("bd kv list --json: %w", err)
 	}
 
 	return parseBdKvListJSON(out)
 }
 
-// bdKvListTimeout bounds the `bd kv list` shell-out used for memory injection.
-var bdKvListTimeout = 5 * time.Second
+// bdKvListTimeout bounds the `bd kv list` shell-out behind gt memories.
+var bdKvListTimeout = 60 * time.Second
