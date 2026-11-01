@@ -192,3 +192,33 @@ func TestDetectZombiePolecats_NewestDoneIntentDecides(t *testing.T) {
 		t.Errorf("did not clear the leftover label %q", f.labels[0])
 	}
 }
+
+// A detect-only scan classifies around a stale label but leaves the agent bead
+// as it found it: held scans preserve state.
+func TestDetectZombiePolecats_NoRestartScanDoesNotClearStaleDoneIntent(t *testing.T) {
+	f := newReuseFixture(t, time.Hour, 6*24*time.Hour, 4*24*time.Hour)
+
+	res := DetectZombiePolecatsWithOptions(f.bd(), f.town, "alpha", nil, DetectZombieOptions{NoRestart: true})
+	if removed := f.removedLabels(); len(removed) != 0 {
+		t.Errorf("a NoRestart scan removed done-intent labels: %v", removed)
+	}
+	if len(f.restarts) != 0 {
+		t.Errorf("restarted under NoRestart: %v", f.restarts)
+	}
+	for _, z := range res.Zombies {
+		t.Errorf("stale label still counted for classification: %+v", z)
+	}
+}
+
+// A detect-only scan still reports a done-intent that postdates the assignment.
+func TestDetectZombiePolecats_NoRestartScanStillDetectsFreshDoneIntent(t *testing.T) {
+	f := newReuseFixture(t, 2*time.Hour, 5*time.Minute)
+
+	res := DetectZombiePolecatsWithOptions(f.bd(), f.town, "alpha", nil, DetectZombieOptions{NoRestart: true})
+	if len(res.Zombies) != 1 || res.Zombies[0].Classification != ZombieStuckInDone {
+		t.Errorf("zombies = %+v, want one stuck-in-done", res.Zombies)
+	}
+	if len(f.restarts) != 0 {
+		t.Errorf("restarted under NoRestart: %v", f.restarts)
+	}
+}
