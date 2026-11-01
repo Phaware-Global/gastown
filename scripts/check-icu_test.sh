@@ -139,7 +139,8 @@ run_make "$BREW_DIR:$GO_DIR:$SYSTEM_PATH"
 assert_ok_with "several versioned kegs: newest major wins numerically" \
   "-I$KEG100/include" "-L$KEG100/lib"
 
-# 3. ICU_PREFIX in the environment wins and brew is never consulted.
+# 3. An ICU_PREFIX in the environment that contains include/unicode/regex.h
+#    wins and the brew lookup is skipped.
 reset_goenv
 OVERRIDE="$(make_keg override)"
 write_brew "$MISSING79" "$MISSING79" "icu4c@78" "icu4c@78" "$KEG78"
@@ -152,12 +153,12 @@ else
   OUT="$(cat "$BREW_LOG")"; fail "ICU_PREFIX override invoked brew"
 fi
 
-# 3b. A bad ICU_PREFIX override is not silently replaced by a brew keg.
+# 3b. An ICU_PREFIX that lacks include/unicode/regex.h is discarded in favour
+#     of the newest installed brew keg.
 reset_goenv
 write_brew "$MISSING79" "$KEG78" "icu4c@78" "icu4c@78" "$KEG78"
 run_make "$BREW_DIR:$GO_DIR:$SYSTEM_PATH" ICU_PREFIX="$TMPDIR_ROOT/nope"
-# The Makefile falls back to a brew keg when the override lacks headers; what
-# matters is the build never proceeds with the broken prefix.
+# The build must never proceed with the broken prefix.
 if [[ "$RC" -eq 0 && "$OUT" != *"$TMPDIR_ROOT/nope"* ]]; then
   pass "bad ICU_PREFIX never reaches the CGO flags"
 else

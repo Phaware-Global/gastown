@@ -14,7 +14,9 @@
 #     CGO_CXXFLAGS is set in the environment or CGO_CPPFLAGS is set via
 #     `go env -w` (e.g. MacPorts); otherwise `make build` stops with a hint.
 #   Override: ICU_PREFIX=<prefix> (a directory containing include/ and lib/)
-#     skips brew entirely.
+#     skips the brew lookup only when it contains include/unicode/regex.h.
+#     Otherwise the override is discarded and the newest installed keg is
+#     used.
 # Without icu4c the build otherwise fails with:
 #     fatal error: 'unicode/regex.h' file not found
 # icu4c is a system package, so it cannot be pinned here.
