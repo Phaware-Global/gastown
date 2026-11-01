@@ -4,9 +4,18 @@
 # golangci-lint is pinned so lint results are reproducible across machines.
 #
 # Build note: the go-icu-regex transitive dependency needs ICU headers. On
-# macOS, Homebrew installs icu4c keg-only, so the Makefile locates it with
-# `brew --prefix icu4c` and exports CGO_CPPFLAGS/CGO_LDFLAGS. Without icu4c
-# installed the build fails with:
+# macOS, Homebrew installs icu4c keg-only, so the Makefile locates it and
+# exports CGO_CPPFLAGS/CGO_LDFLAGS.
+#   Detection: `brew --prefix --installed icu4c`, then the newest installed
+#     versioned keg (icu4c@NN) from `brew list`. A prefix counts only if it
+#     contains include/unicode/regex.h; the unversioned alias can point at a
+#     newer keg than the one installed.
+#   Fallback: if no keg is found, the build proceeds when CGO_CPPFLAGS or
+#     CGO_CXXFLAGS is set in the environment or CGO_CPPFLAGS is set via
+#     `go env -w` (e.g. MacPorts); otherwise `make build` stops with a hint.
+#   Override: ICU_PREFIX=<prefix> (a directory containing include/ and lib/)
+#     skips brew entirely.
+# Without icu4c the build otherwise fails with:
 #     fatal error: 'unicode/regex.h' file not found
 # icu4c is a system package, so it cannot be pinned here.
 [tools]
