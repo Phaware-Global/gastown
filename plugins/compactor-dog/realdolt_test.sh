@@ -23,18 +23,42 @@ fi
 
 WORK="$(mktemp -d)"
 SERVER_PID=""
+
+# Stops the sql-server: SIGTERM, a bounded wait, then SIGKILL, so a wedged server
+# cannot hang teardown. `wait` is only reached once the process is gone.
 stop_server() {
+  local i
   if [[ -n "$SERVER_PID" ]]; then
     kill "$SERVER_PID" 2>/dev/null || true
+    for i in $(seq 1 50); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$SERVER_PID" 2>/dev/null; then kill -9 "$SERVER_PID" 2>/dev/null || true; fi
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
 }
-trap 'stop_server; rm -rf "$WORK"' EXIT
+
+# cleanup runs on EXIT and must never change the suite's verdict: the assertions
+# decide the exit status, not teardown. It stops the server, then removes $WORK,
+# retrying because a straggling writer can recreate an entry between rm's readdir
+# and rmdir. DOLT_DISABLE_EVENT_FLUSH (set below) keeps dolt from spawning
+# detached writers into $WORK, so the server is the only process to stop.
+cleanup() {
+  local status=$? i
+  trap - EXIT
+  set +e
+  stop_server
+  for i in 1 2 3 4 5; do rm -rf "$WORK" 2>/dev/null && break; sleep 0.2; done
+  if [[ -e "$WORK" ]]; then echo "warning: could not remove $WORK" >&2; fi
+  exit "$status"
+}
+trap cleanup EXIT
 PASS=0
 FAIL=0
 
 export DOLT_ROOT_PATH="$WORK/doltroot"
+# Every dolt CLI call otherwise spawns a detached `dolt send-metrics` that writes
+# under $DOLT_ROOT_PATH/eventsData after the call returns.
+export DOLT_DISABLE_EVENT_FLUSH=1
 mkdir -p "$DOLT_ROOT_PATH"
 dolt config --global --add user.name compactor-test >/dev/null
 dolt config --global --add user.email compactor-test@example.com >/dev/null
