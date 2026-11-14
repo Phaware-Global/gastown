@@ -383,7 +383,7 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, command)
+		respawnArgs = append(respawnArgs, commandInWorkDir(workDir, command))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -463,7 +463,7 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, command)
+		respawnArgs = append(respawnArgs, commandInWorkDir(workDir, command))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -4008,9 +4008,21 @@ func (t *Tmux) RespawnPaneWithWorkDir(pane, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	args = append(args, command)
+	args = append(args, commandInWorkDir(workDir, command))
 	_, err := t.run(args...)
 	return err
+}
+
+// commandInWorkDir prefixes a POSIX pane command with an explicit cd into
+// workDir. When the directory the tmux server was started in has been
+// deleted, tmux starts every new pane in that dead directory regardless of -c,
+// and agents exit at launch (gt-a7pkv). The explicit cd makes the pane
+// independent of the server's working directory.
+func commandInWorkDir(workDir, command string) string {
+	if workDir == "" || command == "" {
+		return command
+	}
+	return "cd " + config.ShellQuote(workDir) + " && " + command
 }
 
 // psQuoteValue quotes a value for PowerShell single-quoted strings.
