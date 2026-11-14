@@ -550,7 +550,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 				prov.teardown()
 			}
 		}()
-		command = shellJoinArgv(prov.argv)
+		// exec so the launcher replaces the pane shell: the pane command is
+		// prefixed with "cd <workDir> &&", and a shell that only exec-optimizes
+		// a lone simple command (bash < 5.1) would otherwise stay as the pane
+		// process and defeat pane_current_command detection.
+		command = "exec " + shellJoinArgv(prov.argv)
 		// The host pane runs the backend's launcher, not the agent, so
 		// process-name liveness must track the launcher; agent liveness is
 		// heartbeat-only for remote backends (§8.1).
