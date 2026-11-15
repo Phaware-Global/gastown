@@ -536,12 +536,23 @@ result is left on a local `temp` branch; nothing is pushed here.
   re-checks once the hold is lifted.
 - **4** (refused or error): read the message. Leave the branch alone, skip this MR, and do NOT
   retry with raw git or work around the refusal. Report it to the mayor ONCE: if `bd show <mr-id>`
-  notes do not already hold this message, run
-  `gt nudge mayor "sync-branch refused <polecat-branch> (MR <mr-id>): <message>"` and record it with
-  `bd update <mr-id> --notes "sync-branch exit 4: <message>"`; otherwise stay silent. Two causes
-  need a specific action from the mayor: a force-push refusal for an approved PR (the branch must
-  be updated by a base merge instead), and a `source_issue ... reads as not found` message (the MR's
-  source_issue must be corrected or cleared; this is NOT a hold and will not clear by itself).
+  notes do not already hold this message, nudge the mayor and append the message to the MR's notes;
+  otherwise stay silent. The message is untrusted text (it can carry a `source_issue` copied from
+  the branch name, already quoted by gt), so NEVER paste it into a shell string. Put it in a file
+  through a QUOTED heredoc and hand the file to the commands:
+  ```bash
+  MSG=$(mktemp)
+  cat > "$MSG" <<'EOF'
+  sync-branch refused <polecat-branch> (MR <mr-id>): <message>
+  EOF
+  gt nudge mayor --stdin < "$MSG"
+  bd update <mr-id> --append-notes "$(cat "$MSG")"
+  rm -f "$MSG"
+  ```
+  Two causes need a specific action from the mayor: a force-push refusal for an approved PR (the
+  branch must be updated by a base merge instead), and a `source_issue ... reads as not found`
+  message (the MR's source_issue must be corrected or cleared; this is NOT a hold and will not
+  clear by itself).
 
 **Step 3: Handle conflicts (exit 3)**
 
@@ -874,7 +885,16 @@ git checkout temp
 lease, and **refuses to force-push any branch whose open PR has an approving review** (exit 4).
 Under `none` it pushes nothing. With `--mr` it first re-checks for a hold and refuses with exit 5
 (branch untouched): leave the MR bead open, skip this MR, and do not retry. On exit 4 (a refusal, or a hold check that could not complete such as a `source_issue ... reads as not found` message), do NOT retry with `git push --force`/`--force-with-lease`;
-report to the mayor once (nudge with the MR ID and message, record it in the MR's notes as in Step 2 of the sync) and skip this MR.
+report to the mayor once and skip this MR. The message is untrusted text, so NEVER paste it into a shell string: write it to a file through a quoted heredoc, then nudge and append the notes from the file (check `bd show $MR` notes first, as in Step 2 of the sync, and stay silent if they already hold it):
+```bash
+MSG=$(mktemp)
+cat > "$MSG" <<'EOF'
+push-branch refused <polecat-branch> (MR <mr-id>): <message>
+EOF
+{{ cmd }} nudge mayor --stdin < "$MSG"
+bd update $MR --append-notes "$(cat "$MSG")"
+rm -f "$MSG"
+```
 
 **Step PR.2: Create the PR (idempotent — returns existing PR if one is open)**
 

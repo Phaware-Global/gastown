@@ -125,8 +125,10 @@ func refusePrSync(cmd *cobra.Command, name string, err error) error {
 //
 // Only a rig that publishes through PRs has a PR to look up; elsewhere the
 // bead holds still apply. Without --mr the MR bead is found by PR number (as the
-// other refinery commands do), so omitting the flag never skips the gate. With
-// neither an MR nor a PR there is nothing to check.
+// other refinery commands do), so the gate still runs when the branch has an
+// open PR. It is skipped only when there is neither --mr nor an open PR for the
+// branch (including every rig whose merge strategy is not "pr", which does no
+// PR lookup): with neither an MR nor a PR there is nothing to check.
 func holdGateForBranchUpdate(provider refinery.PRProvider, mergeStrategy, branch, mrID string,
 	findMR func(prNumber int) (*beads.Issue, error), show refinery.BeadShower) error {
 	var prNumber int

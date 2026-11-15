@@ -182,8 +182,10 @@ the binary. The patrol formula calls two commands instead of raw git:
 
 Both commands run the hold check before touching the branch. `--mr` names the
 MR bead; when it is omitted the MR is found by the branch's PR number, so the
-check is never skipped. It fails closed: a PR or bead that cannot be read is
-exit 4, never a pass.
+check still runs for a branch with an open PR. It is skipped only when there is
+neither `--mr` nor an open PR for the branch (always the case outside the `pr`
+merge strategy, which does no PR lookup). It fails closed: a PR or bead that
+cannot be read is exit 4, never a pass.
 
 Independent of the strategy, a force-push of a branch whose open PR has an
 approving review is refused (exit 4). The check is fail-closed: if the PR or its
