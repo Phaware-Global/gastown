@@ -140,7 +140,7 @@ func TestBdShowInvocationPinsRoutedMetadataDatabase(t *testing.T) {
 
 func setupShowInvocationTown(t *testing.T) string {
 	t.Helper()
-	townRoot := t.TempDir()
+	townRoot := canonicalTempDir(t)
 	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
 	for _, dir := range []string{
 		filepath.Join(townRoot, "mayor"),
