@@ -613,3 +613,56 @@ func TestRefineryPatrolBranchUpdateGoesThroughCode(t *testing.T) {
 		t.Error("merge-push PR.1 still force-pushes with raw git")
 	}
 }
+
+// A held MR must be skipped before the refinery rewrites its branch. The hold
+// gate lives in sync-branch/push-branch (they take --mr), and the formula must
+// pass --mr and handle the held exit code instead of treating it as a failure.
+func TestRefineryPatrolHoldCheckedBeforeBranchUpdate(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+	desc := func(id string) string {
+		t.Helper()
+		for i := range f.Steps {
+			if f.Steps[i].ID == id {
+				return f.Steps[i].Description
+			}
+		}
+		t.Fatalf("step %q not found", id)
+		return ""
+	}
+
+	process := desc("process-branch")
+	sync := strings.Index(process, "refinery pr sync-branch --branch")
+	if sync < 0 {
+		t.Fatal("process-branch has no sync-branch invocation")
+	}
+	line := process[sync:]
+	if nl := strings.Index(line, "\n"); nl >= 0 {
+		line = line[:nl]
+	}
+	if !strings.Contains(line, "--mr <mr-id>") {
+		t.Errorf("sync-branch invocation must pass --mr <mr-id> so the hold gate runs before the rewrite: %q", line)
+	}
+	if !strings.Contains(process, "**5**") {
+		t.Error("process-branch must handle sync-branch exit 5 (held): skip the MR, branch untouched")
+	}
+
+	merge := desc("merge-push")
+	push := strings.Index(merge, "refinery pr push-branch --branch")
+	if push < 0 {
+		t.Fatal("merge-push has no push-branch invocation")
+	}
+	pline := merge[push:]
+	if nl := strings.Index(pline, "\n"); nl >= 0 {
+		pline = pline[:nl]
+	}
+	if !strings.Contains(pline, "--mr $MR") {
+		t.Errorf("push-branch invocation must pass --mr $MR: %q", pline)
+	}
+}

@@ -6,8 +6,10 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
 // refinery_pr_sync.go: the refinery's branch-update primitives. The patrol
@@ -19,9 +21,11 @@ var (
 	refPrSyncBranch string
 	refPrSyncTarget string
 	refPrSyncLocal  string
+	refPrSyncMR     string
 
 	refPrPushBranch string
 	refPrPushLocal  string
+	refPrPushMR     string
 )
 
 // Exit codes for "gt refinery pr sync-branch" (and 4 for push-branch).
@@ -29,6 +33,7 @@ const (
 	syncExitBehindBase = 2 // strategy=none and the branch is behind its target
 	syncExitConflict   = 3 // merge/rebase conflicted and was aborted
 	syncExitRefused    = 4 // refused (approved PR force-push) or operational error
+	syncExitHeld       = 5 // the MR, its source issue or its PR is on hold; branch untouched
 )
 
 var refineryPrSyncBranchCmd = &cobra.Command{
@@ -48,7 +53,11 @@ Exit codes:
   0  up-to-date, or synced onto the local working branch
   2  behind base and strategy=none — report to the mayor, leave the branch alone
   3  conflict (merge/rebase aborted, nothing changed) — create a conflict task
-  4  refused or operational error`,
+  4  refused or operational error
+  5  held (--mr): the MR, its source issue or its PR is on hold or a draft;
+     checked before anything is fetched or rewritten — skip the MR
+
+With --mr the hold check runs first, so a held MR's branch is never rewritten.`,
 	Args: cobra.NoArgs,
 	RunE: runRefineryPrSyncBranch,
 }
@@ -65,7 +74,9 @@ pushed; under strategy=merge a non-fast-forward is an error.
 
 Exit codes:
   0  pushed, or nothing to push
-  4  refused or operational error`,
+  4  refused or operational error
+  5  held (--mr): the MR, its source issue or its PR is on hold or a draft;
+     checked before anything is pushed — skip the MR`,
 	Args: cobra.NoArgs,
 	RunE: runRefineryPrPushBranch,
 }
@@ -77,9 +88,13 @@ func init() {
 	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncBranch, "branch", "", "work branch to update (required)")
 	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncTarget, "target", "", "branch it must contain (required)")
 	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncLocal, "local", "temp", "local working branch to leave the result on")
+	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncMR, "mr", "",
+		"MR bead ID; when set, a hold on the MR, its source issue or its PR stops the sync before the branch is touched (exit 5)")
 
 	refineryPrPushBranchCmd.Flags().StringVar(&refPrPushBranch, "branch", "", "remote branch to update (required)")
 	refineryPrPushBranchCmd.Flags().StringVar(&refPrPushLocal, "local", "temp", "local working branch to push")
+	refineryPrPushBranchCmd.Flags().StringVar(&refPrPushMR, "mr", "",
+		"MR bead ID; when set, a hold on the MR, its source issue or its PR stops the push before the branch is touched (exit 5)")
 }
 
 // noOpenPR is the approval probe for rigs that do not publish branches through
@@ -100,13 +115,69 @@ func refusePrSync(cmd *cobra.Command, name string, err error) error {
 	return NewSilentExit(syncExitRefused)
 }
 
+// holdGateForBranchUpdate refuses to rewrite or publish a held MR's branch. It
+// runs before the first fetch or push, so a held branch is left exactly as it
+// was. A hold is syncExitHeld; a check that cannot complete (unreadable bead,
+// PR lookup failure) is syncExitRefused: it fails closed, never on a guess.
+//
+// Only a rig that publishes through PRs has a PR to look up; elsewhere the
+// bead holds still apply. With no PR yet, only the bead holds apply.
+func holdGateForBranchUpdate(provider refinery.PRProvider, mergeStrategy, branch, mrID string,
+	findMR func(prNumber int) (*beads.Issue, error), show refinery.BeadShower) error {
+	if mrID == "" {
+		return nil
+	}
+	var prNumber int
+	var draftProvider refinery.PRProvider
+	if mergeStrategy == "pr" {
+		n, err := provider.FindPRNumber(branch)
+		if err != nil {
+			return fmt.Errorf("finding the PR for %s for the hold check: %w", branch, err)
+		}
+		if n > 0 {
+			prNumber, draftProvider = n, provider
+		}
+	}
+	return verifyNotHeld(draftProvider, prNumber, mrID, findMR, show)
+}
+
+// runHoldGateForBranchUpdate wires holdGateForBranchUpdate to the rig's beads
+// and reports the outcome the way the other sync/push failures are reported.
+func runHoldGateForBranchUpdate(cmd *cobra.Command, name string, provider refinery.PRProvider,
+	cfg *refinery.MergeQueueConfig, r *rig.Rig, branch, mrID string) error {
+	findMR := func(pr int) (*beads.Issue, error) {
+		return beads.New(r.BeadsPath()).FindMRForReviewPR(pr)
+	}
+	show := func(id string) (*beads.Issue, error) {
+		return beads.New(resolveBeadDir(id)).Show(id)
+	}
+	err := holdGateForBranchUpdate(provider, cfg.MergeStrategy, branch, mrID, findMR, show)
+	return reportHoldGate(cmd, name, err)
+}
+
+// reportHoldGate maps a hold-gate error to the sync/push exit codes.
+func reportHoldGate(cmd *cobra.Command, name string, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case refinery.IsHoldRefusal(err):
+		fmt.Fprintf(cmd.ErrOrStderr(), "%s: held, branch untouched: %v\n", name, err)
+		return NewSilentExit(syncExitHeld)
+	default:
+		return refusePrSync(cmd, name, err)
+	}
+}
+
 func runRefineryPrSyncBranch(cmd *cobra.Command, _ []string) error {
 	if refPrSyncBranch == "" || refPrSyncTarget == "" {
 		return refusePrSync(cmd, "sync-branch", errors.New("--branch and --target are required"))
 	}
-	provider, cfg, _, err := getRefineryPRContext()
+	provider, cfg, r, err := getRefineryPRContext()
 	if err != nil {
 		return refusePrSync(cmd, "sync-branch", err)
+	}
+	if err := runHoldGateForBranchUpdate(cmd, "sync-branch", provider, cfg, r, refPrSyncBranch, refPrSyncMR); err != nil {
+		return err
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -145,9 +216,12 @@ func runRefineryPrPushBranch(cmd *cobra.Command, _ []string) error {
 	if refPrPushBranch == "" {
 		return refusePrSync(cmd, "push-branch", errors.New("--branch is required"))
 	}
-	provider, cfg, _, err := getRefineryPRContext()
+	provider, cfg, r, err := getRefineryPRContext()
 	if err != nil {
 		return refusePrSync(cmd, "push-branch", err)
+	}
+	if err := runHoldGateForBranchUpdate(cmd, "push-branch", provider, cfg, r, refPrPushBranch, refPrPushMR); err != nil {
+		return err
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
