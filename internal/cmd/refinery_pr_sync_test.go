@@ -102,3 +102,64 @@ func TestHoldGateForBranchUpdate(t *testing.T) {
 		wantExit(t, err, syncExitRefused)
 	})
 }
+
+// The refinery role prompt runs sync-branch/push-branch without --mr. The gate
+// must still run: the MR is found by PR number and the draft check applies.
+func TestHoldGateForBranchUpdate_NoMR(t *testing.T) {
+	issues := map[string]*beads.Issue{
+		"gt-mr-1":  holdGateMR("hold"),
+		"gt-src-1": {ID: "gt-src-1"},
+	}
+	findMR := func(mr *beads.Issue, err error) func(int) (*beads.Issue, error) {
+		return func(pr int) (*beads.Issue, error) {
+			if pr != 42 {
+				t.Errorf("looked up PR %d, want 42", pr)
+			}
+			return mr, err
+		}
+	}
+	gate := func(p refinery.PRProvider, strategy string, find func(int) (*beads.Issue, error)) error {
+		cmd := &cobra.Command{}
+		cmd.SetErr(&bytes.Buffer{})
+		return reportHoldGate(cmd, "sync-branch",
+			holdGateForBranchUpdate(p, strategy, "feat/x", "", find, holdGateShow(issues)))
+	}
+
+	t.Run("held PR found by number is refused", func(t *testing.T) {
+		err := gate(&branchHoldProvider{prNumber: 42}, "pr", findMR(holdGateMR("hold"), nil))
+		wantExit(t, err, syncExitHeld)
+	})
+	t.Run("draft PR is refused", func(t *testing.T) {
+		p := &branchHoldProvider{prNumber: 42}
+		p.draft = true
+		wantExit(t, gate(p, "pr", findMR(nil, nil)), syncExitHeld)
+	})
+	t.Run("unheld PR proceeds", func(t *testing.T) {
+		unheld := map[string]*beads.Issue{"gt-mr-1": holdGateMR(), "gt-src-1": {ID: "gt-src-1"}}
+		mr := holdGateMR()
+		cmd := &cobra.Command{}
+		cmd.SetErr(&bytes.Buffer{})
+		err := reportHoldGate(cmd, "sync-branch",
+			holdGateForBranchUpdate(&branchHoldProvider{prNumber: 42}, "pr", "feat/x", "", findMR(mr, nil), holdGateShow(unheld)))
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+	})
+	t.Run("a failed MR lookup fails closed", func(t *testing.T) {
+		err := gate(&branchHoldProvider{prNumber: 42}, "pr", findMR(nil, errors.New("dolt unreachable")))
+		wantExit(t, err, syncExitRefused)
+	})
+	t.Run("no PR yet and no MR: nothing to check", func(t *testing.T) {
+		never := func(int) (*beads.Issue, error) {
+			t.Error("MR lookup ran with no PR number")
+			return nil, nil
+		}
+		if err := gate(&branchHoldProvider{}, "pr", never); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+	})
+	t.Run("PR lookup failure fails closed", func(t *testing.T) {
+		err := gate(&branchHoldProvider{findErr: errors.New("gh down")}, "pr", findMR(nil, nil))
+		wantExit(t, err, syncExitRefused)
+	})
+}

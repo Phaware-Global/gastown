@@ -54,10 +54,11 @@ Exit codes:
   2  behind base and strategy=none — report to the mayor, leave the branch alone
   3  conflict (merge/rebase aborted, nothing changed) — create a conflict task
   4  refused or operational error
-  5  held (--mr): the MR, its source issue or its PR is on hold or a draft;
+  5  held: the MR, its source issue or its PR is on hold or a draft;
      checked before anything is fetched or rewritten — skip the MR
 
-With --mr the hold check runs first, so a held MR's branch is never rewritten.`,
+The hold check runs first, so a held MR's branch is never rewritten. Pass --mr;
+without it the MR is found by the branch's PR number.`,
 	Args: cobra.NoArgs,
 	RunE: runRefineryPrSyncBranch,
 }
@@ -75,7 +76,7 @@ pushed; under strategy=merge a non-fast-forward is an error.
 Exit codes:
   0  pushed, or nothing to push
   4  refused or operational error
-  5  held (--mr): the MR, its source issue or its PR is on hold or a draft;
+  5  held: the MR, its source issue or its PR is on hold or a draft;
      checked before anything is pushed — skip the MR`,
 	Args: cobra.NoArgs,
 	RunE: runRefineryPrPushBranch,
@@ -89,12 +90,12 @@ func init() {
 	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncTarget, "target", "", "branch it must contain (required)")
 	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncLocal, "local", "temp", "local working branch to leave the result on")
 	refineryPrSyncBranchCmd.Flags().StringVar(&refPrSyncMR, "mr", "",
-		"MR bead ID; when set, a hold on the MR, its source issue or its PR stops the sync before the branch is touched (exit 5)")
+		"MR bead ID; a hold on the MR, its source issue or its PR stops the sync before the branch is touched (exit 5). Omitted: the MR is found by PR number")
 
 	refineryPrPushBranchCmd.Flags().StringVar(&refPrPushBranch, "branch", "", "remote branch to update (required)")
 	refineryPrPushBranchCmd.Flags().StringVar(&refPrPushLocal, "local", "temp", "local working branch to push")
 	refineryPrPushBranchCmd.Flags().StringVar(&refPrPushMR, "mr", "",
-		"MR bead ID; when set, a hold on the MR, its source issue or its PR stops the push before the branch is touched (exit 5)")
+		"MR bead ID; a hold on the MR, its source issue or its PR stops the push before the branch is touched (exit 5). Omitted: the MR is found by PR number")
 }
 
 // noOpenPR is the approval probe for rigs that do not publish branches through
@@ -121,12 +122,11 @@ func refusePrSync(cmd *cobra.Command, name string, err error) error {
 // PR lookup failure) is syncExitRefused: it fails closed, never on a guess.
 //
 // Only a rig that publishes through PRs has a PR to look up; elsewhere the
-// bead holds still apply. With no PR yet, only the bead holds apply.
+// bead holds still apply. Without --mr the MR bead is found by PR number (as the
+// other refinery commands do), so omitting the flag never skips the gate. With
+// neither an MR nor a PR there is nothing to check.
 func holdGateForBranchUpdate(provider refinery.PRProvider, mergeStrategy, branch, mrID string,
 	findMR func(prNumber int) (*beads.Issue, error), show refinery.BeadShower) error {
-	if mrID == "" {
-		return nil
-	}
 	var prNumber int
 	var draftProvider refinery.PRProvider
 	if mergeStrategy == "pr" {
@@ -137,6 +137,9 @@ func holdGateForBranchUpdate(provider refinery.PRProvider, mergeStrategy, branch
 		if n > 0 {
 			prNumber, draftProvider = n, provider
 		}
+	}
+	if mrID == "" && prNumber == 0 {
+		return nil
 	}
 	return verifyNotHeld(draftProvider, prNumber, mrID, findMR, show)
 }
