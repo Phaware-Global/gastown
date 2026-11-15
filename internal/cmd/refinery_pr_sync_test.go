@@ -101,6 +101,19 @@ func TestHoldGateForBranchUpdate(t *testing.T) {
 		err := gate(&branchHoldProvider{findErr: errors.New("gh down")}, "pr", "gt-mr-1", show())
 		wantExit(t, err, syncExitRefused)
 	})
+	t.Run("source issue that reads as not found is a failed check, not a hold", func(t *testing.T) {
+		missingSrc := holdGateShow(map[string]*beads.Issue{"gt-mr-1": holdGateMR()})
+		err := gate(&branchHoldProvider{prNumber: 42}, "pr", "gt-mr-1", missingSrc)
+		wantExit(t, err, syncExitRefused)
+	})
+	t.Run("held source issue is still a hold", func(t *testing.T) {
+		heldSrc := holdGateShow(map[string]*beads.Issue{
+			"gt-mr-1":  holdGateMR(),
+			"gt-src-1": {ID: "gt-src-1", Status: "deferred"},
+		})
+		err := gate(&branchHoldProvider{prNumber: 42}, "pr", "gt-mr-1", heldSrc)
+		wantExit(t, err, syncExitHeld)
+	})
 }
 
 // The refinery role prompt runs sync-branch/push-branch without --mr. The gate

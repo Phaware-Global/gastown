@@ -53,7 +53,8 @@ Exit codes:
   0  up-to-date, or synced onto the local working branch
   2  behind base and strategy=none — report to the mayor, leave the branch alone
   3  conflict (merge/rebase aborted, nothing changed) — create a conflict task
-  4  refused or operational error
+  4  refused or operational error, including a hold check that could not
+     complete (e.g. the MR's source_issue reads as not found)
   5  held: the MR, its source issue or its PR is on hold or a draft;
      checked before anything is fetched or rewritten — skip the MR
 
@@ -75,7 +76,8 @@ pushed; under strategy=merge a non-fast-forward is an error.
 
 Exit codes:
   0  pushed, or nothing to push
-  4  refused or operational error
+  4  refused or operational error, including a hold check that could not
+     complete (e.g. the MR's source_issue reads as not found)
   5  held: the MR, its source issue or its PR is on hold or a draft;
      checked before anything is pushed — skip the MR`,
 	Args: cobra.NoArgs,
@@ -158,11 +160,16 @@ func runHoldGateForBranchUpdate(cmd *cobra.Command, name string, provider refine
 	return reportHoldGate(cmd, name, err)
 }
 
-// reportHoldGate maps a hold-gate error to the sync/push exit codes.
+// reportHoldGate maps a hold-gate error to the sync/push exit codes. A source
+// issue that reads as not found is not a hold: nothing will lift it, so it is a
+// check that could not complete (exit 4, reported by the formula), not a skip.
 func reportHoldGate(cmd *cobra.Command, name string, err error) error {
+	var missing *refinery.SourceIssueNotFoundError
 	switch {
 	case err == nil:
 		return nil
+	case errors.As(err, &missing):
+		return refusePrSync(cmd, name, err)
 	case refinery.IsHoldRefusal(err):
 		fmt.Fprintf(cmd.ErrOrStderr(), "%s: held, branch untouched: %v\n", name, err)
 		return NewSilentExit(syncExitHeld)

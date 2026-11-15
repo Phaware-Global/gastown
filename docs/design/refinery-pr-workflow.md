@@ -172,7 +172,8 @@ the binary. The patrol formula calls two commands instead of raw git:
   local `temp` branch and never pushes. Exit 0 = up-to-date/synced; 2 = behind
   base under `none` (report, leave the branch alone); 3 = conflict (aborted,
   nothing changed); 4 = refused or error, including a hold check that could not
-  complete; 5 = held (the MR, its source issue or its PR is on hold or a draft;
+  complete (a `source_issue` that reads as not found is this, not a hold: the
+  formula reports it to the mayor once); 5 = held (the MR, its source issue or its PR is on hold or a draft;
   the branch is untouched, skip the MR).
 - `gt refinery pr push-branch --branch B --mr M` — exit 5 = held, as above. A fast-forward is pushed plainly.
   Only `rebase` may force-push, with a lease on the tip fetched at sync time.

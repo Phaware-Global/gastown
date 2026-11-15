@@ -534,9 +534,14 @@ result is left on a local `temp` branch; nothing is pushed here.
   sync, rebase, merge or push it by hand, do NOT create a conflict task, and do NOT nudge the
   polecat. Leave the MR bead open, skip this MR, and continue to loop-check; a later cycle
   re-checks once the hold is lifted.
-- **4** (refused or error): read the message. If it is a force-push refusal for an approved PR,
-  the branch must be updated by a base merge instead — report to the mayor, leave the branch and
-  MR bead alone, skip this MR. Do NOT retry with raw git or work around the refusal.
+- **4** (refused or error): read the message. Leave the branch alone, skip this MR, and do NOT
+  retry with raw git or work around the refusal. Report it to the mayor ONCE: if `bd show <mr-id>`
+  notes do not already hold this message, run
+  `gt nudge mayor "sync-branch refused <polecat-branch> (MR <mr-id>): <message>"` and record it with
+  `bd update <mr-id> --notes "sync-branch exit 4: <message>"`; otherwise stay silent. Two causes
+  need a specific action from the mayor: a force-push refusal for an approved PR (the branch must
+  be updated by a base merge instead), and a `source_issue ... reads as not found` message (the MR's
+  source_issue must be corrected or cleared; this is NOT a hold and will not clear by itself).
 
 **Step 3: Handle conflicts (exit 3)**
 
@@ -868,8 +873,8 @@ git checkout temp
 (the `merge` strategy's merge commit) plainly, force-pushes only under `rebase` and only with a
 lease, and **refuses to force-push any branch whose open PR has an approving review** (exit 4).
 Under `none` it pushes nothing. With `--mr` it first re-checks for a hold and refuses with exit 5
-(branch untouched): leave the MR bead open, skip this MR, and do not retry. On exit 4, do NOT retry with `git push --force`/`--force-with-lease`;
-report to the mayor and skip this MR.
+(branch untouched): leave the MR bead open, skip this MR, and do not retry. On exit 4 (a refusal, or a hold check that could not complete such as a `source_issue ... reads as not found` message), do NOT retry with `git push --force`/`--force-with-lease`;
+report to the mayor once (nudge with the MR ID and message, record it in the MR's notes as in Step 2 of the sync) and skip this MR.
 
 **Step PR.2: Create the PR (idempotent — returns existing PR if one is open)**
 
