@@ -168,14 +168,24 @@ Some rigs forbid rewriting a PR branch (human reviewers track it by commit).
 A prose directive to the refinery was not enough, so the policy is enforced by
 the binary. The patrol formula calls two commands instead of raw git:
 
-- `gt refinery pr sync-branch --branch B --target T` — leaves the result on a
+- `gt refinery pr sync-branch --branch B --target T --mr M` — leaves the result on a
   local `temp` branch and never pushes. Exit 0 = up-to-date/synced; 2 = behind
   base under `none` (report, leave the branch alone); 3 = conflict (aborted,
-  nothing changed); 4 = refused or error.
-- `gt refinery pr push-branch --branch B` — a fast-forward is pushed plainly.
+  nothing changed); 4 = refused or error, including a hold check that could not
+  complete (a `source_issue` that reads as not found is this, not a hold: the
+  formula reports it to the mayor once); 5 = held (the MR, its source issue or its PR is on hold or a draft;
+  the branch is untouched, skip the MR).
+- `gt refinery pr push-branch --branch B --mr M` — exit 5 = held, as above. A fast-forward is pushed plainly.
   Only `rebase` may force-push, with a lease on the tip fetched at sync time.
   Under `none` nothing is pushed; under `merge` a non-fast-forward is an error,
   never a force.
+
+Both commands run the hold check before touching the branch. `--mr` names the
+MR bead; when it is omitted the MR is found by the branch's PR number, so the
+check still runs for a branch with an open PR. It is skipped only when there is
+neither `--mr` nor an open PR for the branch (always the case outside the `pr`
+merge strategy, which does no PR lookup). It fails closed: a PR or bead that
+cannot be read is exit 4, never a pass.
 
 Independent of the strategy, a force-push of a branch whose open PR has an
 approving review is refused (exit 4). The check is fail-closed: if the PR or its

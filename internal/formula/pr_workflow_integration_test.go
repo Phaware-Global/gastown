@@ -613,3 +613,122 @@ func TestRefineryPatrolBranchUpdateGoesThroughCode(t *testing.T) {
 		t.Error("merge-push PR.1 still force-pushes with raw git")
 	}
 }
+
+// A held MR must be skipped before the refinery rewrites its branch. The hold
+// gate lives in sync-branch/push-branch (they take --mr), and the formula must
+// pass --mr and handle the held exit code instead of treating it as a failure.
+func TestRefineryPatrolHoldCheckedBeforeBranchUpdate(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+	desc := func(id string) string {
+		t.Helper()
+		for i := range f.Steps {
+			if f.Steps[i].ID == id {
+				return f.Steps[i].Description
+			}
+		}
+		t.Fatalf("step %q not found", id)
+		return ""
+	}
+
+	process := desc("process-branch")
+	sync := strings.Index(process, "refinery pr sync-branch --branch")
+	if sync < 0 {
+		t.Fatal("process-branch has no sync-branch invocation")
+	}
+	line := process[sync:]
+	if nl := strings.Index(line, "\n"); nl >= 0 {
+		line = line[:nl]
+	}
+	if !strings.Contains(line, "--mr <mr-id>") {
+		t.Errorf("sync-branch invocation must pass --mr <mr-id> so the hold gate runs before the rewrite: %q", line)
+	}
+	if !strings.Contains(process, "**5**") {
+		t.Error("process-branch must handle sync-branch exit 5 (held): skip the MR, branch untouched")
+	}
+
+	merge := desc("merge-push")
+	push := strings.Index(merge, "refinery pr push-branch --branch")
+	if push < 0 {
+		t.Fatal("merge-push has no push-branch invocation")
+	}
+	pline := merge[push:]
+	if nl := strings.Index(pline, "\n"); nl >= 0 {
+		pline = pline[:nl]
+	}
+	if !strings.Contains(pline, "--mr $MR") {
+		t.Errorf("push-branch invocation must pass --mr $MR: %q", pline)
+	}
+}
+
+// The exit-4 report carries gt's own message, which can embed text copied from
+// a branch name (SourceIssueNotFoundError formats source_issue with %q). Pasting
+// it into a double-quoted shell string would let that text reach the shell, so
+// the formula must route it through a quoted heredoc, and must append to the MR
+// notes rather than replace operator notes (which the report-once check reads).
+func TestRefineryPatrolExit4ReportKeepsMessageOutOfShellStrings(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+	desc := func(id string) string {
+		t.Helper()
+		for i := range f.Steps {
+			if f.Steps[i].ID == id {
+				return f.Steps[i].Description
+			}
+		}
+		t.Fatalf("step %q not found", id)
+		return ""
+	}
+
+	process := desc("process-branch")
+	start := strings.Index(process, "- **4** (refused or error)")
+	if start < 0 {
+		t.Fatal("process-branch has no exit 4 bullet")
+	}
+	end := strings.Index(process[start:], "**Step 3:")
+	if end < 0 {
+		t.Fatal("process-branch exit 4 bullet is not followed by Step 3")
+	}
+	syncExit4 := process[start : start+end]
+
+	merge := desc("merge-push")
+	pstart := strings.Index(merge, "On exit 4")
+	if pstart < 0 {
+		t.Fatal("merge-push has no exit 4 guidance")
+	}
+	pend := strings.Index(merge[pstart:], "**Step PR.2")
+	if pend < 0 {
+		t.Fatal("merge-push exit 4 guidance is not followed by Step PR.2")
+	}
+	pushExit4 := merge[pstart : pstart+pend]
+
+	for name, text := range map[string]string{"sync-branch": syncExit4, "push-branch": pushExit4} {
+		if !strings.Contains(text, "<<'EOF'") {
+			t.Errorf("%s exit 4: the message must be written through a quoted heredoc (<<'EOF')", name)
+		}
+		if !strings.Contains(text, "--append-notes") {
+			t.Errorf("%s exit 4: record with --append-notes so operator notes survive", name)
+		}
+		if !strings.Contains(text, "nudge mayor --stdin") {
+			t.Errorf("%s exit 4: nudge the mayor with --stdin", name)
+		}
+		bare := strings.ReplaceAll(text, "--append-notes", "")
+		for _, banned := range []string{`--notes "`, `nudge mayor "`} {
+			if strings.Contains(bare, banned) {
+				t.Errorf("%s exit 4 still puts the message in a shell string via %q", name, banned)
+			}
+		}
+	}
+}
