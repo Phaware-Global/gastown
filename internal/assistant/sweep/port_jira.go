@@ -23,7 +23,7 @@ const (
 	jiraPageSize        = 100
 	jiraMaxPages        = 10 // per search; more is reported as partial
 	jiraCommentPage     = 50
-	jiraMaxNamedUnread  = 10 // unread issue keys a time-budget note lists before "+N more"
+	jiraMaxNamedUnread  = 10 // issue keys a partial note lists before "+N more"
 )
 
 var (
@@ -563,6 +563,10 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			wip++
 		}
 	}
+	// Failed comment reads are summed into one note: a count, the first few
+	// keys and the first error, however many issues fail.
+	var commentFailed []jiraIssue
+	var firstCommentErr error
 	for n, is := range issues {
 		// Every involved issue gets its comments; only the time budget
 		// stops the loop, and the issues are newest-updated first, so the
@@ -590,7 +594,10 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		comments, err := c.comments(is.Key)
 		if err != nil {
-			note("%s: comments unavailable: %v", is.Key, err)
+			if len(commentFailed) == 0 {
+				firstCommentErr = err
+			}
+			commentFailed = append(commentFailed, is)
 			continue
 		}
 		base := jiraBase(is, browse)
@@ -708,6 +715,9 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			}
 		}
 	}
+	if len(commentFailed) > 0 {
+		note("comments unavailable for %d issues: %s; first error: %v", len(commentFailed), unreadKeys(commentFailed), firstCommentErr)
+	}
 	if wip > wipLimit {
 		out = append(out, Finding{Kind: "wip-over-limit", Key: "wip", Severity: SeverityInfo, Since: in.Now,
 			Fields:  map[string]string{"count": fmt.Sprint(wip), "limit": fmt.Sprint(wipLimit)},
@@ -754,8 +764,8 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	return out, nil
 }
 
-// unreadKeys lists the keys of issues the comment loop did not reach, at most
-// jiraMaxNamedUnread of them. A key outside jiraKeyRe is counted, never
+// unreadKeys lists the keys of issues a note names (the ones the comment loop
+// did not reach, or could not read), at most jiraMaxNamedUnread of them. A key outside jiraKeyRe is counted, never
 // printed.
 func unreadKeys(issues []jiraIssue) string {
 	var keys []string

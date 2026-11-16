@@ -570,7 +570,8 @@ the loop; the port is then partial and the note names the issues not reached by
 key (at most ten, then a count), so the unread tail is the stalest.
 Release waves are checked before the comment loop, so a loop that spends the
 whole budget cannot skip them; a wave the budget still cuts is named in the
-partial note.
+partial note. Comment reads that fail are one note: a count, the first few
+keys, then `+N more`, and the first error.
 
 | Kind | Condition (deterministic) | Why it exists |
 |---|---|---|
