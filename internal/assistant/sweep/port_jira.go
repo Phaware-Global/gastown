@@ -19,11 +19,11 @@ import (
 
 // Jira port defaults (design: docs/design/assistant-role.md, "Jira port").
 const (
-	jiraDefaultTokenEnv  = "JIRA_API_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
-	jiraPageSize         = 100
-	jiraMaxPages         = 10  // per search; more is reported as partial
-	jiraMaxCommentIssues = 150 // issues whose comments are fetched per run
-	jiraCommentPage      = 50
+	jiraDefaultTokenEnv = "JIRA_API_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
+	jiraPageSize        = 100
+	jiraMaxPages        = 10 // per search; more is reported as partial
+	jiraCommentPage     = 50
+	jiraMaxNamedUnread  = 10 // issue keys a partial note lists before "+N more"
 )
 
 var (
@@ -524,22 +524,55 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	}
 
 	var out []Finding
+	// Release waves are checked before the comment loop: that loop is bounded
+	// only by the port budget and can spend all of it, which would silently
+	// skip the few calls the waves need. A wave the budget still cuts is named
+	// in the partial note.
+	for _, w := range waves {
+		if !jiraKeyRe.MatchString(w.Key) {
+			note("release wave with malformed key skipped")
+			continue
+		}
+		if !timeLeft(ctx) {
+			note("time budget exhausted before release wave %s", w.Key)
+			break
+		}
+		children, err := c.searchFirst(fmt.Sprintf(`parent = %s ORDER BY updated DESC`, w.Key))
+		if err != nil {
+			note("%s: subtasks unavailable: %v", w.Key, err)
+			continue
+		}
+		last := time.Time(w.Fields.Updated)
+		if len(children) > 0 && time.Time(children[0].Fields.Updated).After(last) {
+			last = time.Time(children[0].Fields.Updated)
+		}
+		if in.Now.Sub(last) >= d.stale {
+			fd := jiraBase(w, browse)("release-wave-stale", SeverityInfo)
+			fd.Since = last
+			fd.Suggest = "review release wave " + w.Key
+			fd.Fingerprint = last.UTC().Format(time.RFC3339)
+			out = append(out, fd)
+		}
+	}
 	// WIP needs only assignee and status, which the search already returned
-	// for every issue, so it is counted before the comment cap or the time
-	// budget can cut the loop short.
+	// for every issue, so it is counted before the time budget can cut the
+	// comment loop short.
 	wip := 0
 	for _, is := range issues {
 		if a := is.Fields.Assignee; a != nil && isPersona[a.AccountID] && contains(wipStatuses, is.Fields.Status.Name) {
 			wip++
 		}
 	}
+	// Failed comment reads are summed into one note: a count, the first few
+	// keys and the first error, however many issues fail.
+	var commentFailed []jiraIssue
+	var firstCommentErr error
 	for n, is := range issues {
-		if n >= jiraMaxCommentIssues {
-			note("comments fetched for the first %d of %d issues", jiraMaxCommentIssues, len(issues))
-			break
-		}
+		// Every involved issue gets its comments; only the time budget
+		// stops the loop, and the issues are newest-updated first, so the
+		// unread tail is the stalest. The tail is named by key.
 		if !timeLeft(ctx) {
-			note("time budget exhausted after %d of %d issues", n, len(issues))
+			note("time budget exhausted after %d of %d issues; not reached: %s", n, len(issues), unreadKeys(issues[n:]))
 			break
 		}
 		f := is.Fields
@@ -561,7 +594,10 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		comments, err := c.comments(is.Key)
 		if err != nil {
-			note("%s: comments unavailable: %v", is.Key, err)
+			if len(commentFailed) == 0 {
+				firstCommentErr = err
+			}
+			commentFailed = append(commentFailed, is)
 			continue
 		}
 		base := jiraBase(is, browse)
@@ -679,6 +715,9 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			}
 		}
 	}
+	if len(commentFailed) > 0 {
+		note("comments unavailable for %d issues: %s; first error: %v", len(commentFailed), unreadKeys(commentFailed), firstCommentErr)
+	}
 	if wip > wipLimit {
 		out = append(out, Finding{Kind: "wip-over-limit", Key: "wip", Severity: SeverityInfo, Since: in.Now,
 			Fields:  map[string]string{"count": fmt.Sprint(wip), "limit": fmt.Sprint(wipLimit)},
@@ -714,32 +753,6 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			note("queue search truncated after %d issues: %d of %d free WIP slots named", len(queue), rank, free)
 		}
 	}
-	for _, w := range waves {
-		if !jiraKeyRe.MatchString(w.Key) {
-			note("release wave with malformed key skipped")
-			continue
-		}
-		if !timeLeft(ctx) {
-			note("time budget exhausted before release wave %s", w.Key)
-			break
-		}
-		children, err := c.searchFirst(fmt.Sprintf(`parent = %s ORDER BY updated DESC`, w.Key))
-		if err != nil {
-			note("%s: subtasks unavailable: %v", w.Key, err)
-			continue
-		}
-		last := time.Time(w.Fields.Updated)
-		if len(children) > 0 && time.Time(children[0].Fields.Updated).After(last) {
-			last = time.Time(children[0].Fields.Updated)
-		}
-		if in.Now.Sub(last) >= d.stale {
-			fd := jiraBase(w, browse)("release-wave-stale", SeverityInfo)
-			fd.Since = last
-			fd.Suggest = "review release wave " + w.Key
-			fd.Fingerprint = last.UTC().Format(time.RFC3339)
-			out = append(out, fd)
-		}
-	}
 	for i := range out {
 		if strings.HasPrefix(out[i].Key, "invalid-key-") {
 			out[i].Suggest = "" // would quote a malformed key
@@ -749,6 +762,31 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		return out, &PartialError{Reason: strings.Join(partial, "; ")}
 	}
 	return out, nil
+}
+
+// unreadKeys lists the keys of issues a note names (the ones the comment loop
+// did not reach, or could not read), at most jiraMaxNamedUnread of them. A key outside jiraKeyRe is counted, never
+// printed.
+func unreadKeys(issues []jiraIssue) string {
+	var keys []string
+	for _, is := range issues {
+		if jiraKeyRe.MatchString(is.Key) {
+			keys = append(keys, is.Key)
+		}
+	}
+	more := len(issues) - len(keys)
+	if len(keys) > jiraMaxNamedUnread {
+		more += len(keys) - jiraMaxNamedUnread
+		keys = keys[:jiraMaxNamedUnread]
+	}
+	out := strings.Join(keys, ", ")
+	if more > 0 {
+		if out != "" {
+			out += " "
+		}
+		out += fmt.Sprintf("+%d more", more)
+	}
+	return out
 }
 
 // jiraBase returns a Finding constructor for an issue. A key outside
