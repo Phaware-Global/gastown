@@ -19,11 +19,11 @@ import (
 
 // Jira port defaults (design: docs/design/assistant-role.md, "Jira port").
 const (
-	jiraDefaultTokenEnv  = "JIRA_API_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
-	jiraPageSize         = 100
-	jiraMaxPages         = 10  // per search; more is reported as partial
-	jiraMaxCommentIssues = 150 // issues whose comments are fetched per run
-	jiraCommentPage      = 50
+	jiraDefaultTokenEnv = "JIRA_API_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
+	jiraPageSize        = 100
+	jiraMaxPages        = 10 // per search; more is reported as partial
+	jiraCommentPage     = 50
+	jiraMaxNamedUnread  = 10 // unread issue keys a time-budget note lists before "+N more"
 )
 
 var (
@@ -525,8 +525,8 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 
 	var out []Finding
 	// WIP needs only assignee and status, which the search already returned
-	// for every issue, so it is counted before the comment cap or the time
-	// budget can cut the loop short.
+	// for every issue, so it is counted before the time budget can cut the
+	// comment loop short.
 	wip := 0
 	for _, is := range issues {
 		if a := is.Fields.Assignee; a != nil && isPersona[a.AccountID] && contains(wipStatuses, is.Fields.Status.Name) {
@@ -534,12 +534,11 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 	}
 	for n, is := range issues {
-		if n >= jiraMaxCommentIssues {
-			note("comments fetched for the first %d of %d issues", jiraMaxCommentIssues, len(issues))
-			break
-		}
+		// Every involved issue gets its comments; only the time budget
+		// stops the loop, and the issues are newest-updated first, so the
+		// unread tail is the stalest. The tail is named by key.
 		if !timeLeft(ctx) {
-			note("time budget exhausted after %d of %d issues", n, len(issues))
+			note("time budget exhausted after %d of %d issues; not reached: %s", n, len(issues), unreadKeys(issues[n:]))
 			break
 		}
 		f := is.Fields
@@ -749,6 +748,31 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		return out, &PartialError{Reason: strings.Join(partial, "; ")}
 	}
 	return out, nil
+}
+
+// unreadKeys lists the keys of issues the comment loop did not reach, at most
+// jiraMaxNamedUnread of them. A key outside jiraKeyRe is counted, never
+// printed.
+func unreadKeys(issues []jiraIssue) string {
+	var keys []string
+	for _, is := range issues {
+		if jiraKeyRe.MatchString(is.Key) {
+			keys = append(keys, is.Key)
+		}
+	}
+	more := len(issues) - len(keys)
+	if len(keys) > jiraMaxNamedUnread {
+		more += len(keys) - jiraMaxNamedUnread
+		keys = keys[:jiraMaxNamedUnread]
+	}
+	out := strings.Join(keys, ", ")
+	if more > 0 {
+		if out != "" {
+			out += " "
+		}
+		out += fmt.Sprintf("+%d more", more)
+	}
+	return out
 }
 
 // jiraBase returns a Finding constructor for an issue. A key outside
