@@ -532,6 +532,42 @@ func TestJiraPort_BudgetCutsInFlightCallAndKeepsFindings(t *testing.T) {
 	}
 }
 
+// The comment loop can use the whole port budget; the release-wave checks must
+// still run, so a stale wave is reported even when every comment read is cut.
+func TestJiraPort_ReleaseWaveSurvivesExhaustedCommentBudget(t *testing.T) {
+	h := time.Hour
+	fx := &jiraFixture{
+		issues: []map[string]any{
+			issue("P23-1", "In Progress", "indeterminate", humanID, 240*h, 5*h, "slow comments"),
+			issue("P23-2", "In Progress", "indeterminate", humanID, 240*h, 5*h, "never reached"),
+		},
+		comments:  map[string][]map[string]any{"P23-1": {comment("101", humanID, 5*h, "a?", "")}},
+		waves:     []map[string]any{issue("P23-9", "In Progress", "indeterminate", "", 500*h, 300*h, "Release wave 12")},
+		waveChild: map[string][]map[string]any{"P23-9": {issue("P23-91", "In UAT", "indeterminate", "", 400*h, 250*h, "child")}},
+		slowKey:   "P23-1", slowFor: 5 * time.Second,
+	}
+	oldMargin := budgetMargin
+	budgetMargin = 600 * time.Millisecond
+	defer func() { budgetMargin = oldMargin }()
+	p, in := newJiraTest(t, fx, []string{personaID})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	findings, err := p.Sweep(ctx, in)
+	var partial *PartialError
+	if !errors.As(err, &partial) {
+		t.Fatalf("a cut comment loop must be partial: %v", err)
+	}
+	var wave bool
+	for _, f := range findings {
+		if f.Kind == "release-wave-stale" && f.Key == "P23-9" {
+			wave = true
+		}
+	}
+	if !wave {
+		t.Errorf("the release-wave check must run before the comment loop can spend the budget: findings %+v, partial %q", findings, partial.Reason)
+	}
+}
+
 // Below the WIP limit the port names the top of the persona's ranked To Do
 // queue, one finding per free slot, skipping issues not on the board (the
 // backlog). The fingerprint is the WIP count, so a candidate comes back

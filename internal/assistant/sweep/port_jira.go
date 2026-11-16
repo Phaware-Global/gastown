@@ -524,6 +524,36 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	}
 
 	var out []Finding
+	// Release waves are checked before the comment loop: that loop is bounded
+	// only by the port budget and can spend all of it, which would silently
+	// skip the few calls the waves need. A wave the budget still cuts is named
+	// in the partial note.
+	for _, w := range waves {
+		if !jiraKeyRe.MatchString(w.Key) {
+			note("release wave with malformed key skipped")
+			continue
+		}
+		if !timeLeft(ctx) {
+			note("time budget exhausted before release wave %s", w.Key)
+			break
+		}
+		children, err := c.searchFirst(fmt.Sprintf(`parent = %s ORDER BY updated DESC`, w.Key))
+		if err != nil {
+			note("%s: subtasks unavailable: %v", w.Key, err)
+			continue
+		}
+		last := time.Time(w.Fields.Updated)
+		if len(children) > 0 && time.Time(children[0].Fields.Updated).After(last) {
+			last = time.Time(children[0].Fields.Updated)
+		}
+		if in.Now.Sub(last) >= d.stale {
+			fd := jiraBase(w, browse)("release-wave-stale", SeverityInfo)
+			fd.Since = last
+			fd.Suggest = "review release wave " + w.Key
+			fd.Fingerprint = last.UTC().Format(time.RFC3339)
+			out = append(out, fd)
+		}
+	}
 	// WIP needs only assignee and status, which the search already returned
 	// for every issue, so it is counted before the time budget can cut the
 	// comment loop short.
@@ -711,32 +741,6 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		if rank < free && !queueComplete && queueErr == nil {
 			note("queue search truncated after %d issues: %d of %d free WIP slots named", len(queue), rank, free)
-		}
-	}
-	for _, w := range waves {
-		if !jiraKeyRe.MatchString(w.Key) {
-			note("release wave with malformed key skipped")
-			continue
-		}
-		if !timeLeft(ctx) {
-			note("time budget exhausted before release wave %s", w.Key)
-			break
-		}
-		children, err := c.searchFirst(fmt.Sprintf(`parent = %s ORDER BY updated DESC`, w.Key))
-		if err != nil {
-			note("%s: subtasks unavailable: %v", w.Key, err)
-			continue
-		}
-		last := time.Time(w.Fields.Updated)
-		if len(children) > 0 && time.Time(children[0].Fields.Updated).After(last) {
-			last = time.Time(children[0].Fields.Updated)
-		}
-		if in.Now.Sub(last) >= d.stale {
-			fd := jiraBase(w, browse)("release-wave-stale", SeverityInfo)
-			fd.Since = last
-			fd.Suggest = "review release wave " + w.Key
-			fd.Fingerprint = last.UTC().Format(time.RFC3339)
-			out = append(out, fd)
 		}
 	}
 	for i := range out {

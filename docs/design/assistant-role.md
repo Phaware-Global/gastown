@@ -568,6 +568,9 @@ Comments are fetched for every issue the involved-issue search returns (up to
 `jiraMaxPages` pages), newest-updated first. Only the port's time budget stops
 the loop; the port is then partial and the note names the issues not reached by
 key (at most ten, then a count), so the unread tail is the stalest.
+Release waves are checked before the comment loop, so a loop that spends the
+whole budget cannot skip them; a wave the budget still cuts is named in the
+partial note.
 
 | Kind | Condition (deterministic) | Why it exists |
 |---|---|---|
