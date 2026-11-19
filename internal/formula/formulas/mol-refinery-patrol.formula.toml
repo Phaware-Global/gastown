@@ -369,8 +369,14 @@ git fetch --prune origin
 ORPHAN_CANDIDATES=$(git branch -r \\
   | { grep -oE 'origin/polecat/[^ ]+' || true; } \\
   | sed 's|origin/||' \\
+  | { grep -vE '(^polecat/(.*/)?preserve|-preserved$)' || true; } \\
   | sort -u)
 ```
+
+Branches named `polecat/preserve*`, `polecat/<name>/preserve*` or ending in
+`-preserved` are deliberate preservation branches, kept on purpose. They
+are never orphans: the filter above drops them, so never escalate, merge
+or delete them.
 
 **Step 2: enumerate branches referenced by open MR beads**
 Two hazards in this pipeline, both of which would abort the orphan
