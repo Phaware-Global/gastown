@@ -39,6 +39,7 @@ func main() {
 		maxSessions = flag.Int("max-sessions", 1, "concurrent session cap")
 		execModes   = flag.String("exec-modes", "native", "comma-separated supported exec modes (native,container)")
 		docker      = flag.Bool("docker", false, "advertise a usable docker daemon")
+		codesignID  = flag.String("codesign-identity", "", "keychain code-signing identity (macOS): re-sign pushed binaries with it before installing, so privacy grants survive a push")
 		agentEnvGT  = flag.String("agent-env-file", "", "operator-managed KEY=VALUE file supplying worker-local agent credentials (§8); injected into the agent, never transmitted")
 
 		// Enrollment mode (§3.1): `gt-worker-client enroll -listen ... -join-token ... -tls-dir ...`
@@ -129,16 +130,17 @@ func main() {
 	}
 
 	svc, err := workerclient.New(workerclient.Config{
-		WorkerID:     *workerID,
-		Token:        *token,
-		StateDir:     *stateDir,
-		ProxyURL:     *proxyURL,
-		GTDir:        *gtDir,
-		MaxSessions:  *maxSessions,
-		ExecModes:    strings.Split(*execModes, ","),
-		Docker:       *docker,
-		AgentEnvFile: *agentEnvGT,
-		Log:          log,
+		WorkerID:         *workerID,
+		Token:            *token,
+		StateDir:         *stateDir,
+		ProxyURL:         *proxyURL,
+		GTDir:            *gtDir,
+		MaxSessions:      *maxSessions,
+		ExecModes:        strings.Split(*execModes, ","),
+		Docker:           *docker,
+		AgentEnvFile:     *agentEnvGT,
+		CodesignIdentity: *codesignID,
+		Log:              log,
 	})
 	if err != nil {
 		log.Error("service config invalid", "err", err)

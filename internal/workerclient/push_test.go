@@ -551,3 +551,103 @@ func TestContainerPlatform_NegativeProbeExpires(t *testing.T) {
 	require.Eventually(t, func() bool { return svc.containerPlatform() == "linux-amd64" },
 		5*time.Second, 25*time.Millisecond, "a recovered daemon must be picked up without a restart")
 }
+
+// fakeCodesign puts a codesign on PATH that records its argv and exits with
+// status 0 (ok) or 1. Returns the log path.
+func fakeCodesign(t *testing.T, ok bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "codesign.log")
+	status := "1"
+	if ok {
+		status = "0"
+	}
+	script := "#!/bin/sh\necho \"$*\" >> " + log + "\nexit " + status + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "codesign"), []byte(script), 0755))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return log
+}
+
+// A pushed binary arrives with whatever signature the orchestrator's build
+// gave it — a different code hash on every upgrade. A worker configured with a
+// signing identity re-signs it under the stable identifier BEFORE it replaces
+// the installed binary, so the designated requirement macOS privacy grants are
+// keyed to does not change across pushes.
+func TestPush_ResignsWithTheWorkersIdentityBeforeInstalling(t *testing.T) {
+	log := fakeCodesign(t, true)
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL, func(c *Config) {
+		c.CodesignIdentity = "gt-local"
+		c.RestartHook = func() {} // the staged worker binary is applied when the connection closes
+	})
+
+	resp := pushBinary(t, addr, BinProxyClient, []byte("new-proxy-client"), false)
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "msg: %s", resp.Msg)
+
+	data, err := os.ReadFile(log)
+	require.NoError(t, err)
+	line := strings.TrimSpace(string(data))
+	assert.True(t, strings.HasPrefix(line, "-f -s gt-local --identifier com.gastown.gt-proxy-client "), "codesign argv: %s", line)
+	assert.Contains(t, line, filepath.Join(svc.cfg.StateDir, "staging"), "the STAGED file is signed, not the installed one")
+
+	// The worker's own binary is signed when it is staged, so the file that is
+	// later swapped in already carries the stable signature.
+	resp = pushBinary(t, addr, BinWorkerClient, []byte("new-worker-client"), false)
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "msg: %s", resp.Msg)
+	data, err = os.ReadFile(log)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "--identifier com.gastown.gt-worker-client ")
+}
+
+// Signing is configured and fails: the push is refused and the installed
+// binary stays. Installing it unsigned would silently swap a stable signature
+// for an ad-hoc one.
+func TestPush_FailedResignRefusesThePush(t *testing.T) {
+	fakeCodesign(t, false)
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL, func(c *Config) { c.CodesignIdentity = "gt-local" })
+	installed := filepath.Join(svc.cfg.StateDir, "bin", BinProxyClient)
+	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0755))
+	require.NoError(t, os.WriteFile(installed, []byte("old-proxy-client"), 0755))
+
+	resp := pushBinary(t, addr, BinProxyClient, []byte("new-proxy-client"), false)
+	require.Equal(t, sockproto.TypeError, resp.Type)
+	assert.Equal(t, "sign", resp.Code)
+
+	data, err := os.ReadFile(installed)
+	require.NoError(t, err)
+	assert.Equal(t, "old-proxy-client", string(data))
+	leftovers, _ := os.ReadDir(filepath.Join(svc.cfg.StateDir, "staging"))
+	assert.Empty(t, leftovers, "the unsigned staged file must not linger")
+}
+
+// No identity configured: nothing is signed (a Linux worker, or an operator
+// who has not opted in), exactly as before.
+func TestPush_NoIdentityDoesNotSign(t *testing.T) {
+	log := fakeCodesign(t, true)
+	proxyURL, _, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+
+	resp := pushBinary(t, addr, BinProxyClient, []byte("new-proxy-client"), false)
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type)
+	_, err := os.Stat(log)
+	assert.True(t, os.IsNotExist(err), "codesign must not run without an identity")
+}
+
+// A binary tagged for the work container's platform is not something this
+// machine executes, so it is never signed with this machine's identity.
+func TestPush_ContainerPlatformBinaryIsNotSigned(t *testing.T) {
+	log := fakeCodesign(t, true)
+	proxyURL, _, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL, func(c *Config) { c.CodesignIdentity = "gt-local" })
+
+	resp := pushBinaryFor(t, addr, BinProxyClient, "linux-arm64", []byte("linux-proxy-client"), false)
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "msg: %s", resp.Msg)
+	_, err := os.Stat(log)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestNew_RefusesAdHocCodesignIdentity(t *testing.T) {
+	_, err := New(Config{StateDir: t.TempDir(), ProxyURL: "https://x:1", Token: "t", CodesignIdentity: "-"})
+	require.Error(t, err)
+}

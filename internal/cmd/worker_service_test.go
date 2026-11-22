@@ -95,10 +95,12 @@ func TestPlanWorkerService_TCPJob(t *testing.T) {
 		Listen: "0.0.0.0:9878", ProxyURL: "https://orch.local:9876",
 		StateDir: stateDir, WorkerName: "mac-mini-1", AgentEnvFile: envFile,
 		TLSDir: tlsDir, ExecModes: "native,container", MaxSessions: 2,
+		CodesignIdentity: "gt-local",
 	})
 	require.NoError(t, err)
 
 	argv := strings.Join(plan.Args, " ")
+	assert.Contains(t, argv, "-codesign-identity gt-local")
 	assert.Contains(t, argv, "-worker-id mac-mini-1")
 	assert.Contains(t, argv, "-tls-cert "+filepath.Join(tlsDir, workerclient.MachineCertFile))
 	assert.Contains(t, argv, "-tls-client-ca "+filepath.Join(tlsDir, workerclient.ClientCAFile))
@@ -316,4 +318,19 @@ func TestDefaultWorkerStateDir(t *testing.T) {
 	// cannot create.
 	assert.NotEqual(t, "/var/lib/gt-worker", d)
 	assert.True(t, strings.HasSuffix(d, filepath.Join("Library", "Application Support", "gt-worker")), d)
+}
+
+// An ad-hoc identity re-signs with a new code hash every time, which is the
+// instability the option exists to remove.
+func TestPlanWorkerService_RefusesAdHocCodesignIdentity(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	_, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/w.sock", ProxyURL: "https://orch.local:9876",
+		StateDir: t.TempDir(), CodesignIdentity: "-",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "codesign-identity")
 }

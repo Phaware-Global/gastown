@@ -57,6 +57,7 @@ Example (TCP, mTLS, enrolled as this machine's name):
 		o.StateDir, _ = cmd.Flags().GetString("state-dir")
 		o.WorkerName, _ = cmd.Flags().GetString("worker-name")
 		o.AgentEnvFile, _ = cmd.Flags().GetString("agent-env-file")
+		o.CodesignIdentity, _ = cmd.Flags().GetString("codesign-identity")
 		o.TLSDir, _ = cmd.Flags().GetString("tls-dir")
 		o.ExecModes, _ = cmd.Flags().GetString("exec-modes")
 		o.GTDir, _ = cmd.Flags().GetString("gt-dir")
@@ -91,6 +92,9 @@ type workerServiceOpts struct {
 	ExecModes    string
 	GTDir        string
 	MaxSessions  int
+	// CodesignIdentity makes the worker re-sign pushed binaries (see
+	// workerclient.Config.CodesignIdentity).
+	CodesignIdentity string
 }
 
 // workerServicePlan is a validated, fully-resolved job description: every path
@@ -149,6 +153,12 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	args := []string{"-listen", o.Listen, "-proxy-url", o.ProxyURL, "-state-dir", stateDir}
 	if o.WorkerName != "" {
 		args = append(args, "-worker-id", o.WorkerName)
+	}
+	if o.CodesignIdentity != "" {
+		if strings.HasPrefix(o.CodesignIdentity, "-") {
+			return nil, fmt.Errorf("--codesign-identity must name a keychain identity; %q is ad-hoc signing and does not keep privacy grants", o.CodesignIdentity)
+		}
+		args = append(args, "-codesign-identity", o.CodesignIdentity)
 	}
 	if o.AgentEnvFile != "" {
 		abs, err := filepath.Abs(o.AgentEnvFile)
@@ -474,6 +484,7 @@ func init() {
 	f.String("state-dir", "", "session state dir (default ~/Library/Application Support/gt-worker)")
 	f.String("worker-name", "", "this machine's enrolled name, reported in the handshake")
 	f.String("agent-env-file", "", "KEY=VALUE file supplying agent credentials worker-side (§8)")
+	f.String("codesign-identity", "", "keychain code-signing identity (macOS): re-sign pushed binaries so privacy grants survive a push")
 	f.String("tls-dir", "", "enrollment output dir holding worker.crt/worker.key + the worker CA (TCP mTLS)")
 	f.String("exec-modes", "native", "comma-separated exec modes to advertise (native,container)")
 	f.Int("max-sessions", 1, "concurrent session cap")
