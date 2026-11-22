@@ -96,6 +96,17 @@ func (b *SocketBackend) endpointFor(spec execution.PolecatSpec) execution.Endpoi
 	}
 }
 
+// stagedWorkerClient reports whether a binary refresh left a new worker
+// service staged: pushed, but not running until the worker is idle.
+func stagedWorkerClient(pushed []PushResult) bool {
+	for _, r := range pushed {
+		if r.Name == "gt-worker-client" && r.Applied == "staged" {
+			return true
+		}
+	}
+	return false
+}
+
 // errWorkerRestarting marks a refusal from a worker that is exiting onto a
 // pushed binary. Its supervisor brings it straight back, so this is transient
 // by construction — see Provision's retry.
@@ -157,7 +168,8 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 	// still runs sessions, since protocol version (not gt version) is the
 	// compatibility gate, and failing a session a user is waiting on because of
 	// a version bump would be the wrong trade.
-	if err := b.pushBinaries(ctx, c); err != nil {
+	pushed, err := b.pushTo(ctx, c, false)
+	if err != nil {
 		slog.Default().Warn("socket: binary refresh skipped", "worker", c.ack.WorkerID, "err", err)
 	}
 
@@ -179,7 +191,15 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 	// start the agent with no settings, so no hooks and no guards. The binary
 	// refresh above is best-effort and a busy worker defers its own upgrade,
 	// so this is reachable; refuse rather than open that session.
+	//
+	// The handshake predates the refresh above. If that refresh just staged a
+	// new worker binary, an idle worker applies it as soon as this connection
+	// closes, and the next handshake may well carry the capability: retry
+	// rather than report a refusal the upgraded worker would not make.
 	if len(spec.Files) > 0 && !c.ack.Capabilities.GetAgentFiles() {
+		if stagedWorkerClient(pushed) {
+			return execution.Endpoint{}, fmt.Errorf("socket: worker at %s cannot receive the agent's settings file yet, a newer binary was just staged on it: %w", b.settings.Address, errWorkerRestarting)
+		}
 		return execution.Endpoint{}, fmt.Errorf("socket: worker at %s runs a binary that cannot receive the agent's settings file (gt %s): upgrade the worker, or wait for it to go idle and apply its pending update", b.settings.Address, c.ack.GTVersion)
 	}
 

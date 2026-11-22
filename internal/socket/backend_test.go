@@ -46,6 +46,11 @@ type fakeWorker struct {
 	containerPlatform      string
 	containerClient        string
 	noAgentFiles           bool // an older worker: hello_ack lacks the agent_files capability
+	// stageWorkerClient makes a pushed gt-worker-client "staged" rather than
+	// installed, as a running worker does. The upgrade takes effect for the
+	// next handshake: it then reports agent_files whatever noAgentFiles says.
+	stageWorkerClient bool
+	upgraded          bool
 
 	// knobs
 	refusePush   string // non-empty → answer a terminal push chunk with this error code
@@ -92,8 +97,13 @@ func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
 	}
 	w.pushes[key] = &pushedBinary{data: w.pushBuf[key], sha: m.SHA256}
 	delete(w.pushBuf, key)
+	applied := "installed"
+	if w.stageWorkerClient && m.Name == "gt-worker-client" {
+		applied = "staged"
+		w.upgraded = true
+	}
 	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID,
-		Name: m.Name, Platform: m.Platform, Applied: "installed"})
+		Name: m.Name, Platform: m.Platform, Applied: applied})
 }
 
 // sessionOpenAttempts reports how many session_opens arrived.
@@ -185,6 +195,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 			}
 			w.mu.Lock()
 			sess := append([]sockproto.SessionSummary(nil), w.sessions...)
+			agentFiles := !w.noAgentFiles || w.upgraded
 			w.mu.Unlock()
 			workerOS, workerArch := w.os, w.arch
 			if workerOS == "" {
@@ -199,7 +210,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				Arch:         workerArch,
 				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"},
 					MaxSessions: w.maxSessions, ContainerPlatform: w.containerPlatform,
-					ContainerClient: w.containerClient, AgentFiles: !w.noAgentFiles},
+					ContainerClient: w.containerClient, AgentFiles: agentFiles},
 				Sessions: sess,
 			})
 		case sockproto.TypePushBinary:
@@ -418,6 +429,35 @@ func TestProvision_WorkerWithoutAgentFilesIsRefused(t *testing.T) {
 	// Without files there is nothing to lose, so the same worker is still usable.
 	_, err = b.Provision(context.Background(), spec())
 	require.NoError(t, err)
+}
+
+// An idle worker on an older binary is refreshed by this very provision: the
+// new gt-worker-client is staged and applied when the connection closes. The
+// handshake this attempt holds still describes the old binary, so the gate
+// would refuse a session the upgraded worker accepts. It must retry instead.
+func TestProvision_RetriesWhenItsOwnPushStagedTheUpgrade(t *testing.T) {
+	prev := provisionRetryDelay
+	provisionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { provisionRetryDelay = prev })
+
+	w := newFakeWorker(t)
+	w.noAgentFiles = true
+	w.stageWorkerClient = true
+	w.gtVersion = "1.2.2"
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-worker-client"), []byte("payload"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	withFiles := spec()
+	withFiles.Files = map[string]string{"/host/polecats/.claude/settings.json": "{}"}
+	_, err := b.Provision(context.Background(), withFiles)
+	require.NoError(t, err, "the upgrade this provision staged must be retried onto, not reported")
+	assert.Equal(t, 1, w.sessionOpenAttempts(), "the session is opened once, on the upgraded worker")
 }
 
 func TestProvision_SessionError(t *testing.T) {
