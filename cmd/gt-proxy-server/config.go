@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"time"
 )
 
 // ProxyConfig is the configuration file schema for gt-proxy-server.
@@ -56,6 +58,23 @@ type ProxyConfig struct {
 	//   - A split-horizon DNS entry that resolves to the proxy IP
 	//   - A mDNS name (e.g. "macbook.local")
 	ExtraSANHosts []string `json:"extra_san_hosts"`
+
+	// ExecTimeout is the longest a single proxied gt/bd command may run, as a
+	// Go duration ("5m"). Empty keeps the server default (60s). A remote
+	// polecat's gt done runs through the proxy and can need longer.
+	ExecTimeout string `json:"exec_timeout"`
+}
+
+// execTimeout parses ExecTimeout. Empty yields 0, the server default.
+func (c ProxyConfig) execTimeout() (time.Duration, error) {
+	if c.ExecTimeout == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.ExecTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("exec_timeout %q: %w", c.ExecTimeout, err)
+	}
+	return d, nil
 }
 
 // loadConfig reads the config file at path and returns a ProxyConfig.

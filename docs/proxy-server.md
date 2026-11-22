@@ -123,8 +123,12 @@ The default subcommand allowlists are:
 
 | Binary | Subcommands |
 |--------|-------------|
-| `gt` | `prime`, `hook`, `done`, `mail`, `nudge`, `mol`, `status`, `handoff`, `version`, `convoy`, `sling` |
-| `bd` | `create`, `update`, `close`, `show`, `list`, `ready`, `dep`, `export`, `prime`, `stats`, `blocked`, `doctor` |
+| `gt` | `prime`, `hook`, `done`, `mail`, `nudge`, `mol`, `status`, `handoff`, `version`, `convoy`, `sling`, `tap`, `escalate` |
+| `bd` | `create`, `update`, `close`, `show`, `list`, `ready`, `dep`, `export`, `prime`, `stats`, `blocked`, `doctor`, `formula`, `mol` |
+
+`gt tap` is the agent's hook handlers (`gt tap guard …`). They read the tool
+input from stdin, so `gt-proxy-client` forwards stdin for `gt tap` calls — and
+only for those — in the request's `stdin` field.
 
 #### Auto-discovery via `gt proxy-subcmds`
 

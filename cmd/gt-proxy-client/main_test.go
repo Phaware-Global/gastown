@@ -432,3 +432,33 @@ func TestWithCleanupStatus(t *testing.T) {
 		})
 	}
 }
+
+// Hook handlers (gt tap …) are fed the tool input on stdin by the agent's hook
+// runner, which closes the pipe. Every other call must not read stdin at all:
+// an agent's shell can leave it open, and a read would hang the command.
+func TestStdinForRequest(t *testing.T) {
+	in := strings.NewReader(`{"tool_input":{"command":"ls"}}`)
+
+	got, err := stdinForRequest("gt", []string{"tap", "guard", "pr-workflow"}, in)
+	require.NoError(t, err)
+	assert.Equal(t, `{"tool_input":{"command":"ls"}}`, got)
+
+	for _, tc := range []struct {
+		tool string
+		args []string
+	}{
+		{"gt", []string{"done"}},
+		{"gt", []string{"mail", "inbox"}},
+		{"bd", []string{"tap"}},
+		{"gt", nil},
+	} {
+		got, err := stdinForRequest(tc.tool, tc.args, strings.NewReader("unread"))
+		require.NoError(t, err)
+		assert.Empty(t, got, "%s %v must not read stdin", tc.tool, tc.args)
+	}
+}
+
+func TestStdinForRequest_TooLargeIsAnError(t *testing.T) {
+	_, err := stdinForRequest("gt", []string{"tap", "guard", "pr-workflow"}, strings.NewReader(strings.Repeat("x", maxForwardedStdin+1)))
+	require.Error(t, err)
+}

@@ -5,8 +5,9 @@ import (
 )
 
 var tapCmd = &cobra.Command{
-	Use:   "tap",
-	Short: "Claude Code hook handlers",
+	Use:         "tap",
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Claude Code hook handlers",
 	Long: `Hook handlers for Claude Code PreToolUse and PostToolUse events.
 
 These commands are called by Claude Code hooks to implement policies,

@@ -31,8 +31,13 @@ import (
 )
 
 type execRequest struct {
-	Argv []string `json:"argv"`
+	Argv  []string `json:"argv"`
+	Stdin string   `json:"stdin,omitempty"`
 }
+
+// maxForwardedStdin bounds the hook input forwarded with a request. The server
+// caps the whole request body at 1 MiB.
+const maxForwardedStdin = 512 << 10
 
 type execResponse struct {
 	Stdout   string `json:"stdout"`
@@ -86,7 +91,13 @@ func main() {
 	}
 	argv = withCleanupStatus(argv, unsaved)
 
-	body, err := json.Marshal(execRequest{Argv: argv})
+	stdin, err := stdinForRequest(toolName, os.Args[1:], os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
+		os.Exit(1)
+	}
+
+	body, err := json.Marshal(execRequest{Argv: argv, Stdin: stdin})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: encode request: %v\n", err)
 		os.Exit(1)
@@ -260,6 +271,24 @@ func runGit(cmd *exec.Cmd, dir string) (string, error) {
 	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// stdinForRequest returns the stdin to forward with a proxied call. Only
+// `gt tap …` gets one: those are the agent's hook handlers, which are handed
+// the tool input on a pipe that the hook runner closes. No other command reads
+// stdin here — an agent's shell can leave it open, and reading it would hang.
+func stdinForRequest(tool string, args []string, in io.Reader) (string, error) {
+	if tool != "gt" || len(args) == 0 || args[0] != "tap" {
+		return "", nil
+	}
+	data, err := io.ReadAll(io.LimitReader(in, maxForwardedStdin+1))
+	if err != nil {
+		return "", fmt.Errorf("read hook input from stdin: %w", err)
+	}
+	if len(data) > maxForwardedStdin {
+		return "", fmt.Errorf("hook input on stdin exceeds %d bytes", maxForwardedStdin)
+	}
+	return string(data), nil
 }
 
 // toolNameFromArg0 extracts "gt" or "bd" from the argv[0] binary path.
