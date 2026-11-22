@@ -405,7 +405,7 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	// not exist there, with no hooks and no error, so it is refused until the
 	// files are delivered somewhere the container can read.
 	if m.ExecMode == "container" && len(m.Files) > 0 {
-		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: "agent files are not delivered to a container session yet: the agent would start without its settings and hooks; use exec_mode native"})
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: "agent files are not delivered to a container session yet: the agent would start without its settings and hooks. Use exec_mode native where the rig allows it (network.mode sandboxed requires container mode, so such a rig cannot run this agent on a remote worker yet)"})
 		return
 	}
 	if m.Branch != "" && !validBranch(m.Branch) {
