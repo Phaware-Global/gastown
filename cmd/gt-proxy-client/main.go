@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -74,6 +75,13 @@ func main() {
 	toolName := toolNameFromArg0(os.Args[0])
 	argv = append([]string{toolName}, os.Args[1:]...)
 
+	if cwd, err := os.Getwd(); err == nil {
+		if err := pushWorkBeforeDone(toolName, os.Args[1:], cwd); err != nil {
+			fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	body, err := json.Marshal(execRequest{Argv: argv})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: encode request: %v\n", err)
@@ -106,6 +114,34 @@ func main() {
 		_, _ = fmt.Fprint(os.Stderr, result.Stderr)
 	}
 	os.Exit(result.ExitCode)
+}
+
+// pushWorkBeforeDone pushes the polecat's branch to the host before a proxied
+// `gt done`. gt done runs on the host, against the host's copy of the branch;
+// commits that exist only in this worktree would be invisible to it, and the
+// bead would complete without the work. A failed push is therefore an error
+// that stops gt done. Anything that is not `gt done` on a polecat/ branch in a
+// git worktree is left alone.
+func pushWorkBeforeDone(tool string, args []string, dir string) error {
+	if tool != "gt" || len(args) == 0 || args[0] != "done" {
+		return nil
+	}
+	head := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+	head.Dir = dir
+	out, err := head.Output()
+	if err != nil {
+		return nil // not a worktree, or detached HEAD: nothing of ours to push
+	}
+	branch := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(branch, "polecat/") {
+		return nil
+	}
+	push := exec.Command("git", "push", "origin", "HEAD:refs/heads/"+branch)
+	push.Dir = dir
+	if out, err := push.CombinedOutput(); err != nil {
+		return fmt.Errorf("pushing %s to the host before gt done: %v: %s", branch, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // toolNameFromArg0 extracts "gt" or "bd" from the argv[0] binary path.

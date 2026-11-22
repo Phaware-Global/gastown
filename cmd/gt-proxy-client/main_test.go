@@ -9,7 +9,9 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,4 +126,92 @@ func writeTestKeypair(t *testing.T, dir string) (certFile, keyFile, caFile strin
 func TestToolNameFromArg0(t *testing.T) {
 	assert.Equal(t, "gt", toolNameFromArg0("/opt/gt/bin/gt"))
 	assert.Equal(t, "bd", toolNameFromArg0("bd"))
+}
+
+func gitT(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// polecatClone returns a clone on a polecat branch with one unpushed commit,
+// and the bare repo it was cloned from.
+func polecatClone(t *testing.T, branch string) (clone, bare string) {
+	t.Helper()
+	root := t.TempDir()
+	bare = filepath.Join(root, "repo.git")
+	gitT(t, root, "init", "--bare", "-b", "main", bare)
+	clone = filepath.Join(root, "wt")
+	gitT(t, root, "clone", bare, clone)
+	gitT(t, clone, "commit", "--allow-empty", "-m", "initial")
+	gitT(t, clone, "push", "origin", "HEAD:refs/heads/main")
+	gitT(t, clone, "checkout", "-b", branch)
+	gitT(t, clone, "commit", "--allow-empty", "-m", "work")
+	return clone, bare
+}
+
+// gt done runs on the host, so the remote agent's commits must be on the host
+// before the call is forwarded.
+func TestPushWorkBeforeDone_PushesPolecatBranch(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	clone, bare := polecatClone(t, branch)
+
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone); err != nil {
+		t.Fatalf("pushWorkBeforeDone: %v", err)
+	}
+	if got, want := gitT(t, bare, "rev-parse", "refs/heads/"+branch), gitT(t, clone, "rev-parse", "HEAD"); got != want {
+		t.Fatalf("host branch = %s, want the worker's HEAD %s", got, want)
+	}
+}
+
+func TestPushWorkBeforeDone_OnlyForGtDoneOnAPolecatBranch(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	clone, bare := polecatClone(t, branch)
+	for _, tc := range []struct {
+		tool string
+		args []string
+	}{
+		{"gt", []string{"prime"}},
+		{"bd", []string{"done"}},
+		{"gt", nil},
+	} {
+		if err := pushWorkBeforeDone(tc.tool, tc.args, clone); err != nil {
+			t.Fatalf("%s %v: %v", tc.tool, tc.args, err)
+		}
+	}
+	gitT(t, clone, "checkout", "main")
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone); err != nil {
+		t.Fatalf("non-polecat branch: %v", err)
+	}
+	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	cmd.Dir = bare
+	if cmd.Run() == nil {
+		t.Fatal("nothing should have been pushed")
+	}
+	// Outside a git worktree there is nothing to push, and that is not an error.
+	if err := pushWorkBeforeDone("gt", []string{"done"}, t.TempDir()); err != nil {
+		t.Fatalf("outside a worktree: %v", err)
+	}
+}
+
+// A push that fails must stop gt done: forwarding it would complete the bead
+// against a host branch that does not have the work.
+func TestPushWorkBeforeDone_FailedPushIsAnError(t *testing.T) {
+	clone, bare := polecatClone(t, "polecat/furiosa/gt-abc12@mv3cxv4t")
+	if err := os.RemoveAll(bare); err != nil {
+		t.Fatal(err)
+	}
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone); err == nil {
+		t.Fatal("expected an error when the push fails")
+	}
 }
