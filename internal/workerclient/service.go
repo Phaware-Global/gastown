@@ -399,6 +399,15 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
 		return
 	}
+	// Agent files land beside the session identity, which a work container
+	// does not mount, and only a native session's argv is remapped to them.
+	// A container session would start its agent on a settings path that does
+	// not exist there, with no hooks and no error, so it is refused until the
+	// files are delivered somewhere the container can read.
+	if m.ExecMode == "container" && len(m.Files) > 0 {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: "agent files are not delivered to a container session yet: the agent would start without its settings and hooks; use exec_mode native"})
+		return
+	}
 	if m.Branch != "" && !validBranch(m.Branch) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: fmt.Sprintf("branch %q is not a safe branch name", m.Branch)})
 		return
