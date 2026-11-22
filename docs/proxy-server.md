@@ -383,7 +383,8 @@ curl -s https://api.ipify.org
 | **Exec allowlist** | Containers can only call `gt` and `bd` (or the configured set) | `--allowed-cmds` checked on every `/v1/exec` request |
 | **Subcommand allowlist** | Polecats may only invoke permitted subcommands of `gt`/`bd` | `--allowed-subcmds` checked on every `/v1/exec` request; missing or disallowed subcommands → 403 |
 | **Subcommand injection** | Polecat identity is injected as `--identity <rig>/<name>` and cannot be overridden | Server derives identity from the client certificate, not from the request body |
-| **Branch scope** | A polecat can only push to `refs/heads/polecat/<name>-*` or `refs/heads/polecat/<name>/*` | pkt-line stream parsed and validated before `git-receive-pack` is invoked |
+| **Branch scope** | A polecat can only push to `refs/heads/polecat/<name>-*` or `refs/heads/polecat/<name>/<one segment>` | pkt-line stream parsed and validated before `git-receive-pack` is invoked |
+| **Rig scope** | A polecat can only push to its own rig's repo | The rig in the cert CN must equal the rig in the URL; checked before any ref is read |
 | **Path traversal** | Rig names are validated against `[a-zA-Z0-9_-]+` | Rejects `../` and other traversal attempts |
 | **Body size limits** | `/v1/exec` body capped at 1 MiB; receive-pack ref list capped at 32 MiB | `http.MaxBytesReader` applied before reading |
 | **Env isolation** | `gt`/`bd`/`git` subprocesses only see `HOME` and `PATH` | Server never passes its own `GITHUB_TOKEN`, `GT_TOKEN`, or other credentials |
@@ -495,7 +496,7 @@ allowed scope:
 
 ```
 refs/heads/polecat/<name>-*   ✓ allowed
-refs/heads/polecat/<name>/*   ✓ allowed (a slung polecat's <issue>@<ts> branch)
+refs/heads/polecat/<name>/*   ✓ allowed (a slung polecat's <issue>@<ts> branch; one segment only)
 refs/heads/main               ✗ denied (403 Forbidden)
 refs/heads/polecat/other-*    ✗ denied (belongs to another polecat)
 ```

@@ -176,6 +176,15 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request, repoPath, se
 	// For receive-pack: enforce CN-scoped branch authorization.
 	var refs []string
 	if service == "git-receive-pack" {
+		// The cert names a rig as well as a polecat. Polecat names repeat
+		// across rigs, so a cert for one rig must not push to another rig's
+		// repo, whatever the ref. A CN with no identity falls through to
+		// authorizeReceivePack, which refuses it.
+		if identity != "" && identity != rig+"/"+polecatName(clientCN) {
+			s.log.Warn("git push denied", "identity", identity, "rig", rig, "reason", "cert is for a different rig")
+			http.Error(w, fmt.Sprintf("push to rig %q denied: the client cert is for a different rig", rig), http.StatusForbidden)
+			return
+		}
 		var ok bool
 		ok, refs = s.authorizeReceivePack(w, r, clientCN)
 		if !ok {
@@ -363,11 +372,14 @@ func validateReceivePackRefs(body []byte, cnName string) error {
 		//     without the timestamp suffix are not permitted),
 		//   - refs/heads/polecat/<cnName>/<issue>@<ts>, the branch a slung
 		//     polecat works on (polecat.Manager.buildBranchName) — the "/"
-		//     keeps it inside this polecat's own namespace, and
+		//     keeps it inside this polecat's own namespace, and exactly one
+		//     segment may follow it, so a ref can never reach the namespace
+		//     of a polecat whose own name contains a slash, and
 		//   - refs/checkpoints/polecat/<cnName>, the polecat's own checkpoint
 		//     ref (remote-polecat-execution.md §9.2) — exact name only, so
 		//     one polecat can never move another's checkpoint.
-		slung := strings.HasPrefix(ref, allowedSlung) && len(ref) > len(allowedSlung)
+		rest, underName := strings.CutPrefix(ref, allowedSlung)
+		slung := underName && rest != "" && !strings.Contains(rest, "/")
 		if !strings.HasPrefix(ref, allowed) && !slung && ref != checkpointRef {
 			return fmt.Errorf("push to %q denied: only refs/heads/polecat/%s-*, refs/heads/polecat/%s/* or %s allowed", ref, cnName, cnName, checkpointRef)
 		}
