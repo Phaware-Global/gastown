@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -100,7 +101,9 @@ func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
 	applied := "installed"
 	if w.stageWorkerClient && m.Name == "gt-worker-client" {
 		applied = "staged"
-		w.upgraded = true
+		// As on a real worker, a staged binary is applied only once no
+		// session is left.
+		w.upgraded = len(w.sessions) == 0
 	}
 	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID,
 		Name: m.Name, Platform: m.Platform, Applied: applied})
@@ -458,6 +461,91 @@ func TestProvision_RetriesWhenItsOwnPushStagedTheUpgrade(t *testing.T) {
 	_, err := b.Provision(context.Background(), withFiles)
 	require.NoError(t, err, "the upgrade this provision staged must be retried onto, not reported")
 	assert.Equal(t, 1, w.sessionOpenAttempts(), "the session is opened once, on the upgraded worker")
+}
+
+// stagedUpgradeBackend is a backend whose worker runs an older binary without
+// agent_files, stages a pushed gt-worker-client, and has that binary on hand.
+func stagedUpgradeBackend(t *testing.T) (*SocketBackend, *fakeWorker, execution.PolecatSpec) {
+	t.Helper()
+	prev := provisionRetryDelay
+	provisionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { provisionRetryDelay = prev })
+
+	w := newFakeWorker(t)
+	w.noAgentFiles = true
+	w.stageWorkerClient = true
+	w.gtVersion = "1.2.2"
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-worker-client"), []byte("payload"), 0755))
+	t.Cleanup(SetBinarySourceForTest(root))
+
+	withFiles := spec()
+	withFiles.Files = map[string]string{"/host/polecats/.claude/settings.json": "{}"}
+	return b, w, withFiles
+}
+
+// A worker with live sessions stages the upgrade but does not apply it, so a
+// retry would only push the same binaries again at a worker that is serving
+// agents, and fail the same way. It must be refused once, with the remedy.
+func TestProvision_DoesNotRetryAStagedUpgradeOnABusyWorker(t *testing.T) {
+	b, w, withFiles := stagedUpgradeBackend(t)
+	w.maxSessions = 2
+	w.preload(sockproto.SessionSummary{Session: "gt-MyRig-nux", Rig: "MyRig", Polecat: "nux", State: "ready"})
+
+	dials := 0
+	b.dialFn = func(ctx context.Context, s *Settings, id, ver string) (*conn, error) {
+		dials++
+		return dial(ctx, s, id, ver)
+	}
+
+	_, err := b.Provision(context.Background(), withFiles)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, errWorkerRestarting)
+	assert.Contains(t, err.Error(), "upgrade the worker, or wait for it to go idle")
+	assert.Equal(t, 1, dials, "a busy worker must not be re-dialed and re-pushed")
+	assert.Equal(t, 0, w.sessionOpenAttempts())
+}
+
+// Closing the connection that staged the upgrade makes an idle worker exit so
+// its supervisor can start the new binary. Until it is listening again a dial
+// fails outright; that is the restart this provision caused, not a dead worker.
+func TestProvision_RetriesADialFailureAfterStagingTheUpgrade(t *testing.T) {
+	b, w, withFiles := stagedUpgradeBackend(t)
+
+	dials := 0
+	b.dialFn = func(ctx context.Context, s *Settings, id, ver string) (*conn, error) {
+		dials++
+		if dials == 2 || dials == 3 {
+			return nil, errors.New("dial unix: connect: connection refused")
+		}
+		return dial(ctx, s, id, ver)
+	}
+
+	_, err := b.Provision(context.Background(), withFiles)
+	require.NoError(t, err, "the worker being down right after the staged push is its restart")
+	assert.Equal(t, 4, dials)
+	assert.Equal(t, 1, w.sessionOpenAttempts())
+}
+
+// Without a staged upgrade behind it, a dial failure is a worker that is not
+// there: it is reported at once, as before.
+func TestProvision_DoesNotRetryAnUnrelatedDialFailure(t *testing.T) {
+	b, _, withFiles := stagedUpgradeBackend(t)
+
+	dials := 0
+	b.dialFn = func(context.Context, *Settings, string, string) (*conn, error) {
+		dials++
+		return nil, errors.New("dial unix: connect: connection refused")
+	}
+
+	_, err := b.Provision(context.Background(), withFiles)
+	require.Error(t, err)
+	assert.Equal(t, 1, dials)
 }
 
 func TestProvision_SessionError(t *testing.T) {

@@ -120,6 +120,24 @@ const provisionRetries = 2
 // provisionRetryDelay is the wait before each retry.
 var provisionRetryDelay = 500 * time.Millisecond
 
+// errUpgradeStaged is the restart a provision brings about itself: its binary
+// refresh staged a new worker service on an idle worker, which exits to apply
+// it once this connection closes.
+var errUpgradeStaged = fmt.Errorf("%w onto the binary this provision staged", errWorkerRestarting)
+
+// stagedRestartWait is how long a worker that this provision sent into that
+// restart may stay unreachable before the dial failure is believed. A respawn
+// is usually sub-second, but the listener is not up until the new binary has
+// started, so the window is wider than the ordinary retry budget.
+const stagedRestartWait = 15 * time.Second
+
+// dialError marks a failure to reach the worker at all, as opposed to a
+// refusal from it.
+type dialError struct{ err error }
+
+func (e *dialError) Error() string { return e.err.Error() }
+func (e *dialError) Unwrap() error { return e.err }
+
 // Provision opens (or reattaches) a session on the worker (§5, core §9.4).
 //
 // A worker that is restarting onto a pushed binary (§4.1) is retried rather
@@ -140,9 +158,24 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 
 	var ep execution.Endpoint
 	var err error
+	var stagedAt time.Time // when this provision staged the worker's upgrade
 	for attempt := 0; ; attempt++ {
 		ep, err = b.provisionOnce(ctx, spec)
-		if err == nil || !errors.Is(err, errWorkerRestarting) || attempt >= provisionRetries {
+		if err == nil {
+			return ep, nil
+		}
+		retry := errors.Is(err, errWorkerRestarting) && attempt < provisionRetries
+		if errors.Is(err, errUpgradeStaged) && stagedAt.IsZero() {
+			stagedAt = time.Now()
+		}
+		// The worker exits to apply the upgrade and is not listening until
+		// its supervisor has the new binary up. A dial that fails in that
+		// window is the restart this provision caused, not a dead worker.
+		var de *dialError
+		if !stagedAt.IsZero() && errors.As(err, &de) && time.Since(stagedAt) < stagedRestartWait {
+			retry = true
+		}
+		if !retry {
 			return ep, err
 		}
 		slog.Default().Info("socket: worker is restarting onto a pushed binary; retrying provision",
@@ -159,7 +192,7 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.PolecatSpec) (execution.Endpoint, error) {
 	c, err := b.dial(ctx)
 	if err != nil {
-		return execution.Endpoint{}, err
+		return execution.Endpoint{}, &dialError{err}
 	}
 	defer func() { _ = c.close() }()
 
@@ -193,12 +226,14 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 	// so this is reachable; refuse rather than open that session.
 	//
 	// The handshake predates the refresh above. If that refresh just staged a
-	// new worker binary, an idle worker applies it as soon as this connection
-	// closes, and the next handshake may well carry the capability: retry
-	// rather than report a refusal the upgraded worker would not make.
+	// new worker binary, a worker with no sessions applies it as soon as this
+	// connection closes, and the next handshake may well carry the capability:
+	// retry rather than report a refusal the upgraded worker would not make.
+	// A worker with sessions keeps the old binary until they end, so a retry
+	// would only push the same binaries at it again: that one is refused.
 	if len(spec.Files) > 0 && !c.ack.Capabilities.GetAgentFiles() {
-		if stagedWorkerClient(pushed) {
-			return execution.Endpoint{}, fmt.Errorf("socket: worker at %s cannot receive the agent's settings file yet, a newer binary was just staged on it: %w", b.settings.Address, errWorkerRestarting)
+		if stagedWorkerClient(pushed) && len(c.ack.Sessions) == 0 {
+			return execution.Endpoint{}, fmt.Errorf("socket: worker at %s cannot receive the agent's settings file yet, a newer binary was just staged on it: %w", b.settings.Address, errUpgradeStaged)
 		}
 		return execution.Endpoint{}, fmt.Errorf("socket: worker at %s runs a binary that cannot receive the agent's settings file (gt %s): upgrade the worker, or wait for it to go idle and apply its pending update", b.settings.Address, c.ack.GTVersion)
 	}
