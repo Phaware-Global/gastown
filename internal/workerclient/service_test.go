@@ -713,5 +713,7 @@ func TestSessionOpen_RejectsUnsafeBranch(t *testing.T) {
 	spec := polecatSpec()
 	spec.Branch = "--upload-pack=evil"
 	_, err := b.Provision(context.Background(), spec)
-	require.Error(t, err)
+	// The session_open guard's own message: git would also reject this name
+	// later, at checkout, so a bare "some error" would pass without the guard.
+	require.ErrorContains(t, err, "not a safe branch name")
 }
