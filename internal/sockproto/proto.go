@@ -145,6 +145,10 @@ type Message struct {
 	// Branch is the polecat's work branch; the worker checks the cloned
 	// worktree out on it. Empty keeps the clone's default branch.
 	Branch string `json:"branch,omitempty"`
+	// Files are non-secret host files the agent argv names by path, keyed by
+	// that host path. The worker stores each and rewrites an argv token equal
+	// to the key to its own copy.
+	Files map[string]string `json:"files,omitempty"`
 
 	// push_binaries (§4.1). Chunks carry Data; the final chunk sets EOF and the
 	// whole-file SHA256, which the worker verifies before anything is installed.

@@ -163,6 +163,18 @@ func (s *Service) handleAttach(ctx context.Context, c *connState, m *sockproto.M
 	var ready bool
 	if sess != nil {
 		worktree = sess.worktree
+		// Point argv tokens that name a delivered agent file at the local
+		// copy. Whole-token match only; native mode only (a container does
+		// not see the worker's state dir).
+		if len(sess.argvPaths) > 0 && sess.workEnv == nil {
+			argv := append([]string(nil), m.Argv...)
+			for i, tok := range argv {
+				if local, ok := sess.argvPaths[tok]; ok {
+					argv[i] = local
+				}
+			}
+			m.Argv = argv
+		}
 		ready = sess.summary.State == "ready"
 		if sess.workEnv != nil {
 			container = sess.workEnv.ContainerName()

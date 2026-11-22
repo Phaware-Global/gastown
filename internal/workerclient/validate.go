@@ -65,6 +65,29 @@ func validBranch(v string) bool {
 	return true
 }
 
+// Bounds on orchestrator-delivered agent files (session_open files). They are
+// small config documents; anything larger is not what this channel is for.
+const (
+	maxAgentFiles     = 8
+	maxAgentFileBytes = 256 << 10
+)
+
+// validateAgentFiles bounds the session_open files map.
+func validateAgentFiles(files map[string]string) error {
+	if len(files) > maxAgentFiles {
+		return fmt.Errorf("too many agent files (%d, max %d)", len(files), maxAgentFiles)
+	}
+	for k, v := range files {
+		if k == "" {
+			return fmt.Errorf("agent file with an empty path key")
+		}
+		if len(v) > maxAgentFileBytes {
+			return fmt.Errorf("agent file exceeds %d bytes", maxAgentFileBytes)
+		}
+	}
+	return nil
+}
+
 // underRoot asserts that a joined path stays within root — defense in depth
 // behind validateSessionFields, so a joined path can never escape the state
 // dir even if the validation were somehow bypassed.

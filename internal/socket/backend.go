@@ -186,6 +186,7 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 		CheckpointInterval: b.cfg.CheckpointInterval().String(),
 		MaxRuntime:         durationOrEmpty(b.cfg),
 		Branch:             spec.Branch,
+		Files:              spec.Files,
 	}
 	resp, err := c.request(ctx, open)
 	if err != nil {

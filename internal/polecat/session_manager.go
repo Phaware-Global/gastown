@@ -536,9 +536,14 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 		if opts.Command != "" {
 			return fmt.Errorf("explicit command override is not supported with remote execution backend %q", execCfg.BackendName())
 		}
+		agentArgv := runtimeConfig.BuildArgsWithPrompt(beacon)
+		agentFiles, err := remoteAgentFiles(agentArgv)
+		if err != nil {
+			return fmt.Errorf("remote execution: %w", err)
+		}
 		prov, err := buildRemoteArgv(context.Background(), execCfg,
-			execution.PolecatSpec{Rig: m.rig.Name, Polecat: polecat, Session: sessionID, Branch: remoteSessionBranch(polecatGitBranch), Config: execCfg},
-			runtimeConfig.BuildArgsWithPrompt(beacon), envVars)
+			execution.PolecatSpec{Rig: m.rig.Name, Polecat: polecat, Session: sessionID, Branch: remoteSessionBranch(polecatGitBranch), Files: agentFiles, Config: execCfg},
+			agentArgv, envVars)
 		if err != nil {
 			return fmt.Errorf("remote execution: %w", err)
 		}

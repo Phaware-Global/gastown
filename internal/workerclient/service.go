@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +90,7 @@ type session struct {
 	relay       *worker.Relay
 	workEnv     *worker.WorkEnv // nil in native mode
 	worktree    string
+	argvPaths   map[string]string  // orchestrator path -> delivered local copy (agent files)
 	execCancel  context.CancelFunc // cancels an attached exec stream (nil when none)
 	certWanted  bool               // SignCSR is awaiting a cert
 	certTaken   bool               // a cert has been claimed for this session
@@ -392,6 +394,10 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
 		return
 	}
+	if err := validateAgentFiles(m.Files); err != nil {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
+		return
+	}
 	if m.Branch != "" && !validBranch(m.Branch) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: fmt.Sprintf("branch %q is not a safe branch name", m.Branch)})
 		return
@@ -652,6 +658,34 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 			fail(replyID, "work ref", err)
 			return
 		}
+	}
+
+	// Agent files (the agent's settings): stored beside the session identity,
+	// so every path that drops the identity drops them too. The orchestrator's
+	// path is only ever a lookup key — the file name on disk is ours.
+	if len(open.Files) > 0 {
+		filesDir := filepath.Join(idDir, "agent-files")
+		if err := os.MkdirAll(filesDir, 0700); err != nil {
+			fail(replyID, "files", err)
+			return
+		}
+		argvPaths := make(map[string]string, len(open.Files))
+		keys := make([]string, 0, len(open.Files))
+		for k := range open.Files {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for i, k := range keys {
+			local := filepath.Join(filesDir, fmt.Sprintf("%d.json", i))
+			if err := os.WriteFile(local, []byte(open.Files[k]), 0600); err != nil {
+				fail(replyID, "files", err)
+				return
+			}
+			argvPaths[k] = local
+		}
+		s.mu.Lock()
+		sess.argvPaths = argvPaths
+		s.mu.Unlock()
 	}
 
 	// Container mode: prepare the idle work container (§6.1.2 via the shared
