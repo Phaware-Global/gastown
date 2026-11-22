@@ -320,3 +320,36 @@ func TestPreserveRemoteWork_WorkerPushDuringPublishIsRefused(t *testing.T) {
 		t.Fatalf("work ref = %s, want the later commit %s kept", got, later)
 	}
 }
+
+// gt done can publish the work ref without releasing it (a failed merge
+// request, an interrupted run). Removing the polecat then finds nothing
+// unpublished, and must still take the ref with it.
+func TestRemoveWithOptions_DeletesAWorkRefOriginAlreadyHolds(t *testing.T) {
+	for _, missingWorktree := range []bool{false, true} {
+		name := "worktree present"
+		if missingWorktree {
+			name = "worktree missing"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newMissingWorktreeFixture(t, "start point", false)
+			rwGit(t, f.p.ClonePath, "push", "-q", "origin", "HEAD:refs/heads/"+f.branch)
+			sha := leaveRemoteWork(t, f.p.ClonePath, f.branch, "work pushed by the remote worker")
+			workRef := constants.RemoteWorkRef(f.branch)
+			rwGit(t, f.p.ClonePath, "push", "-q", "origin", sha+":refs/heads/"+f.branch)
+			rwGit(t, f.p.ClonePath, "fetch", "-q", "origin")
+			common := rwGit(t, f.p.ClonePath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+			if missingWorktree {
+				if err := os.RemoveAll(f.p.ClonePath); err != nil {
+					t.Fatalf("remove worktree: %v", err)
+				}
+			}
+
+			if err := f.mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+				t.Fatalf("RemoveWithOptions: %v", err)
+			}
+			if exec.Command("git", "--git-dir", common, "show-ref", "--verify", "--quiet", workRef).Run() == nil {
+				t.Fatalf("%s survived the removal although origin holds it", workRef)
+			}
+		})
+	}
+}
