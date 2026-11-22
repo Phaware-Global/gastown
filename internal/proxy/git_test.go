@@ -97,6 +97,25 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("slung branch (issue form) is allowed", func(t *testing.T) {
+		// A slung polecat's branch is polecat/<name>/<issue>@<ts>
+		// (polecat.Manager.buildBranchName), not the dash form.
+		body := receivePackBody("refs/heads/polecat/furiosa/gt-abc12@mv3cxv4t")
+		assert.NoError(t, validateReceivePackRefs(body, polecat))
+	})
+
+	t.Run("another polecat's slung branch is denied", func(t *testing.T) {
+		body := receivePackBody("refs/heads/polecat/nux/gt-abc12@mv3cxv4t")
+		err := validateReceivePackRefs(body, polecat)
+		require.Error(t, err)
+	})
+
+	t.Run("slash form with nothing after the name is denied", func(t *testing.T) {
+		body := receivePackBody("refs/heads/polecat/furiosa/")
+		err := validateReceivePackRefs(body, polecat)
+		require.Error(t, err)
+	})
+
 	t.Run("own checkpoint ref is allowed", func(t *testing.T) {
 		// remote-polecat-execution.md §9.2: the worker force-pushes
 		// refs/checkpoints/polecat/<name> through the proxy.

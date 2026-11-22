@@ -31,8 +31,9 @@
 //     response body if repoPath is missing (avoids corrupt partial responses).
 //   - git-receive-pack requires a valid mTLS client cert.  The cert CN
 //     (format: "gt-<rig>-<name>") is parsed to extract the polecat name.
-//     Every pushed ref must match refs/heads/polecat/<name>-*; any other
-//     ref is rejected with 403 before git ever sees the request body.
+//     Every pushed ref must match refs/heads/polecat/<name>-* or
+//     refs/heads/polecat/<name>/*; any other ref is rejected with 403
+//     before git ever sees the request body.
 //   - git-upload-pack is unrestricted for any authenticated client (read-only).
 //   - Subprocesses inherit only HOME and PATH from the server environment;
 //     no credentials, tokens, or secrets are visible to git.
@@ -204,7 +205,8 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request, repoPath, se
 	}
 }
 
-// authorizeReceivePack checks that the push only touches refs/heads/polecat/<cn-name>-*.
+// authorizeReceivePack checks that the push only touches refs/heads/polecat/<cn-name>-* or
+// refs/heads/polecat/<cn-name>/*.
 // It reads the pkt-line stream to extract ref names, then rewinds the body.
 // It returns (true, refs) on success, or (false, refs) on failure; refs may be
 // non-nil on failure when the body was read but contained a disallowed ref.
@@ -307,13 +309,15 @@ func collectReceivePackRefs(body []byte) []string {
 }
 
 // validateReceivePackRefs parses the git-receive-pack pkt-line stream and validates
-// that all pushed refs are under refs/heads/polecat/<cnName>-* (prefix form only).
+// that all pushed refs are under refs/heads/polecat/<cnName>-* or
+// refs/heads/polecat/<cnName>/* (prefix forms only), or are the checkpoint ref.
 func validateReceivePackRefs(body []byte, cnName string) error {
 	// The pkt-line wire format: each record is a 4-hex-digit length (including the
 	// length field itself) followed by that many bytes of payload.  "0000" is a
 	// flush packet that terminates the ref list.  Any binary pack data that follows
 	// the flush packet is never read by this loop.
 	allowed := "refs/heads/polecat/" + cnName + "-"
+	allowedSlung := "refs/heads/polecat/" + cnName + "/"
 	checkpointRef := "refs/checkpoints/polecat/" + cnName
 	offset := 0
 	for offset < len(body) {
@@ -356,12 +360,16 @@ func validateReceivePackRefs(body []byte, cnName string) error {
 
 		// Allowed refs for a polecat identity:
 		//   - refs/heads/polecat/<cnName>-* (prefix form; exact-name pushes
-		//     without the timestamp suffix are not permitted), and
+		//     without the timestamp suffix are not permitted),
+		//   - refs/heads/polecat/<cnName>/<issue>@<ts>, the branch a slung
+		//     polecat works on (polecat.Manager.buildBranchName) — the "/"
+		//     keeps it inside this polecat's own namespace, and
 		//   - refs/checkpoints/polecat/<cnName>, the polecat's own checkpoint
 		//     ref (remote-polecat-execution.md §9.2) — exact name only, so
 		//     one polecat can never move another's checkpoint.
-		if !strings.HasPrefix(ref, allowed) && ref != checkpointRef {
-			return fmt.Errorf("push to %q denied: only refs/heads/polecat/%s-* or %s allowed", ref, cnName, checkpointRef)
+		slung := strings.HasPrefix(ref, allowedSlung) && len(ref) > len(allowedSlung)
+		if !strings.HasPrefix(ref, allowed) && !slung && ref != checkpointRef {
+			return fmt.Errorf("push to %q denied: only refs/heads/polecat/%s-*, refs/heads/polecat/%s/* or %s allowed", ref, cnName, cnName, checkpointRef)
 		}
 	}
 	return nil
