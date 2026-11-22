@@ -175,6 +175,14 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 		return execution.Endpoint{}, fmt.Errorf("socket: worker at %s is at its session limit (%d)", b.settings.Address, cap.MaxSessions)
 	}
 
+	// A worker that predates agent files would drop them without an error and
+	// start the agent with no settings, so no hooks and no guards. The binary
+	// refresh above is best-effort and a busy worker defers its own upgrade,
+	// so this is reachable; refuse rather than open that session.
+	if len(spec.Files) > 0 && !c.ack.Capabilities.GetAgentFiles() {
+		return execution.Endpoint{}, fmt.Errorf("socket: worker at %s runs a binary that cannot receive the agent's settings file (gt %s): upgrade the worker, or wait for it to go idle and apply its pending update", b.settings.Address, c.ack.GTVersion)
+	}
+
 	open := &sockproto.Message{
 		Type:               sockproto.TypeSessionOpen,
 		Session:            spec.Session,

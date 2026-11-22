@@ -81,6 +81,17 @@ type Capabilities struct {
 	// the ones the worker runs — the orchestrator needs this to pick the right
 	// artifacts (§4.1).
 	ContainerPlatform string `json:"container_platform,omitempty"`
+	// AgentFiles reports that the worker understands session_open's files
+	// field. A worker on an older binary decodes the message without it and
+	// would start the agent with a settings path that does not exist there, so
+	// the orchestrator refuses to open a session that carries files on a
+	// worker that does not say this.
+	AgentFiles bool `json:"agent_files,omitempty"`
+}
+
+// GetAgentFiles reads AgentFiles from a possibly-nil capability block.
+func (c *Capabilities) GetAgentFiles() bool {
+	return c != nil && c.AgentFiles
 }
 
 // GetContainerPlatform reads the container platform from a possibly-nil

@@ -354,6 +354,7 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 					// worker would otherwise never be sent any.
 					ContainerPlatform: containerPlatform,
 					ContainerClient:   s.containerClientDigest(containerPlatform),
+					AgentFiles:        true,
 				},
 				Sessions: s.summaries(),
 			})

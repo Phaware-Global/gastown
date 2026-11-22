@@ -45,6 +45,7 @@ type fakeWorker struct {
 	openAttempts           int
 	containerPlatform      string
 	containerClient        string
+	noAgentFiles           bool // an older worker: hello_ack lacks the agent_files capability
 
 	// knobs
 	refusePush   string // non-empty → answer a terminal push chunk with this error code
@@ -198,7 +199,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				Arch:         workerArch,
 				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"},
 					MaxSessions: w.maxSessions, ContainerPlatform: w.containerPlatform,
-					ContainerClient: w.containerClient},
+					ContainerClient: w.containerClient, AgentFiles: !w.noAgentFiles},
 				Sessions: sess,
 			})
 		case sockproto.TypePushBinary:
@@ -398,6 +399,25 @@ func TestProvision_SessionLimit(t *testing.T) {
 	_, err := b.Provision(context.Background(), spec())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session limit")
+}
+
+// A worker on a binary that predates agent files would drop them silently and
+// start the agent without its settings. The session must not be opened.
+func TestProvision_WorkerWithoutAgentFilesIsRefused(t *testing.T) {
+	w := newFakeWorker(t)
+	w.noAgentFiles = true
+	b, _ := testBackend(t, w)
+
+	withFiles := spec()
+	withFiles.Files = map[string]string{"/host/polecats/.claude/settings.json": "{}"}
+	_, err := b.Provision(context.Background(), withFiles)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "settings file")
+	assert.NotContains(t, w.got(), sockproto.TypeSessionOpen, "no session may be opened on that worker")
+
+	// Without files there is nothing to lose, so the same worker is still usable.
+	_, err = b.Provision(context.Background(), spec())
+	require.NoError(t, err)
 }
 
 func TestProvision_SessionError(t *testing.T) {
