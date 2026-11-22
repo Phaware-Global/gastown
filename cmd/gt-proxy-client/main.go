@@ -144,8 +144,9 @@ const pushTimeout = 5 * time.Minute
 // there the push is best effort, and a failure is a warning.
 //
 // A best-effort exit that left work behind returns the cleanup status that
-// describes it (uncommitted, unpushed, or unknown when the worktree could not
-// be examined). The host cannot see this worktree: it reads its own, which
+// describes it: uncommitted, or unpushed, which also covers a worktree that
+// could not be examined, since nothing was pushed from it. The host cannot
+// see this worktree: it reads its own, which
 // sits at the branch's start point, and would record the polecat as clean.
 // The caller forwards the status so the host records the risk instead.
 func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) (unsaved string, err error) {
@@ -200,9 +201,10 @@ func doneStatus(args []string) string {
 // committed is still sent.
 //
 // unsaved is the cleanup status for work this call left behind: uncommitted
-// for tracked changes that were not committed, unpushed when the push failed,
-// unknown when the worktree could not be examined, and empty when everything
-// committed reached the host.
+// for tracked changes that were not committed, unpushed when the push failed
+// or the worktree could not be examined, and empty when everything committed
+// reached the host. It is never "unknown": the host does not record that
+// value, and would then treat the polecat as clean.
 func pushWork(dir, sessionBranch string, submitting bool) (unsaved string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
@@ -211,10 +213,10 @@ func pushWork(dir, sessionBranch string, submitting bool) (unsaved string, err e
 	branch := strings.TrimSpace(out)
 	if sessionBranch != "" {
 		if headErr != nil {
-			return "unknown", fmt.Errorf("gt done must run on the session's branch %s, but no branch is checked out here (detached HEAD, or not the worktree): nothing was pushed to the host", sessionBranch)
+			return "unpushed", fmt.Errorf("gt done must run on the session's branch %s, but no branch is checked out here (detached HEAD, or not the worktree): nothing was pushed to the host", sessionBranch)
 		}
 		if branch != sessionBranch {
-			return "unknown", fmt.Errorf("gt done must run on the session's branch %s, but %s is checked out: nothing was pushed to the host", sessionBranch, branch)
+			return "unpushed", fmt.Errorf("gt done must run on the session's branch %s, but %s is checked out: nothing was pushed to the host", sessionBranch, branch)
 		}
 	} else if headErr != nil || !strings.HasPrefix(branch, "polecat/") {
 		return "", nil // not a worktree, a detached HEAD or some other branch: nothing of ours to push
@@ -225,7 +227,7 @@ func pushWork(dir, sessionBranch string, submitting bool) (unsaved string, err e
 	// the work. (A local polecat's gt done commits them itself; here that is
 	// the agent's job.) Untracked files are not work and are ignored.
 	if status, err := runGit(exec.CommandContext(ctx, "git", "status", "--porcelain", "--untracked-files=no"), dir); err != nil {
-		return "unknown", fmt.Errorf("checking for uncommitted changes before gt done: %v: %s", err, strings.TrimSpace(status))
+		return "unpushed", fmt.Errorf("checking for uncommitted changes before gt done: %v: %s", err, strings.TrimSpace(status))
 	} else if strings.TrimSpace(status) != "" {
 		if submitting {
 			return "uncommitted", fmt.Errorf("uncommitted changes to tracked files: commit them (or discard them) and run gt done again; nothing was pushed to the host:\n%s", strings.TrimRight(status, "\n"))

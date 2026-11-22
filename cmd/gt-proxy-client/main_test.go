@@ -404,8 +404,10 @@ func TestPushWorkBeforeDone_UnsavedWorkIsReportedAsCleanupStatus(t *testing.T) {
 		clone, _ := polecatClone(t, branch)
 		gitT(t, clone, "checkout", "--detach")
 		status, err := pushWorkBeforeDone("gt", deferred, clone, branch)
-		if err != nil || status != "unknown" {
-			t.Fatalf("status = %q, err = %v; want unknown", status, err)
+		// Not "unknown": the host records nothing for that value and the
+		// polecat would read as clean.
+		if err != nil || status != "unpushed" {
+			t.Fatalf("status = %q, err = %v; want unpushed", status, err)
 		}
 	})
 }
