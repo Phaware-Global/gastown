@@ -333,6 +333,20 @@ func collectReceivePackRefs(body []byte) []string {
 	return refs
 }
 
+// isBranchTimestamp reports whether s is the suffix of a polecat's dash-form
+// branch: the base-36 millisecond timestamp, so lowercase alphanumerics only.
+func isBranchTimestamp(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
 // validateReceivePackRefs parses the git-receive-pack pkt-line stream and validates
 // that all pushed refs are under refs/heads/polecat/<cnName>-* or
 // refs/heads/polecat/<cnName>/* (prefix forms only), the same two forms under
@@ -399,12 +413,18 @@ func validateReceivePackRefs(body []byte, cnName string) error {
 		//     ref (remote-polecat-execution.md §9.2) — exact name only, so
 		//     one polecat can never move another's checkpoint.
 		//   - the same two forms under constants.RemoteWorkRefPrefix, where a remote
-		//     polecat's work branch lands (see constants.RemoteWorkRef).
+		//     polecat's work branch lands (see constants.RemoteWorkRef). Here the
+		//     dash form takes only the base-36 timestamp the session manager
+		//     emits: names may contain "-", so a bare prefix would let "bullet"
+		//     reach "bullet-farmer"'s work ref, and unlike a checked-out
+		//     refs/heads branch nothing else refuses that push.
 		rest, underName := strings.CutPrefix(ref, allowedSlung)
 		slung := underName && rest != "" && !strings.Contains(rest, "/")
 		workRest, underWorkName := strings.CutPrefix(ref, workAllowedSlung)
 		workSlung := underWorkName && workRest != "" && !strings.Contains(workRest, "/")
-		if !strings.HasPrefix(ref, allowed) && !slung && !strings.HasPrefix(ref, workAllowed) && !workSlung && ref != checkpointRef {
+		workStamp, underWorkDash := strings.CutPrefix(ref, workAllowed)
+		workDash := underWorkDash && isBranchTimestamp(workStamp)
+		if !strings.HasPrefix(ref, allowed) && !slung && !workDash && !workSlung && ref != checkpointRef {
 			return fmt.Errorf("push to %q denied: only refs/heads/polecat/%s-*, refs/heads/polecat/%s/*, the same under %s, or %s allowed", ref, cnName, cnName, constants.RemoteWorkRefPrefix, checkpointRef)
 		}
 	}

@@ -139,6 +139,23 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		}
 	})
 
+	t.Run("remote work ref of a hyphen-extended name denied", func(t *testing.T) {
+		// Names may contain "-", and a pool can hold both "bullet" and
+		// "bullet-farmer". The dash form must not let the shorter name reach
+		// the longer one's work ref, which is what its next session resumes
+		// from and what completion publishes.
+		for _, ref := range []string{
+			"refs/remote-work/polecat/bullet-farmer-mv3cxv4t",
+			"refs/remote-work/polecat/bullet-farmer/gt-abc12@mv3cxv4t",
+			"refs/remote-work/polecat/bullet-",
+			"refs/remote-work/polecat/bullet-MV3CXV4T",
+		} {
+			assert.Error(t, validateReceivePackRefs(receivePackBody(ref), "bullet"), ref)
+		}
+		assert.NoError(t, validateReceivePackRefs(receivePackBody("refs/remote-work/polecat/bullet-mv3cxv4t"), "bullet"))
+		assert.NoError(t, validateReceivePackRefs(receivePackBody("refs/remote-work/polecat/bullet-farmer-mv3cxv4t"), "bullet-farmer"))
+	})
+
 	t.Run("own checkpoint ref is allowed", func(t *testing.T) {
 		// remote-polecat-execution.md §9.2: the worker force-pushes
 		// refs/checkpoints/polecat/<name> through the proxy.
