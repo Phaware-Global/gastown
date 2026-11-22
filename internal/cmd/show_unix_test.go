@@ -10,8 +10,8 @@ import (
 )
 
 func TestPrepareBdShowExecAnchorsRelativePathBeforeChdir(t *testing.T) {
-	startDir := filepath.Join(t.TempDir(), "start")
-	targetDir := filepath.Join(t.TempDir(), "target")
+	startDir := filepath.Join(canonicalTempDir(t), "start")
+	targetDir := filepath.Join(canonicalTempDir(t), "target")
 	for _, dir := range []string{startDir, targetDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
@@ -40,7 +40,7 @@ func TestPrepareBdShowExecAnchorsRelativePathBeforeChdir(t *testing.T) {
 }
 
 func TestPrepareBdShowExecReturnsChdirError(t *testing.T) {
-	startDir := t.TempDir()
+	startDir := canonicalTempDir(t)
 	originalDir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
