@@ -1582,47 +1582,23 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 	if err != nil {
 		return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
 	}
-	if work.Unpublished == 0 {
-		releasePublishedWorkRef(polecatGit, work)
-		return nil
-	}
-	reason := "nuclear removal never publishes"
-	if !nuclear {
+	reason := ""
+	switch {
+	case work.Unpublished == 0:
+	case nuclear:
+		reason = "nuclear removal never publishes"
+	default:
 		reason = m.publishRemoteWork(polecatGit, branch, work)
 	}
 	if reason == "" {
-		// Origin holds the work now, so the host's copy goes with the polecat.
-		// Left behind it would read as unpublished work again once the branch
-		// is merged and deleted from origin. The delete names the commit that
-		// was published: if the worker pushed more meanwhile it fails, and
-		// those commits are at risk like any others.
-		// The delete can fail because the ref is already gone (a gt done
-		// released it meanwhile), because its lock was held, or because the
-		// worker pushed more. Each failure is followed by a fresh look: only
-		// commits origin still does not hold are at risk. A ref that is
-		// still there with everything published is tried once more, and
-		// named if it stays: left behind it is reported as unpublished work
-		// once the branch is merged and deleted from origin.
-		for attempt := 0; ; attempt++ {
-			delErr := polecatGit.DeleteRef(work.Ref, work.Tip)
-			if delErr == nil {
-				return nil
-			}
-			if work, err = polecatGit.UnpublishedRemoteWork(branch, "origin"); err != nil {
-				return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
-			}
-			if work.Unpublished > 0 {
-				break
-			}
-			if work.Tip == "" {
-				return nil
-			}
-			if attempt == 1 {
-				style.PrintWarning("%s is published but could not be deleted: %v", work.Ref, delErr)
-				return nil
-			}
+		// Origin holds the work, so the host's copy goes with the polecat.
+		if work, err = releasePublishedWorkRef(polecatGit, branch, work); err != nil {
+			return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
 		}
-		reason = "it moved while it was being published; run the removal again"
+		if work.Unpublished == 0 {
+			return nil
+		}
+		reason = "it moved while it was being removed; run the removal again"
 	}
 	reason = fmt.Sprintf("%d commit(s) pushed by the remote worker are only in %s: %s", work.Unpublished, work.Ref, reason)
 	if !discard {
@@ -1633,19 +1609,34 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 	return nil
 }
 
-// releasePublishedWorkRef deletes a work ref origin already holds in full,
-// when the polecat it belongs to is being removed. gt done releases the ref
-// only on its success path, so one can be left published but in place; with
-// the polecat gone it would later read as the only copy of its work, once the
-// branch is merged and deleted from origin. The delete names the examined
-// commit, so a push that lands meanwhile survives.
-func releasePublishedWorkRef(g *git.Git, work git.RemoteWork) {
-	if work.Tip == "" {
-		return
+// releasePublishedWorkRef deletes a work ref origin holds in full, when the
+// polecat it belongs to is being removed. Left behind it would read as the
+// only copy of its work once the branch is merged and deleted from origin.
+// It returns the ref's state afterwards: Unpublished is non-zero only when
+// the worker pushed more meanwhile, and those commits are at risk like any
+// others.
+//
+// The delete names the examined commit. It can fail because the ref is
+// already gone (a gt done released it meanwhile), because its lock was held,
+// or because the worker pushed more, so each failure is followed by a fresh
+// look. A ref that is still there with everything published is tried once
+// more, and named if it stays.
+func releasePublishedWorkRef(g *git.Git, branch string, work git.RemoteWork) (git.RemoteWork, error) {
+	for attempt := 0; work.Tip != ""; attempt++ {
+		delErr := g.DeleteRef(work.Ref, work.Tip)
+		if delErr == nil {
+			return git.RemoteWork{Ref: work.Ref}, nil
+		}
+		var err error
+		if work, err = g.UnpublishedRemoteWork(branch, "origin"); err != nil || work.Unpublished > 0 {
+			return work, err
+		}
+		if work.Tip != "" && attempt == 1 {
+			style.PrintWarning("%s is published but could not be deleted: %v", work.Ref, delErr)
+			break
+		}
 	}
-	if err := g.DeleteRef(work.Ref, work.Tip); err != nil {
-		style.PrintWarning("%s is published but could not be deleted: %v", work.Ref, err)
-	}
+	return work, nil
 }
 
 // discardRemoteWorkRef deletes a work ref at whatever commit it holds now.
@@ -1750,12 +1741,18 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard boo
 	if err != nil {
 		return unresolved(err)
 	}
+	if unpushed == 0 && work.Unpublished == 0 {
+		// Origin holds everything, so the work ref goes with the polecat. A
+		// worker push that lands meanwhile is counted below.
+		if work, err = releasePublishedWorkRef(repoGit, branch, work); err != nil {
+			return unresolved(err)
+		}
+	}
 	if work.Unpublished > 0 {
 		unpushed += work.Unpublished
 		tip = work.Tip
 	}
 	if unpushed == 0 {
-		releasePublishedWorkRef(repoGit, work)
 		return nil
 	}
 	reason := fmt.Sprintf("tip %s is on no remote and the worktree is gone, so it is not pushed; pass --discard-unpushed to delete it", tip[:8])

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/git"
 )
 
 func rwGit(t *testing.T, dir string, args ...string) string {
@@ -351,5 +352,43 @@ func TestRemoveWithOptions_DeletesAWorkRefOriginAlreadyHolds(t *testing.T) {
 				t.Fatalf("%s survived the removal although origin holds it", workRef)
 			}
 		})
+	}
+}
+
+// The ref is examined, found fully published, and then deleted. A worker push
+// that lands between the two leaves commits origin does not have: the delete
+// at the examined commit fails, and the later commits are reported, not
+// passed over as a ref that merely could not be deleted.
+func TestReleasePublishedWorkRef_WorkerPushAfterTheExaminationIsReported(t *testing.T) {
+	f := newMissingWorktreeFixture(t, "start point", false)
+	rwGit(t, f.p.ClonePath, "push", "-q", "origin", "HEAD:refs/heads/"+f.branch)
+	sha := leaveRemoteWork(t, f.p.ClonePath, f.branch, "work pushed by the remote worker")
+	workRef := constants.RemoteWorkRef(f.branch)
+	rwGit(t, f.p.ClonePath, "push", "-q", "origin", sha+":refs/heads/"+f.branch)
+	rwGit(t, f.p.ClonePath, "fetch", "-q", "origin")
+	g := git.NewGit(f.p.ClonePath)
+	examined, err := g.UnpublishedRemoteWork(f.branch, "origin")
+	if err != nil || examined.Tip != sha || examined.Unpublished != 0 {
+		t.Fatalf("examined = %+v, %v; want the published tip %s", examined, err, sha)
+	}
+	// The worker pushes one more commit after the examination.
+	later := rwGit(t, f.p.ClonePath, "commit-tree", "-p", workRef, "-m", "pushed after the examination", workRef+"^{tree}")
+	rwGit(t, f.p.ClonePath, "update-ref", workRef, later)
+
+	var after git.RemoteWork
+	stderr := captureStderr(t, func() {
+		after, err = releasePublishedWorkRef(g, f.branch, examined)
+	})
+	if err != nil {
+		t.Fatalf("releasePublishedWorkRef: %v", err)
+	}
+	if after.Unpublished != 1 || after.Tip != later {
+		t.Errorf("after = %+v, want the 1 later commit at %s", after, later)
+	}
+	if strings.Contains(stderr, "published but could not be deleted") {
+		t.Errorf("the moved ref was reported as published: %s", stderr)
+	}
+	if got := rwGit(t, f.p.ClonePath, "rev-parse", workRef); got != later {
+		t.Fatalf("work ref = %s, want the later commit %s kept", got, later)
 	}
 }
