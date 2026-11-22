@@ -1605,6 +1605,15 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 			return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
 		}
 		if work.Unpublished == 0 {
+			// Origin holds everything. A ref that is still there (the delete
+			// lost a race for its lock, say) is tried once more, and named
+			// if it stays: left behind it is reported as unpublished work
+			// once the branch is merged and deleted from origin.
+			if work.Tip != "" {
+				if err := polecatGit.DeleteRef(work.Ref, work.Tip); err != nil {
+					style.PrintWarning("%s is published but could not be deleted: %v", work.Ref, err)
+				}
+			}
 			return nil
 		}
 		reason = "it moved while it was being published; run the removal again"

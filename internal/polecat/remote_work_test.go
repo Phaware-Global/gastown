@@ -242,3 +242,41 @@ func TestPreserveRemoteWork_PublishedAndAlreadyReleasedIsNotAtRisk(t *testing.T)
 		t.Fatal("the work ref is still there")
 	}
 }
+
+// The delete after a publish can fail while the ref is still there at the
+// published commit (its lock was held). Origin has the work, so removal goes
+// on, and the ref is deleted on the second try rather than left behind.
+func TestPreserveRemoteWork_PublishedRefStillThereIsDeletedOnRetry(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	rwGit(t, mayorRig, "clone", "-q", "--bare", mayorRig, origin)
+	rwGit(t, mayorRig, "remote", "set-url", "origin", origin)
+	rwGit(t, mayorRig, "fetch", "-q", "origin")
+	leaveRemoteWork(t, p.ClonePath, p.Branch, "work pushed by the remote worker")
+	workRef := constants.RemoteWorkRef(p.Branch)
+
+	// Hold the ref's lock across the publish: origin's post-receive hook,
+	// which runs before the push returns, takes it and a background process
+	// releases it shortly after, so the first delete fails and the retry,
+	// which follows a recount, finds it free.
+	common := rwGit(t, p.ClonePath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	lock := filepath.Join(common, workRef+".lock")
+	hook := filepath.Join(origin, "hooks", "post-receive")
+	script := "#!/bin/sh\n: > '" + lock + "'\n(sleep 1; rm -f '" + lock + "') >/dev/null 2>&1 &\n"
+	if err := os.WriteFile(hook, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	stderr := captureStderr(t, func() {
+		if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+			t.Fatalf("RemoveWithOptions: %v", err)
+		}
+	})
+	if refExists(t, mayorRig, workRef) && !strings.Contains(stderr, "could not be deleted") {
+		t.Fatalf("the published work ref was left behind without a warning; stderr: %s", stderr)
+	}
+}
