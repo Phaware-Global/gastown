@@ -49,6 +49,11 @@ func validBranch(v string) bool {
 	if !safeBranch.MatchString(v) || strings.HasPrefix(v, "-") {
 		return false
 	}
+	// "HEAD" is what a detached worktree reports for its branch, and git
+	// refuses to create a branch of that name.
+	if v == "HEAD" {
+		return false
+	}
 	if strings.Contains(v, "..") || strings.Contains(v, "@{") {
 		return false
 	}

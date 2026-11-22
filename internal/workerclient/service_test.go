@@ -674,11 +674,33 @@ func TestSessionOpen_CreatesMissingPolecatBranch(t *testing.T) {
 	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
 }
 
+// The host can ask for the branch the fresh clone is already on (its worktree
+// was sitting on the default branch). That must land on the branch, not fail
+// because a branch of that name already exists.
+func TestSessionOpen_BranchTheCloneIsAlreadyOn(t *testing.T) {
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	branch := git(t, rigRepo, "symbolic-ref", "--short", "HEAD")
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+}
+
 func TestValidBranch(t *testing.T) {
 	for _, ok := range []string{"polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa-mv3cxv4t", "main"} {
 		assert.True(t, validBranch(ok), "%q must be accepted", ok)
 	}
-	for _, bad := range []string{"", "-f", "--upload-pack=x", "a..b", "/abs", "a//b", "a/", "a b", "a;b", "a.lock", "refs/heads/@{-1}"} {
+	// "HEAD" is what a detached worktree reports as its branch; git refuses to
+	// create a branch of that name.
+	for _, bad := range []string{"", "-f", "--upload-pack=x", "a..b", "/abs", "a//b", "a/", "a b", "a;b", "a.lock", "refs/heads/@{-1}", "HEAD"} {
 		assert.False(t, validBranch(bad), "%q must be rejected", bad)
 	}
 }

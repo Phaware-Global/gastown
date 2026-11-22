@@ -635,9 +635,11 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 	}
 	// Land the worktree on the polecat's work branch. The host creates it in
 	// the rig repo before the session starts, so it is normally a remote
-	// branch to track; one the host repo does not have is created here.
+	// branch to track; one the host repo does not have is created here. -B
+	// rather than -b: the clone has no work of its own, and the branch asked
+	// for can be the one the clone is already on (its default branch).
 	if open.Branch != "" {
-		args := []string{"-C", worktree, "checkout", "-b", open.Branch}
+		args := []string{"-C", worktree, "checkout", "-B", open.Branch}
 		if exec.CommandContext(buCtx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+open.Branch).Run() == nil {
 			args = append(args, "--track", "origin/"+open.Branch)
 		}
