@@ -24,7 +24,9 @@ cleanup() {
 trap cleanup EXIT
 
 # setup <codesign exit code>: stub build outputs, an existing install, and a
-# fake codesign that records its arguments.
+# fake codesign that records its arguments and, when it succeeds, marks the
+# file it signed (its last argument), so a signed file differs from the build
+# output it was copied from.
 setup() {
   cleanup
   TMPDIR="$(mktemp -d)"
@@ -37,6 +39,10 @@ setup() {
   cat > "$FAKE/codesign" <<FAKE_EOF
 #!/bin/sh
 echo "\$*" >> "$TMPDIR/codesign.log"
+if [ "$1" = 0 ]; then
+  for last; do :; done
+  echo "signed" >> "\$last"
+fi
 exit $1
 FAKE_EOF
   chmod +x "$FAKE/codesign"
@@ -71,6 +77,7 @@ echo "signing: this platform's pushable artifacts are the signed installs"
 platform="$(go env GOOS)-$(go env GOARCH)"
 for b in gt-proxy-client gt-worker-client; do
   check "$b artifact matches the installed binary" cmp -s "$INSTALL/$b" "$ARTIFACTS/$platform/$b"
+  check "$b artifact is the signed file, not the build output" grep -q "signed" "$ARTIFACTS/$platform/$b"
 done
 
 echo "signing: a failed signature fails the install and replaces nothing"

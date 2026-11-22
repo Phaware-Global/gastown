@@ -213,18 +213,39 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 // hash on every orchestrator upgrade; without a stable signature the privacy
 // grants held by the installed binary stop matching and tccd re-evaluates the
 // binary on every file access. No-op when no identity is configured.
+//
+// The call is bounded. It runs on the connection's read loop, and codesign
+// blocks for as long as a keychain prompt is on screen, which on an
+// unattended worker is forever: the push would hang and the session_open
+// queued behind it would never be read.
 func (s *Service) resign(name, staged string) error {
 	if s.cfg.CodesignIdentity == "" {
 		return nil
 	}
-	out, err := exec.Command("codesign", "-f", "-s", s.cfg.CodesignIdentity,
-		"--identifier", "com.gastown."+name, staged).CombinedOutput() //nolint:gosec // identity is operator config; name is allowlisted
+	ctx, cancel := context.WithTimeout(context.Background(), codesignTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "codesign", "-f", "-s", s.cfg.CodesignIdentity,
+		"--identifier", "com.gastown."+name, staged)
+	cmd.WaitDelay = codesignWaitDelay
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("codesign %s with identity %s did not finish within %s: the keychain is probably locked or asking for permission to use the key (the installed binary was left in place)",
+			name, s.cfg.CodesignIdentity, codesignTimeout)
+	}
 	if err != nil {
 		return fmt.Errorf("codesign %s with identity %s: %v: %s (the installed binary was left in place)",
 			name, s.cfg.CodesignIdentity, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
+
+// codesignTimeout bounds one signing; signing a binary takes well under a
+// second, so only a blocked keychain reaches it. codesignWaitDelay bounds the
+// wait for its output after it is killed. Variables so tests can shorten them.
+var (
+	codesignTimeout   = 60 * time.Second
+	codesignWaitDelay = 5 * time.Second
+)
 
 // installPushed moves a verified binary into place, or stages it when applying
 // now would kill work. Returns "installed" or "staged".

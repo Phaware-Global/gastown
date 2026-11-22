@@ -158,6 +158,12 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 		if strings.HasPrefix(o.CodesignIdentity, "-") {
 			return nil, fmt.Errorf("--codesign-identity must name a keychain identity; %q is ad-hoc signing and does not keep privacy grants", o.CodesignIdentity)
 		}
+		// Install time is the one interactive moment to catch a mistyped
+		// identity. Later it only shows as every binary push being refused,
+		// which is logged and otherwise silent.
+		if found, checked := codesignIdentityInKeychain(o.CodesignIdentity); checked && !found {
+			return nil, fmt.Errorf("--codesign-identity %q is not a code-signing identity in this user's keychains (see: security find-identity -p codesigning)", o.CodesignIdentity)
+		}
 		args = append(args, "-codesign-identity", o.CodesignIdentity)
 	}
 	if o.AgentEnvFile != "" {
@@ -493,4 +499,21 @@ func init() {
 	workerServiceCmd.AddCommand(workerServiceInstallCmd, workerServiceUninstallCmd,
 		workerServiceRestartCmd, workerServiceStatusCmd)
 	workerCmd.AddCommand(workerServiceCmd)
+}
+
+// codesignIdentityInKeychain reports whether name is a code-signing identity
+// in the user's keychains. checked is false when that could not be determined
+// (not macOS, or the lookup failed), in which case the caller must not refuse.
+// It lists without -v on purpose: a self-signed identity is untrusted, so the
+// "valid only" listing hides it although codesign signs with it. A variable so
+// tests need no keychain.
+var codesignIdentityInKeychain = func(name string) (found, checked bool) {
+	if runtime.GOOS != "darwin" {
+		return false, false
+	}
+	out, err := exec.Command("security", "find-identity", "-p", "codesigning").Output()
+	if err != nil {
+		return false, false
+	}
+	return strings.Contains(string(out), `"`+name+`"`), true
 }

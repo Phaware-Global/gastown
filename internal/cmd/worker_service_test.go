@@ -86,6 +86,7 @@ func TestPlanWorkerService_TCPJob(t *testing.T) {
 		t.Skip("launchd job planning is macOS-only")
 	}
 	fakeWorkerClient(t)
+	stubCodesignIdentities(t, "gt-local")
 	tlsDir := enrolledTLSDir(t)
 	envFile := filepath.Join(t.TempDir(), "agent.env")
 	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_API_KEY=sk-x\n"), 0600))
@@ -322,6 +323,37 @@ func TestDefaultWorkerStateDir(t *testing.T) {
 
 // An ad-hoc identity re-signs with a new code hash every time, which is the
 // instability the option exists to remove.
+// stubCodesignIdentities makes the keychain lookup answer from a fixed list.
+func stubCodesignIdentities(t *testing.T, names ...string) {
+	t.Helper()
+	old := codesignIdentityInKeychain
+	codesignIdentityInKeychain = func(name string) (bool, bool) {
+		for _, n := range names {
+			if n == name {
+				return true, true
+			}
+		}
+		return false, true
+	}
+	t.Cleanup(func() { codesignIdentityInKeychain = old })
+}
+
+// A mistyped identity is caught at install, the one interactive moment. Later
+// it only shows as every binary push being refused.
+func TestPlanWorkerService_RefusesUnknownCodesignIdentity(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	stubCodesignIdentities(t, "gt-local")
+	_, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/w.sock", ProxyURL: "https://orch.local:9876",
+		StateDir: t.TempDir(), CodesignIdentity: "gt-locl",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gt-locl")
+}
+
 func TestPlanWorkerService_RefusesAdHocCodesignIdentity(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd job planning is macOS-only")

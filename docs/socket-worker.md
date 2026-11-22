@@ -202,7 +202,15 @@ worker a stable signature the same way `gt` gets one (`docs/INSTALLING.md`):
 The identity lives in the worker's login keychain and never leaves the machine.
 The service runs as a LaunchAgent in the GUI session, which is where the login
 keychain is available; allow `codesign` to use the key without a prompt, as
-described in `docs/INSTALLING.md`.
+described in `docs/INSTALLING.md`. Signing is given 60 seconds: a locked
+keychain or a permission prompt refuses the push instead of hanging it.
+
+A prompt-free key is not an access boundary. Any process running as this user
+can then sign a binary as `com.gastown.<binary>` that inherits the privacy
+grants of the one it replaces, and on a worker that includes a native-mode
+agent, which handles untrusted repository content. Grant Full Disk Access to
+`gt-worker-client` only on workers where that is acceptable, or run agents in
+container mode.
 
 ### Container mode
 

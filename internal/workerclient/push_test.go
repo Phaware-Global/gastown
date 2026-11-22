@@ -651,3 +651,22 @@ func TestNew_RefusesAdHocCodesignIdentity(t *testing.T) {
 	_, err := New(Config{StateDir: t.TempDir(), ProxyURL: "https://x:1", Token: "t", CodesignIdentity: "-"})
 	require.Error(t, err)
 }
+
+// codesign waits for as long as a keychain prompt is on screen. On an
+// unattended worker that is forever, and signing runs on the connection's read
+// loop, so it must give up and refuse the push rather than hang.
+func TestResign_BlockedCodesignTimesOut(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "codesign"), []byte("#!/bin/sh\nexec sleep 30\n"), 0755))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldTimeout, oldDelay := codesignTimeout, codesignWaitDelay
+	codesignTimeout, codesignWaitDelay = 200*time.Millisecond, time.Second
+	t.Cleanup(func() { codesignTimeout, codesignWaitDelay = oldTimeout, oldDelay })
+
+	s := &Service{cfg: Config{CodesignIdentity: "gt-local"}}
+	start := time.Now()
+	err := s.resign("gt-proxy-client", filepath.Join(dir, "staged"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "keychain")
+	assert.Less(t, time.Since(start), 10*time.Second, "resign must not wait for codesign to finish")
+}
