@@ -26,7 +26,7 @@ func TestRemotePolecatDoneError(t *testing.T) {
 	t.Run("a rig on a remote execution backend is refused", func(t *testing.T) {
 		rig := t.TempDir()
 		writeRigSettings(t, rig, `{"type":"rig-settings","version":1,"execution":{"backend":"socket","socket":{"address":"worker.example:9899"}}}`)
-		err := remotePolecatDoneError(rig, "demo")
+		err := remotePolecatDoneError(rig, "demo", ExitCompleted)
 		if err == nil {
 			t.Fatal("expected gt done to be refused for a remote rig")
 		}
@@ -36,15 +36,26 @@ func TestRemotePolecatDoneError(t *testing.T) {
 			}
 		}
 	})
+	// Only COMPLETED reads the worktree for work. ESCALATED and DEFERRED
+	// report a stuck or parked polecat, and a remote one must be able to.
+	t.Run("a remote rig can still escalate or defer", func(t *testing.T) {
+		rig := t.TempDir()
+		writeRigSettings(t, rig, `{"type":"rig-settings","version":1,"execution":{"backend":"socket","socket":{"address":"worker.example:9899"}}}`)
+		for _, exit := range []string{ExitEscalated, ExitDeferred} {
+			if err := remotePolecatDoneError(rig, "demo", exit); err != nil {
+				t.Errorf("%s must not be refused for a remote rig: %v", exit, err)
+			}
+		}
+	})
 	t.Run("a local rig is not affected", func(t *testing.T) {
 		rig := t.TempDir()
 		writeRigSettings(t, rig, `{"type":"rig-settings","version":1}`)
-		if err := remotePolecatDoneError(rig, "demo"); err != nil {
+		if err := remotePolecatDoneError(rig, "demo", ExitCompleted); err != nil {
 			t.Fatalf("local rig: %v", err)
 		}
 	})
 	t.Run("a rig with no settings file is local", func(t *testing.T) {
-		if err := remotePolecatDoneError(t.TempDir(), "demo"); err != nil {
+		if err := remotePolecatDoneError(t.TempDir(), "demo", ExitCompleted); err != nil {
 			t.Fatalf("no settings: %v", err)
 		}
 	})

@@ -276,6 +276,52 @@ func TestPushWorkBeforeDone_FailedPushIsAnError(t *testing.T) {
 	}
 }
 
+// ESCALATED and DEFERRED do not complete the bead: they tell the host the
+// polecat is stuck or parking. A polecat that cannot push, or has not
+// committed, must still be able to say so, so the push is best effort there.
+func TestPushWorkBeforeDone_NonCompletedStatusIsBestEffort(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	for _, args := range [][]string{
+		{"done", "--status", "ESCALATED"},
+		{"done", "--status=deferred"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			clone, bare := polecatClone(t, branch)
+			if err := os.WriteFile(filepath.Join(clone, "tracked.txt"), []byte("v1\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			gitT(t, clone, "add", "tracked.txt")
+			gitT(t, clone, "commit", "-m", "add file")
+			if err := os.WriteFile(filepath.Join(clone, "tracked.txt"), []byte("v2\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := pushWorkBeforeDone("gt", args, clone, branch); err != nil {
+				t.Fatalf("uncommitted changes must not block %v: %v", args, err)
+			}
+			// What is committed is still sent, so the host has it to recover.
+			if got, want := gitT(t, bare, "rev-parse", "refs/remote-work/"+branch), gitT(t, clone, "rev-parse", "HEAD"); got != want {
+				t.Fatalf("host work ref = %s, want the committed HEAD %s", got, want)
+			}
+
+			if err := os.RemoveAll(bare); err != nil {
+				t.Fatal(err)
+			}
+			if err := pushWorkBeforeDone("gt", args, clone, branch); err != nil {
+				t.Fatalf("a failed push must not block %v: %v", args, err)
+			}
+		})
+	}
+	// COMPLETED, named explicitly, keeps the hard refusal.
+	clone, _ := polecatClone(t, branch)
+	if err := os.WriteFile(filepath.Join(clone, "new.txt"), []byte("v1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, clone, "add", "new.txt")
+	if err := pushWorkBeforeDone("gt", []string{"done", "--status", "COMPLETED"}, clone, branch); err == nil {
+		t.Fatal("an explicit COMPLETED must still refuse uncommitted tracked changes")
+	}
+}
+
 // When the session names its work branch (GT_BRANCH), gt done must not be
 // forwarded from anywhere else: the host would complete the bead against a
 // copy of the branch that never received the work.

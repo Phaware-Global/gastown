@@ -135,6 +135,11 @@ const pushTimeout = 5 * time.Minute
 // those would forward gt done with nothing pushed. Without it (a session that
 // predates the branch being sent) only a checked-out polecat/ branch is
 // pushed and anything else is left alone.
+//
+// All of that guards a COMPLETED exit, the one that submits work. With
+// --status ESCALATED or DEFERRED the polecat is reporting that it is stuck or
+// parking, and must be able to even when it cannot push or has not committed:
+// there the push is best effort, and a failure is a warning.
 func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) error {
 	if tool != "gt" || len(args) == 0 || args[0] != "done" {
 		return nil
@@ -142,6 +147,34 @@ func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) e
 	if sessionBranch == "HEAD" {
 		sessionBranch = ""
 	}
+	if status := doneStatus(args[1:]); status != "COMPLETED" {
+		if err := pushWork(dir, sessionBranch, false); err != nil {
+			fmt.Fprintf(os.Stderr, "gt-proxy-client: warning: %v (continuing, --status %s does not submit work)\n", err, status)
+		}
+		return nil
+	}
+	return pushWork(dir, sessionBranch, true)
+}
+
+// doneStatus returns the --status of a gt done argument list, upper-cased;
+// COMPLETED when it is not given, as gt done itself defaults.
+func doneStatus(args []string) string {
+	for i, a := range args {
+		if v, ok := strings.CutPrefix(a, "--status="); ok {
+			return strings.ToUpper(v)
+		}
+		if a == "--status" && i+1 < len(args) {
+			return strings.ToUpper(args[i+1])
+		}
+	}
+	return "COMPLETED"
+}
+
+// pushWork sends the session's committed work to its work ref on the host.
+// With submitting set, tracked changes that are not committed are an error
+// and nothing is pushed; without it they are left behind and what is
+// committed is still sent.
+func pushWork(dir, sessionBranch string, submitting bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 
@@ -165,7 +198,10 @@ func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) e
 	if status, err := runGit(exec.CommandContext(ctx, "git", "status", "--porcelain", "--untracked-files=no"), dir); err != nil {
 		return fmt.Errorf("checking for uncommitted changes before gt done: %v: %s", err, strings.TrimSpace(status))
 	} else if strings.TrimSpace(status) != "" {
-		return fmt.Errorf("uncommitted changes to tracked files: commit them (or discard them) and run gt done again; nothing was pushed to the host:\n%s", strings.TrimRight(status, "\n"))
+		if submitting {
+			return fmt.Errorf("uncommitted changes to tracked files: commit them (or discard them) and run gt done again; nothing was pushed to the host:\n%s", strings.TrimRight(status, "\n"))
+		}
+		fmt.Fprintf(os.Stderr, "gt-proxy-client: warning: uncommitted changes to tracked files are not sent to the host:\n%s\n", strings.TrimRight(status, "\n"))
 	}
 
 	// The session's clone sends the work branch to its work ref on the host

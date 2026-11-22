@@ -18,9 +18,16 @@ import (
 // work ref is a separate change; until then this is refused, loudly, before
 // anything is modified.
 //
+// Only a COMPLETED exit is refused: it is the one that verifies and submits
+// work. ESCALATED and DEFERRED report a stuck or parked polecat and read no
+// work from the worktree, and a remote polecat has to be able to send them.
+//
 // The decision comes from the rig's own settings on the host, never from the
 // caller's arguments or environment.
-func remotePolecatDoneError(rigPath, rigName string) error {
+func remotePolecatDoneError(rigPath, rigName, exitType string) error {
+	if exitType != ExitCompleted {
+		return nil
+	}
 	settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
 	if err != nil || settings == nil || !settings.Execution.IsRemote() {
 		return nil

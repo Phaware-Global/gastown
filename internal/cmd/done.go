@@ -336,7 +336,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if rigName == "" {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
-	if err := remotePolecatDoneError(filepath.Join(townRoot, rigName), rigName); err != nil {
+	if err := remotePolecatDoneError(filepath.Join(townRoot, rigName), rigName, exitType); err != nil {
 		return err
 	}
 
