@@ -23,7 +23,7 @@ import (
 // Dangerous subcommands (e.g. gt polecat, gt rig, gt admin, gt nuke) are excluded.
 const defaultAllowedSubcmds = "" +
 	"gt:prime,hook,done,mail,nudge,mol,status,handoff,version,convoy,sling,tap,escalate;" +
-	"bd:create,update,close,show,list,ready,dep,export,prime,stats,blocked,doctor,formula,mol"
+	"bd:create,update,close,show,list,ready,dep,export,prime,stats,blocked,doctor"
 
 func main() {
 	var (

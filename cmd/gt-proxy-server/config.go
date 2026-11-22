@@ -60,12 +60,21 @@ type ProxyConfig struct {
 	ExtraSANHosts []string `json:"extra_san_hosts"`
 
 	// ExecTimeout is the longest a single proxied gt/bd command may run, as a
-	// Go duration ("5m"). Empty keeps the server default (60s). A remote
-	// polecat's gt done runs through the proxy and can need longer.
+	// Go duration ("4m"). Empty keeps the server default (60s). A remote
+	// polecat's gt done runs through the proxy and can need longer. It must be
+	// positive and below maxExecTimeout.
 	ExecTimeout string `json:"exec_timeout"`
 }
 
-// execTimeout parses ExecTimeout. Empty yields 0, the server default.
+// maxExecTimeout is the transport ceiling on one proxied command: the client
+// gives up on its request, and the server stops writing the response, after
+// five minutes, and either one cancels the command. A longer exec_timeout
+// would never take effect, only kill a command mid-run with no clear error.
+const maxExecTimeout = 5 * time.Minute
+
+// execTimeout parses ExecTimeout. Empty yields 0, the server default. A value
+// that is not positive would remove the deadline altogether, and one at or
+// above maxExecTimeout cannot be honored; both are errors.
 func (c ProxyConfig) execTimeout() (time.Duration, error) {
 	if c.ExecTimeout == "" {
 		return 0, nil
@@ -73,6 +82,12 @@ func (c ProxyConfig) execTimeout() (time.Duration, error) {
 	d, err := time.ParseDuration(c.ExecTimeout)
 	if err != nil {
 		return 0, fmt.Errorf("exec_timeout %q: %w", c.ExecTimeout, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("exec_timeout %q: must be positive", c.ExecTimeout)
+	}
+	if d >= maxExecTimeout {
+		return 0, fmt.Errorf("exec_timeout %q: must be below %s, where the client and the server end the request", c.ExecTimeout, maxExecTimeout)
 	}
 	return d, nil
 }

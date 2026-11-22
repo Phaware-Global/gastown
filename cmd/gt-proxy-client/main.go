@@ -35,9 +35,12 @@ type execRequest struct {
 	Stdin string   `json:"stdin,omitempty"`
 }
 
-// maxForwardedStdin bounds the hook input forwarded with a request. The server
-// caps the whole request body at 1 MiB.
+// maxForwardedStdin bounds the stdin forwarded with a request.
 const maxForwardedStdin = 512 << 10
+
+// maxRequestBody is the server's cap on the whole encoded request
+// (internal/proxy: MaxBytesReader on /v1/exec).
+const maxRequestBody = 1 << 20
 
 type execResponse struct {
 	Stdout   string `json:"stdout"`
@@ -69,17 +72,20 @@ func main() {
 		return
 	}
 
-	httpClient, err := proxyHTTPClient(proxyURL, certFile, keyFile, caFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Determine argv: prepend the binary name so the server knows which tool we are.
 	argv := os.Args // os.Args[0] is the binary path; the server needs the tool name as argv[0].
 	// Replace argv[0] with the tool name (gt or bd) based on the binary name.
 	toolName := toolNameFromArg0(os.Args[0])
 	argv = append([]string{toolName}, os.Args[1:]...)
+	// The exit code for a failure of this client itself, before or instead of
+	// the command's own result.
+	failCode := clientFailureExit(toolName, os.Args[1:])
+
+	httpClient, err := proxyHTTPClient(proxyURL, certFile, keyFile, caFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
+		os.Exit(failCode)
+	}
 
 	// An unreadable cwd is passed on as "": git then fails to find a branch,
 	// which stops gt done when the session named one.
@@ -91,35 +97,35 @@ func main() {
 	}
 	argv = withCleanupStatus(argv, unsaved)
 
-	stdin, err := stdinForRequest(toolName, os.Args[1:], os.Stdin)
+	stdin, err := stdinForRequest(toolName, os.Args[1:], os.Stdin, isTerminal(os.Stdin))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
-		os.Exit(1)
+		os.Exit(failCode)
 	}
 
-	body, err := json.Marshal(execRequest{Argv: argv, Stdin: stdin})
+	body, err := encodeRequest(execRequest{Argv: argv, Stdin: stdin})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gt-proxy-client: encode request: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
+		os.Exit(failCode)
 	}
 
 	resp, err := httpClient.Post(proxyURL+"/v1/exec", "application/json", bytes.NewReader(body)) //nolint:gosec // proxyURL is from trusted env var GT_PROXY_URL
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: proxy request failed: %v\n", err)
-		os.Exit(1)
+		os.Exit(failCode)
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close on response body
 
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: server error %d: %s\n", resp.StatusCode, msg)
-		os.Exit(1)
+		os.Exit(failCode)
 	}
 
 	var result execResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: decode response: %v\n", err)
-		os.Exit(1)
+		os.Exit(failCode)
 	}
 
 	if result.Stdout != "" {
@@ -273,22 +279,79 @@ func runGit(cmd *exec.Cmd, dir string) (string, error) {
 	return string(out), err
 }
 
-// stdinForRequest returns the stdin to forward with a proxied call. Only
-// `gt tap …` gets one: those are the agent's hook handlers, which are handed
-// the tool input on a pipe that the hook runner closes. No other command reads
-// stdin here — an agent's shell can leave it open, and reading it would hang.
-func stdinForRequest(tool string, args []string, in io.Reader) (string, error) {
-	if tool != "gt" || len(args) == 0 || args[0] != "tap" {
+// clientFailureExit is the exit code for a failure of this client itself: the
+// request could not be built, sent or answered. For a hook guard that code is
+// 2. The agent's hook runner blocks a tool call only on exit 2 and treats any
+// other failure as a warning, so a guard that could not be reached must not
+// report 1: an oversized input, a rate limit or a proxy outage would then
+// wave the command through. The guards themselves fail closed the same way.
+func clientFailureExit(tool string, args []string) int {
+	if tool == "gt" && len(args) >= 2 && args[0] == "tap" && args[1] == "guard" {
+		return 2
+	}
+	return 1
+}
+
+// stdinForRequest returns the stdin to forward with a proxied call. Two kinds
+// of call read stdin on the host: `gt tap …`, the agent's hook handlers, which
+// are handed the tool input on a pipe that the hook runner closes, and any
+// command given --stdin (mail send, nudge, escalate, …), where the caller asked
+// for stdin to be read. Nothing else is read — an agent's shell can leave
+// stdin open, and reading it would hang. A terminal is never read either: a
+// hook handler run by hand would otherwise wait for end of input, which the
+// handlers themselves avoid.
+func stdinForRequest(tool string, args []string, in io.Reader, terminal bool) (string, error) {
+	if terminal || len(args) == 0 {
+		return "", nil
+	}
+	if !(tool == "gt" && args[0] == "tap") && !hasFlag(args, "--stdin") {
 		return "", nil
 	}
 	data, err := io.ReadAll(io.LimitReader(in, maxForwardedStdin+1))
 	if err != nil {
-		return "", fmt.Errorf("read hook input from stdin: %w", err)
+		return "", fmt.Errorf("read stdin to forward: %w", err)
 	}
 	if len(data) > maxForwardedStdin {
-		return "", fmt.Errorf("hook input on stdin exceeds %d bytes", maxForwardedStdin)
+		return "", fmt.Errorf("input on stdin exceeds %d bytes", maxForwardedStdin)
 	}
 	return string(data), nil
+}
+
+// hasFlag reports whether flag appears among args before any "--" terminator.
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// isTerminal reports whether f is a character device, i.e. an interactive
+// terminal rather than a pipe or a file.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// encodeRequest renders the request body. HTML escaping is off: it would turn
+// each <, > and & of a forwarded hook input into six bytes, pushing an input
+// that is within the stdin cap past the server's body limit. The encoded size
+// is checked here so that case is reported instead of being refused upstream.
+func encodeRequest(req execRequest) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(req); err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	if buf.Len() > maxRequestBody {
+		return nil, fmt.Errorf("encoded request is %d bytes, over the proxy's %d byte limit", buf.Len(), maxRequestBody)
+	}
+	return buf.Bytes(), nil
 }
 
 // toolNameFromArg0 extracts "gt" or "bd" from the argv[0] binary path.

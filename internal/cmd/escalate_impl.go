@@ -459,7 +459,23 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// refuseProxiedEscalationChange refuses to settle an escalation on behalf of a
+// proxied caller. The proxy allows a subcommand by its first word only, so
+// making `gt escalate` reachable for a remote polecat (to raise one) also
+// reaches ack, close and stale. Escalations are the oversight channel: the
+// agent an escalation may be about must not be able to acknowledge or close
+// it. The proxy sets GT_PROXY_IDENTITY on every command it runs.
+func refuseProxiedEscalationChange(action string) error {
+	if id := os.Getenv("GT_PROXY_IDENTITY"); id != "" {
+		return fmt.Errorf("gt escalate %s is not available through the proxy (caller %s): a proxied agent can raise an escalation, not settle one", action, id)
+	}
+	return nil
+}
+
 func runEscalateAck(cmd *cobra.Command, args []string) error {
+	if err := refuseProxiedEscalationChange("ack"); err != nil {
+		return err
+	}
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -493,6 +509,9 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 }
 
 func runEscalateClose(cmd *cobra.Command, args []string) error {
+	if err := refuseProxiedEscalationChange("close"); err != nil {
+		return err
+	}
 	escalationID := args[0]
 
 	townRoot, err := workspace.FindFromCwdOrError()
@@ -524,6 +543,9 @@ func runEscalateClose(cmd *cobra.Command, args []string) error {
 }
 
 func runEscalateStale(cmd *cobra.Command, args []string) error {
+	if err := refuseProxiedEscalationChange("stale"); err != nil {
+		return err
+	}
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)

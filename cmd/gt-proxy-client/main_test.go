@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"os"
@@ -434,14 +435,22 @@ func TestWithCleanupStatus(t *testing.T) {
 }
 
 // Hook handlers (gt tap …) are fed the tool input on stdin by the agent's hook
-// runner, which closes the pipe. Every other call must not read stdin at all:
-// an agent's shell can leave it open, and a read would hang the command.
+// runner, which closes the pipe, and a command given --stdin asked for it.
+// Every other call must not read stdin at all: an agent's shell can leave it
+// open, and a read would hang the command.
 func TestStdinForRequest(t *testing.T) {
-	in := strings.NewReader(`{"tool_input":{"command":"ls"}}`)
-
-	got, err := stdinForRequest("gt", []string{"tap", "guard", "pr-workflow"}, in)
-	require.NoError(t, err)
-	assert.Equal(t, `{"tool_input":{"command":"ls"}}`, got)
+	for _, tc := range []struct {
+		tool string
+		args []string
+	}{
+		{"gt", []string{"tap", "guard", "pr-workflow"}},
+		{"gt", []string{"escalate", "-s", "high", "stuck", "--stdin"}},
+		{"gt", []string{"mail", "send", "mayor/", "-s", "x", "--stdin"}},
+	} {
+		got, err := stdinForRequest(tc.tool, tc.args, strings.NewReader("payload"), false)
+		require.NoError(t, err)
+		assert.Equal(t, "payload", got, "%s %v must forward stdin", tc.tool, tc.args)
+	}
 
 	for _, tc := range []struct {
 		tool string
@@ -450,15 +459,62 @@ func TestStdinForRequest(t *testing.T) {
 		{"gt", []string{"done"}},
 		{"gt", []string{"mail", "inbox"}},
 		{"bd", []string{"tap"}},
+		{"gt", []string{"mail", "send", "--", "--stdin"}},
 		{"gt", nil},
 	} {
-		got, err := stdinForRequest(tc.tool, tc.args, strings.NewReader("unread"))
+		got, err := stdinForRequest(tc.tool, tc.args, strings.NewReader("unread"), false)
 		require.NoError(t, err)
 		assert.Empty(t, got, "%s %v must not read stdin", tc.tool, tc.args)
 	}
 }
 
+// A hook handler run by hand has a terminal on stdin. Reading it would wait
+// for end of input; the handlers themselves skip the read on a terminal.
+func TestStdinForRequest_TerminalIsNotRead(t *testing.T) {
+	got, err := stdinForRequest("gt", []string{"tap", "guard", "pr-workflow"}, strings.NewReader("unread"), true)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
 func TestStdinForRequest_TooLargeIsAnError(t *testing.T) {
-	_, err := stdinForRequest("gt", []string{"tap", "guard", "pr-workflow"}, strings.NewReader(strings.Repeat("x", maxForwardedStdin+1)))
+	_, err := stdinForRequest("gt", []string{"tap", "guard", "pr-workflow"}, strings.NewReader(strings.Repeat("x", maxForwardedStdin+1)), false)
+	require.Error(t, err)
+}
+
+// The agent's hook runner blocks a tool call only on exit 2. A guard that
+// cannot be reached must therefore fail with 2, not 1.
+func TestClientFailureExit(t *testing.T) {
+	assert.Equal(t, 2, clientFailureExit("gt", []string{"tap", "guard", "dangerous-command"}))
+	for _, tc := range []struct {
+		tool string
+		args []string
+	}{
+		{"gt", []string{"tap", "polecat-stop-check"}},
+		{"gt", []string{"tap"}},
+		{"gt", []string{"done"}},
+		{"bd", []string{"tap", "guard"}},
+		{"gt", nil},
+	} {
+		assert.Equal(t, 1, clientFailureExit(tc.tool, tc.args), "%s %v", tc.tool, tc.args)
+	}
+}
+
+// A hook input full of <, > and & is within the stdin cap, but HTML escaping
+// would grow it sixfold and past the server's body limit, where it was refused
+// and the guard skipped.
+func TestEncodeRequest_DoesNotEscapeHTML(t *testing.T) {
+	stdin := strings.Repeat("&", 200<<10)
+	body, err := encodeRequest(execRequest{Argv: []string{"gt", "tap", "guard", "pr-workflow"}, Stdin: stdin})
+	require.NoError(t, err)
+	assert.Less(t, len(body), maxRequestBody)
+
+	var got execRequest
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Equal(t, stdin, got.Stdin)
+}
+
+func TestEncodeRequest_OverTheServerLimitIsAnError(t *testing.T) {
+	// Quotes are escaped whatever the HTML setting: two bytes each.
+	_, err := encodeRequest(execRequest{Argv: []string{"gt", "tap", "guard", "pr-workflow"}, Stdin: strings.Repeat(`"`, maxForwardedStdin)})
 	require.Error(t, err)
 }

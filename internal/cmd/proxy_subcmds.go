@@ -17,7 +17,7 @@ const AnnotationPolecatSafe = "polecatSafe"
 // bdSafeSubcmds lists the bd subcommands safe for polecat sandbox execution.
 // Unlike gt subcommands (which are auto-discovered via AnnotationPolecatSafe),
 // bd subcommands are listed here since bd does not embed annotations.
-const bdSafeSubcmds = "create,update,close,show,list,ready,dep,export,prime,stats,blocked,doctor,formula,mol"
+const bdSafeSubcmds = "create,update,close,show,list,ready,dep,export,prime,stats,blocked,doctor"
 
 var proxySubcmdsCmd = &cobra.Command{
 	Use:    "proxy-subcmds",

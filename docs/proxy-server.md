@@ -124,11 +124,18 @@ The default subcommand allowlists are:
 | Binary | Subcommands |
 |--------|-------------|
 | `gt` | `prime`, `hook`, `done`, `mail`, `nudge`, `mol`, `status`, `handoff`, `version`, `convoy`, `sling`, `tap`, `escalate` |
-| `bd` | `create`, `update`, `close`, `show`, `list`, `ready`, `dep`, `export`, `prime`, `stats`, `blocked`, `doctor`, `formula`, `mol` |
+| `bd` | `create`, `update`, `close`, `show`, `list`, `ready`, `dep`, `export`, `prime`, `stats`, `blocked`, `doctor` |
 
 `gt tap` is the agent's hook handlers (`gt tap guard …`). They read the tool
-input from stdin, so `gt-proxy-client` forwards stdin for `gt tap` calls — and
-only for those — in the request's `stdin` field.
+input from stdin, so `gt-proxy-client` forwards stdin in the request's `stdin`
+field for `gt tap` calls and for any command given `--stdin`, and for nothing
+else. A `gt tap guard` call that cannot reach the proxy exits 2, which blocks
+the tool call, as the guard itself does on unreadable input.
+
+A subcommand is allowed by its first word, so a parent grants every child.
+`gt escalate` is allowed so that a proxied agent can raise an escalation;
+`ack`, `close` and `stale` refuse a proxied caller. `bd formula` and `bd mol`
+are not allowed: some of their children write files on the proxy host.
 
 #### Auto-discovery via `gt proxy-subcmds`
 
@@ -345,7 +352,7 @@ always take precedence over file values.
 | `max_concurrent_exec` | `int` | Maximum simultaneous exec subprocesses (default: 32) |
 | `exec_rate_limit` | `float64` | Sustained exec requests per second per client (default: 10) |
 | `exec_rate_burst` | `int` | Burst size for per-client rate limiter (default: 20) |
-| `exec_timeout` | `string` | Maximum duration for a single exec subprocess, e.g. `"60s"` (default: 60 s) |
+| `exec_timeout` | `string` | Maximum duration for a single exec subprocess, e.g. `"60s"` (default: 60 s). Must be positive and below `5m`: the client and the server both end a request at five minutes, which cancels the command |
 
 ### Local IPs vs external/NAT IPs
 
