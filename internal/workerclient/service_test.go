@@ -717,3 +717,36 @@ func TestSessionOpen_RejectsUnsafeBranch(t *testing.T) {
 	// later, at checkout, so a bare "some error" would pass without the guard.
 	require.ErrorContains(t, err, "not a safe branch name")
 }
+
+// TestRemotePolecatPushReachesHostWorktree is the whole remote work loop up to
+// gt done: the host has the polecat's worktree checked out on its branch (as
+// polecat.Manager creates it), the agent commits on the worker and pushes
+// through the relay, and the host worktree — which is what gt done inspects
+// when the proxy runs it — must then hold that commit.
+func TestRemotePolecatPushReachesHostWorktree(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	hostWT := filepath.Join(townRoot, "demo", "polecats", "furiosa", "demo")
+	require.NoError(t, os.MkdirAll(filepath.Dir(hostWT), 0755))
+	git(t, rigRepo, "worktree", "add", "-b", branch, hostWT, "HEAD")
+
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, "main.go"), []byte("v2-remote-work\n"), 0644))
+	git(t, worktree, "commit", "-am", "remote work")
+	git(t, worktree, "push", "origin", "HEAD")
+
+	data, err := os.ReadFile(filepath.Join(hostWT, "main.go"))
+	require.NoError(t, err)
+	assert.Equal(t, "v2-remote-work\n", string(data), "the host worktree must follow the pushed branch")
+	assert.Equal(t, git(t, worktree, "rev-parse", "HEAD"), git(t, hostWT, "rev-parse", "HEAD"))
+	assert.Empty(t, git(t, hostWT, "status", "--porcelain"), "the host worktree must stay clean")
+}

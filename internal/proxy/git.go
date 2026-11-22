@@ -202,6 +202,18 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request, repoPath, se
 	cmd.Stdout = w
 	cmd.Stderr = &errBuf
 	cmd.Env = minimalEnv()
+	if service == "git-receive-pack" {
+		// The host keeps a worktree checked out on the polecat's branch, and
+		// git refuses a push to a checked-out branch by default. updateInstead
+		// accepts it and fast-forwards that worktree, so the host — where
+		// gt done runs for a remote polecat — sees the pushed work. A dirty
+		// host worktree still refuses the push.
+		cmd.Env = append(cmd.Env,
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=receive.denyCurrentBranch",
+			"GIT_CONFIG_VALUE_0=updateInstead",
+		)
+	}
 	if err := cmd.Run(); err != nil {
 		s.log.Error("git pack failed", "service", service, "rig", rig, "err", err, "stderr", errBuf.String())
 	}
