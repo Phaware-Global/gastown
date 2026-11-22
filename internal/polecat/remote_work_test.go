@@ -392,3 +392,49 @@ func TestReleasePublishedWorkRef_WorkerPushAfterTheExaminationIsReported(t *test
 		t.Fatalf("work ref = %s, want the later commit %s kept", got, later)
 	}
 }
+
+// The same push with the worktree gone: removal is refused for the commits
+// that arrived, and the ref keeps them.
+func TestRemoveWithOptions_MissingWorktreeWorkerPushDuringReleaseIsRefused(t *testing.T) {
+	f := newMissingWorktreeFixture(t, "start point", false)
+	rwGit(t, f.p.ClonePath, "push", "-q", "origin", "HEAD:refs/heads/"+f.branch)
+	sha := leaveRemoteWork(t, f.p.ClonePath, f.branch, "work pushed by the remote worker")
+	workRef := constants.RemoteWorkRef(f.branch)
+	rwGit(t, f.p.ClonePath, "push", "-q", "origin", sha+":refs/heads/"+f.branch)
+	rwGit(t, f.p.ClonePath, "fetch", "-q", "origin")
+	later := rwGit(t, f.p.ClonePath, "commit-tree", "-p", workRef, "-m", "pushed after the examination", workRef+"^{tree}")
+	common := rwGit(t, f.p.ClonePath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	hooks := rwGit(t, f.p.ClonePath, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
+
+	// Stand in for the worker: the repo's reference-transaction hook rejects
+	// the first delete of the work ref and, once that transaction is aborted
+	// and the ref unlocked, moves the ref on by one commit.
+	marker := filepath.Join(t.TempDir(), "rejected")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = prepared ] && [ ! -e '" + marker + "' ] && grep -q '^" + sha + " 0\\{40\\} " + workRef + "$'; then\n" +
+		"  : > '" + marker + "'; exit 1\nfi\n" +
+		"if [ \"$1\" = aborted ] && [ -e '" + marker + "' ] && [ ! -e '" + marker + ".moved' ]; then\n" +
+		"  : > '" + marker + ".moved'; git update-ref '" + workRef + "' " + later + " " + sha + "\nfi\nexit 0\n"
+	if err := os.MkdirAll(hooks, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hooks, "reference-transaction"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(f.p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	err := f.mgr.RemoveWithOptions("toast", true, false, false)
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWithOptions err = %v, want *WorkAtRiskError", err)
+	}
+	if risk.Unpushed != 1 {
+		t.Errorf("risk.Unpushed = %d, want the 1 later commit", risk.Unpushed)
+	}
+	out, revErr := exec.Command("git", "--git-dir", common, "rev-parse", workRef).Output()
+	if got := strings.TrimSpace(string(out)); revErr != nil || got != later {
+		t.Fatalf("work ref = %q (%v), want the later commit %s kept", got, revErr, later)
+	}
+}
