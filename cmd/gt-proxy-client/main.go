@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -109,7 +110,13 @@ func main() {
 		os.Exit(failCode)
 	}
 
-	resp, err := httpClient.Post(proxyURL+"/v1/exec", "application/json", bytes.NewReader(body)) //nolint:gosec // proxyURL is from trusted env var GT_PROXY_URL
+	// Only a guard retries: it must fail closed, and without a retry a busy
+	// proxy would deny the agent's tool calls outright.
+	retries := 0
+	if failCode == 2 {
+		retries = guardRetries
+	}
+	resp, err := postExec(httpClient, proxyURL+"/v1/exec", body, retries, guardRetryDelay)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: proxy request failed: %v\n", err)
 		os.Exit(failCode)
@@ -134,7 +141,46 @@ func main() {
 	if result.Stderr != "" {
 		_, _ = fmt.Fprint(os.Stderr, result.Stderr)
 	}
-	os.Exit(result.ExitCode)
+	os.Exit(resultExit(failCode, result.ExitCode))
+}
+
+// guardRetries and guardRetryDelay bound how long a guard call waits out a
+// throttled proxy: three more attempts at 1x, 2x and 3x the delay, about 1.5s
+// in all, well inside a hook's own timeout.
+const (
+	guardRetries    = 3
+	guardRetryDelay = 250 * time.Millisecond
+)
+
+// postExec sends an exec request. A 429 (per-identity rate limit) or a 503
+// (exec slots full) is refused at once by the server and clears on its own, so
+// it is retried up to retries times, waiting a little longer each time.
+// Anything else, and the last throttled response, is returned as is.
+func postExec(client *http.Client, url string, body []byte, retries int, delay time.Duration) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := client.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec // proxyURL is from trusted env var GT_PROXY_URL
+		if err != nil {
+			return nil, err
+		}
+		throttled := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable
+		if !throttled || attempt >= retries {
+			return resp, nil
+		}
+		_ = resp.Body.Close()
+		time.Sleep(time.Duration(attempt+1) * delay)
+	}
+}
+
+// resultExit is the exit code for a command the host did run. For a hook
+// guard (failCode 2) only 0 allows and only 2 blocks; a guard killed at the
+// exec timeout (-1) or one that could not start (1) reached no verdict, and
+// the agent's hook runner would treat either as a warning and let the tool
+// call through. Those block too. Every other command keeps its own code.
+func resultExit(failCode, code int) int {
+	if failCode == 2 && code != 0 {
+		return 2
+	}
+	return code
 }
 
 // pushTimeout bounds the pre-done push and its fallback checks. It matches the
@@ -317,7 +363,8 @@ func stdinForRequest(tool string, args []string, in io.Reader, terminal bool) (s
 	return string(data), nil
 }
 
-// hasFlag reports whether flag appears among args before any "--" terminator.
+// hasFlag reports whether the boolean flag is set among args before any "--"
+// terminator, either bare or as flag=<true value>.
 func hasFlag(args []string, flag string) bool {
 	for _, a := range args {
 		if a == "--" {
@@ -325,6 +372,10 @@ func hasFlag(args []string, flag string) bool {
 		}
 		if a == flag {
 			return true
+		}
+		if v, ok := strings.CutPrefix(a, flag+"="); ok {
+			set, err := strconv.ParseBool(v)
+			return err == nil && set
 		}
 	}
 	return false

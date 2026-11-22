@@ -463,8 +463,11 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 // proxied caller. The proxy allows a subcommand by its first word only, so
 // making `gt escalate` reachable for a remote polecat (to raise one) also
 // reaches ack, close and stale. Escalations are the oversight channel: the
-// agent an escalation may be about must not be able to acknowledge or close
-// it. The proxy sets GT_PROXY_IDENTITY on every command it runs.
+// agent an escalation may be about should not settle it through the command
+// this change makes reachable. This covers `gt escalate` only. The proxy's
+// long-standing bd allow-list (update, close) still reaches any bead,
+// escalation beads included; closing that needs bead-level authorization in
+// the proxy. The proxy sets GT_PROXY_IDENTITY on every command it runs.
 func refuseProxiedEscalationChange(action string) error {
 	if id := os.Getenv("GT_PROXY_IDENTITY"); id != "" {
 		return fmt.Errorf("gt escalate %s is not available through the proxy (caller %s): a proxied agent can raise an escalation, not settle one", action, id)

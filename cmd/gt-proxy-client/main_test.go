@@ -8,7 +8,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -446,6 +449,7 @@ func TestStdinForRequest(t *testing.T) {
 		{"gt", []string{"tap", "guard", "pr-workflow"}},
 		{"gt", []string{"escalate", "-s", "high", "stuck", "--stdin"}},
 		{"gt", []string{"mail", "send", "mayor/", "-s", "x", "--stdin"}},
+		{"gt", []string{"escalate", "-s", "high", "stuck", "--stdin=true"}},
 	} {
 		got, err := stdinForRequest(tc.tool, tc.args, strings.NewReader("payload"), false)
 		require.NoError(t, err)
@@ -460,6 +464,8 @@ func TestStdinForRequest(t *testing.T) {
 		{"gt", []string{"mail", "inbox"}},
 		{"bd", []string{"tap"}},
 		{"gt", []string{"mail", "send", "--", "--stdin"}},
+		{"gt", []string{"escalate", "stuck", "--stdin=false"}},
+		{"gt", []string{"escalate", "stuck", "--stdin=maybe"}},
 		{"gt", nil},
 	} {
 		got, err := stdinForRequest(tc.tool, tc.args, strings.NewReader("unread"), false)
@@ -497,6 +503,74 @@ func TestClientFailureExit(t *testing.T) {
 	} {
 		assert.Equal(t, 1, clientFailureExit(tc.tool, tc.args), "%s %v", tc.tool, tc.args)
 	}
+}
+
+// A guard that the host could not run to a verdict (killed at the exec
+// timeout: -1; could not start, unknown guard: 1) must block like a client
+// failure does. Only 0 allows and only 2 blocks, so anything else becomes 2.
+func TestResultExit(t *testing.T) {
+	guard := clientFailureExit("gt", []string{"tap", "guard", "pr-workflow"})
+	for code, want := range map[int]int{0: 0, 2: 2, 1: 2, -1: 2, 137: 2} {
+		assert.Equal(t, want, resultExit(guard, code), "guard exit %d", code)
+	}
+	other := clientFailureExit("gt", []string{"done"})
+	for _, code := range []int{0, 1, 2, -1, 137} {
+		assert.Equal(t, code, resultExit(other, code), "a command's own exit code %d passes through", code)
+	}
+}
+
+// A rate limit or a full exec queue is transient. A guard call rides it out
+// instead of denying the agent's tool call on the first 429.
+func TestPostExec_GuardRetriesThrottling(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		calls := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			body, _ := io.ReadAll(r.Body)
+			assert.Equal(t, "payload", string(body), "every attempt must carry the full body")
+			if calls < 3 {
+				http.Error(w, "busy", status)
+				return
+			}
+			_, _ = w.Write([]byte(`{"exitCode":0}`))
+		}))
+		resp, err := postExec(srv.Client(), srv.URL, []byte("payload"), guardRetries, time.Millisecond)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		_ = resp.Body.Close()
+		assert.Equal(t, 3, calls)
+		srv.Close()
+	}
+}
+
+// The retries are bounded: a proxy that stays throttled is reported, and the
+// caller then fails closed.
+func TestPostExec_GivesUpAfterTheLastRetry(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		http.Error(w, "busy", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	resp, err := postExec(srv.Client(), srv.URL, []byte("payload"), guardRetries, time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	_ = resp.Body.Close()
+	assert.Equal(t, guardRetries+1, calls)
+}
+
+// Anything other than a guard is sent once: its caller sees the 429 and decides.
+func TestPostExec_NoRetriesByDefault(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		http.Error(w, "busy", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	resp, err := postExec(srv.Client(), srv.URL, []byte("payload"), 0, time.Millisecond)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, 1, calls)
 }
 
 // A hook input full of <, > and & is within the stdin cap, but HTML escaping
