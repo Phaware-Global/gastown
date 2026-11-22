@@ -79,10 +79,12 @@ func main() {
 	// An unreadable cwd is passed on as "": git then fails to find a branch,
 	// which stops gt done when the session named one.
 	cwd, _ := os.Getwd()
-	if err := pushWorkBeforeDone(toolName, os.Args[1:], cwd, os.Getenv("GT_BRANCH")); err != nil {
+	unsaved, err := pushWorkBeforeDone(toolName, os.Args[1:], cwd, os.Getenv("GT_BRANCH"))
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
 		os.Exit(1)
 	}
+	argv = withCleanupStatus(argv, unsaved)
 
 	body, err := json.Marshal(execRequest{Argv: argv})
 	if err != nil {
@@ -140,20 +142,42 @@ const pushTimeout = 5 * time.Minute
 // --status ESCALATED or DEFERRED the polecat is reporting that it is stuck or
 // parking, and must be able to even when it cannot push or has not committed:
 // there the push is best effort, and a failure is a warning.
-func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) error {
+//
+// A best-effort exit that left work behind returns the cleanup status that
+// describes it (uncommitted, unpushed, or unknown when the worktree could not
+// be examined). The host cannot see this worktree: it reads its own, which
+// sits at the branch's start point, and would record the polecat as clean.
+// The caller forwards the status so the host records the risk instead.
+func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) (unsaved string, err error) {
 	if tool != "gt" || len(args) == 0 || args[0] != "done" {
-		return nil
+		return "", nil
 	}
 	if sessionBranch == "HEAD" {
 		sessionBranch = ""
 	}
 	if status := doneStatus(args[1:]); status != "COMPLETED" {
-		if err := pushWork(dir, sessionBranch, false); err != nil {
+		unsaved, err := pushWork(dir, sessionBranch, false)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "gt-proxy-client: warning: %v (continuing, --status %s does not submit work)\n", err, status)
 		}
-		return nil
+		return unsaved, nil
 	}
-	return pushWork(dir, sessionBranch, true)
+	_, err = pushWork(dir, sessionBranch, true)
+	return "", err
+}
+
+// withCleanupStatus appends --cleanup-status=<status> to a gt done argv when
+// there is unsaved work to report and the caller did not pass the flag itself.
+func withCleanupStatus(argv []string, status string) []string {
+	if status == "" {
+		return argv
+	}
+	for _, a := range argv {
+		if a == "--cleanup-status" || strings.HasPrefix(a, "--cleanup-status=") {
+			return argv
+		}
+	}
+	return append(argv, "--cleanup-status="+status)
 }
 
 // doneStatus returns the --status of a gt done argument list, upper-cased;
@@ -174,21 +198,26 @@ func doneStatus(args []string) string {
 // With submitting set, tracked changes that are not committed are an error
 // and nothing is pushed; without it they are left behind and what is
 // committed is still sent.
-func pushWork(dir, sessionBranch string, submitting bool) error {
+//
+// unsaved is the cleanup status for work this call left behind: uncommitted
+// for tracked changes that were not committed, unpushed when the push failed,
+// unknown when the worktree could not be examined, and empty when everything
+// committed reached the host.
+func pushWork(dir, sessionBranch string, submitting bool) (unsaved string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 
-	out, err := runGit(exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "--short", "HEAD"), dir)
+	out, headErr := runGit(exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "--short", "HEAD"), dir)
 	branch := strings.TrimSpace(out)
 	if sessionBranch != "" {
-		if err != nil {
-			return fmt.Errorf("gt done must run on the session's branch %s, but no branch is checked out here (detached HEAD, or not the worktree): nothing was pushed to the host", sessionBranch)
+		if headErr != nil {
+			return "unknown", fmt.Errorf("gt done must run on the session's branch %s, but no branch is checked out here (detached HEAD, or not the worktree): nothing was pushed to the host", sessionBranch)
 		}
 		if branch != sessionBranch {
-			return fmt.Errorf("gt done must run on the session's branch %s, but %s is checked out: nothing was pushed to the host", sessionBranch, branch)
+			return "unknown", fmt.Errorf("gt done must run on the session's branch %s, but %s is checked out: nothing was pushed to the host", sessionBranch, branch)
 		}
-	} else if err != nil || !strings.HasPrefix(branch, "polecat/") {
-		return nil // not a worktree, a detached HEAD or some other branch: nothing of ours to push
+	} else if headErr != nil || !strings.HasPrefix(branch, "polecat/") {
+		return "", nil // not a worktree, a detached HEAD or some other branch: nothing of ours to push
 	}
 
 	// gt done on the host reads the pushed commits, never this worktree, so
@@ -196,12 +225,13 @@ func pushWork(dir, sessionBranch string, submitting bool) error {
 	// the work. (A local polecat's gt done commits them itself; here that is
 	// the agent's job.) Untracked files are not work and are ignored.
 	if status, err := runGit(exec.CommandContext(ctx, "git", "status", "--porcelain", "--untracked-files=no"), dir); err != nil {
-		return fmt.Errorf("checking for uncommitted changes before gt done: %v: %s", err, strings.TrimSpace(status))
+		return "unknown", fmt.Errorf("checking for uncommitted changes before gt done: %v: %s", err, strings.TrimSpace(status))
 	} else if strings.TrimSpace(status) != "" {
 		if submitting {
-			return fmt.Errorf("uncommitted changes to tracked files: commit them (or discard them) and run gt done again; nothing was pushed to the host:\n%s", strings.TrimRight(status, "\n"))
+			return "uncommitted", fmt.Errorf("uncommitted changes to tracked files: commit them (or discard them) and run gt done again; nothing was pushed to the host:\n%s", strings.TrimRight(status, "\n"))
 		}
 		fmt.Fprintf(os.Stderr, "gt-proxy-client: warning: uncommitted changes to tracked files are not sent to the host:\n%s\n", strings.TrimRight(status, "\n"))
+		unsaved = "uncommitted"
 	}
 
 	// The session's clone sends the work branch to its work ref on the host
@@ -211,9 +241,12 @@ func pushWork(dir, sessionBranch string, submitting bool) error {
 	// rebase after an earlier push) replace it, and nothing else.
 	pushOut, pushErr := runGit(exec.CommandContext(ctx, "git", "push", "--force-with-lease", "origin"), dir)
 	if pushErr == nil {
-		return nil
+		return unsaved, nil
 	}
-	return fmt.Errorf("pushing %s to the host before gt done: %v: %s", branch, pushErr, strings.TrimSpace(pushOut))
+	if unsaved == "" {
+		unsaved = "unpushed"
+	}
+	return unsaved, fmt.Errorf("pushing %s to the host before gt done: %v: %s", branch, pushErr, strings.TrimSpace(pushOut))
 }
 
 // runGit runs a git command in dir and returns its combined output. It never
