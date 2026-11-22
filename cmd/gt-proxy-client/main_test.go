@@ -166,7 +166,7 @@ func TestPushWorkBeforeDone_PushesPolecatBranch(t *testing.T) {
 	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
 	clone, bare := polecatClone(t, branch)
 
-	if err := pushWorkBeforeDone("gt", []string{"done"}, clone); err != nil {
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone, ""); err != nil {
 		t.Fatalf("pushWorkBeforeDone: %v", err)
 	}
 	if got, want := gitT(t, bare, "rev-parse", "refs/heads/"+branch), gitT(t, clone, "rev-parse", "HEAD"); got != want {
@@ -185,12 +185,12 @@ func TestPushWorkBeforeDone_OnlyForGtDoneOnAPolecatBranch(t *testing.T) {
 		{"bd", []string{"done"}},
 		{"gt", nil},
 	} {
-		if err := pushWorkBeforeDone(tc.tool, tc.args, clone); err != nil {
+		if err := pushWorkBeforeDone(tc.tool, tc.args, clone, ""); err != nil {
 			t.Fatalf("%s %v: %v", tc.tool, tc.args, err)
 		}
 	}
 	gitT(t, clone, "checkout", "main")
-	if err := pushWorkBeforeDone("gt", []string{"done"}, clone); err != nil {
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone, ""); err != nil {
 		t.Fatalf("non-polecat branch: %v", err)
 	}
 	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
@@ -199,7 +199,7 @@ func TestPushWorkBeforeDone_OnlyForGtDoneOnAPolecatBranch(t *testing.T) {
 		t.Fatal("nothing should have been pushed")
 	}
 	// Outside a git worktree there is nothing to push, and that is not an error.
-	if err := pushWorkBeforeDone("gt", []string{"done"}, t.TempDir()); err != nil {
+	if err := pushWorkBeforeDone("gt", []string{"done"}, t.TempDir(), ""); err != nil {
 		t.Fatalf("outside a worktree: %v", err)
 	}
 }
@@ -211,7 +211,99 @@ func TestPushWorkBeforeDone_FailedPushIsAnError(t *testing.T) {
 	if err := os.RemoveAll(bare); err != nil {
 		t.Fatal(err)
 	}
-	if err := pushWorkBeforeDone("gt", []string{"done"}, clone); err == nil {
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone, ""); err == nil {
 		t.Fatal("expected an error when the push fails")
+	}
+}
+
+// When the session names its work branch (GT_BRANCH), gt done must not be
+// forwarded from anywhere else: the host would complete the bead against a
+// copy of the branch that never received the work.
+func TestPushWorkBeforeDone_SessionBranchIsAuthoritative(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+
+	t.Run("detached HEAD", func(t *testing.T) {
+		clone, _ := polecatClone(t, branch)
+		gitT(t, clone, "checkout", "--detach")
+		if err := pushWorkBeforeDone("gt", []string{"done"}, clone, branch); err == nil {
+			t.Fatal("expected an error on a detached HEAD")
+		}
+	})
+	t.Run("a different local branch", func(t *testing.T) {
+		clone, _ := polecatClone(t, branch)
+		gitT(t, clone, "checkout", "-b", "scratch")
+		if err := pushWorkBeforeDone("gt", []string{"done"}, clone, branch); err == nil {
+			t.Fatal("expected an error on a branch other than the session's")
+		}
+	})
+	t.Run("outside a worktree", func(t *testing.T) {
+		if err := pushWorkBeforeDone("gt", []string{"done"}, t.TempDir(), branch); err == nil {
+			t.Fatal("expected an error outside a git worktree")
+		}
+	})
+	t.Run("on the session branch", func(t *testing.T) {
+		clone, bare := polecatClone(t, branch)
+		if err := pushWorkBeforeDone("gt", []string{"done"}, clone, branch); err != nil {
+			t.Fatalf("pushWorkBeforeDone: %v", err)
+		}
+		if got, want := gitT(t, bare, "rev-parse", "refs/heads/"+branch), gitT(t, clone, "rev-parse", "HEAD"); got != want {
+			t.Fatalf("host branch = %s, want %s", got, want)
+		}
+	})
+	t.Run("a detached host worktree reports HEAD, which names no branch", func(t *testing.T) {
+		clone, _ := polecatClone(t, branch)
+		if err := pushWorkBeforeDone("gt", []string{"done"}, clone, "HEAD"); err != nil {
+			t.Fatalf("pushWorkBeforeDone: %v", err)
+		}
+	})
+}
+
+// rewrittenOnHost leaves the host's copy of branch holding a rebased
+// equivalent of the clone's one work commit, as host-side gt done does when
+// it rebases the branch onto its target.
+func rewrittenOnHost(t *testing.T, branch string) (clone, bare string) {
+	t.Helper()
+	clone, bare = polecatClone(t, branch)
+	gitT(t, clone, "reset", "--hard", "main") // drop the helper's empty commit: it has no patch to compare
+	if err := os.WriteFile(filepath.Join(clone, "work.txt"), []byte("work\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, clone, "add", "work.txt")
+	gitT(t, clone, "commit", "-m", "real work")
+	host := filepath.Join(filepath.Dir(clone), "host")
+	gitT(t, filepath.Dir(clone), "clone", bare, host)
+	gitT(t, host, "commit", "--allow-empty", "-m", "target moved")
+	gitT(t, host, "fetch", clone, branch)
+	gitT(t, host, "cherry-pick", "FETCH_HEAD")
+	gitT(t, host, "push", "origin", "HEAD:refs/heads/"+branch)
+	return clone, bare
+}
+
+// A retried gt done after the host rewrote the branch: the push is rejected as
+// non-fast-forward, but every patch is already on the host, so gt done goes ahead.
+func TestPushWorkBeforeDone_HostAlreadyHasTheWorkRewritten(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	clone, _ := rewrittenOnHost(t, branch)
+	if err := pushWorkBeforeDone("gt", []string{"done"}, clone, branch); err != nil {
+		t.Fatalf("the host already holds the work, expected no error: %v", err)
+	}
+}
+
+// The same rejection with work the host does not have is an error that says
+// how to get unstuck.
+func TestPushWorkBeforeDone_RejectedPushWithNewWorkIsAnError(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	clone, _ := rewrittenOnHost(t, branch)
+	if err := os.WriteFile(filepath.Join(clone, "more.txt"), []byte("more\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, clone, "add", "more.txt")
+	gitT(t, clone, "commit", "-m", "more work")
+	err := pushWorkBeforeDone("gt", []string{"done"}, clone, branch)
+	if err == nil {
+		t.Fatal("expected an error: the host lacks the new commit")
+	}
+	if !strings.Contains(err.Error(), "git pull --rebase") {
+		t.Fatalf("error should say how to recover, got: %v", err)
 	}
 }

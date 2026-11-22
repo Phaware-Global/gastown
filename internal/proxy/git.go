@@ -207,7 +207,10 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request, repoPath, se
 		// git refuses a push to a checked-out branch by default. updateInstead
 		// accepts it and fast-forwards that worktree, so the host — where
 		// gt done runs for a remote polecat — sees the pushed work. A dirty
-		// host worktree still refuses the push.
+		// host worktree still refuses the push, and so does an untracked
+		// host file the push would overwrite (a generated CLAUDE.md, say).
+		// The remote agent cannot clear either; its client reports that the
+		// host worktree needs an operator.
 		cmd.Env = append(cmd.Env,
 			"GIT_CONFIG_COUNT=1",
 			"GIT_CONFIG_KEY_0=receive.denyCurrentBranch",

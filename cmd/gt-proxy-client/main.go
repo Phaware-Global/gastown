@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -75,11 +76,12 @@ func main() {
 	toolName := toolNameFromArg0(os.Args[0])
 	argv = append([]string{toolName}, os.Args[1:]...)
 
-	if cwd, err := os.Getwd(); err == nil {
-		if err := pushWorkBeforeDone(toolName, os.Args[1:], cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
-			os.Exit(1)
-		}
+	// An unreadable cwd is passed on as "": git then fails to find a branch,
+	// which stops gt done when the session named one.
+	cwd, _ := os.Getwd()
+	if err := pushWorkBeforeDone(toolName, os.Args[1:], cwd, os.Getenv("GT_BRANCH")); err != nil {
+		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
+		os.Exit(1)
 	}
 
 	body, err := json.Marshal(execRequest{Argv: argv})
@@ -116,34 +118,91 @@ func main() {
 	os.Exit(result.ExitCode)
 }
 
+// pushTimeout bounds the pre-done push and its fallback checks. It matches the
+// exec RPC's own ceiling: past that the proxied gt done could not run anyway.
+const pushTimeout = 5 * time.Minute
+
 // pushWorkBeforeDone pushes the polecat's branch to the host before a proxied
 // `gt done`. gt done runs on the host, against the host's copy of the branch;
 // commits that exist only in this worktree would be invisible to it, and the
 // bead would complete without the work. A failed push is therefore an error
-// that stops gt done. Anything that is not `gt done` on a polecat/ branch in a
-// git worktree is left alone.
-func pushWorkBeforeDone(tool string, args []string, dir string) error {
+// that stops gt done.
+//
+// sessionBranch is the work branch the session was started on (GT_BRANCH).
+// When it is set it is authoritative: gt done is refused from a detached
+// HEAD, from another branch, or from outside the worktree, because each of
+// those would forward gt done with nothing pushed. Without it (a session that
+// predates the branch being sent, or a detached host worktree, which reports
+// "HEAD") only a checked-out polecat/ branch is pushed and anything else is
+// left alone.
+func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) error {
 	if tool != "gt" || len(args) == 0 || args[0] != "done" {
 		return nil
 	}
-	head := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
-	head.Dir = dir
-	out, err := head.Output()
-	if err != nil {
-		return nil // not a worktree, or detached HEAD: nothing of ours to push
+	if sessionBranch == "HEAD" {
+		sessionBranch = ""
 	}
-	branch := strings.TrimSpace(string(out))
-	if !strings.HasPrefix(branch, "polecat/") {
-		return nil
+	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	defer cancel()
+
+	out, err := runGit(exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "--short", "HEAD"), dir)
+	branch := strings.TrimSpace(out)
+	if sessionBranch != "" {
+		if err != nil {
+			return fmt.Errorf("gt done must run on the session's branch %s, but no branch is checked out here (detached HEAD, or not the worktree): nothing was pushed to the host", sessionBranch)
+		}
+		if branch != sessionBranch {
+			return fmt.Errorf("gt done must run on the session's branch %s, but %s is checked out: nothing was pushed to the host", sessionBranch, branch)
+		}
+	} else if err != nil || !strings.HasPrefix(branch, "polecat/") {
+		return nil // not a worktree, a detached HEAD or some other branch: nothing of ours to push
 	}
+
 	// push.default=current sends HEAD to the same-named branch on the host,
 	// whatever upstream the worktree has configured.
-	push := exec.Command("git", "-c", "push.default=current", "push", "origin", "HEAD")
-	push.Dir = dir
-	if out, err := push.CombinedOutput(); err != nil {
-		return fmt.Errorf("pushing %s to the host before gt done: %v: %s", branch, err, strings.TrimSpace(string(out)))
+	pushOut, pushErr := runGit(exec.CommandContext(ctx, "git", "-c", "push.default=current", "push", "origin", "HEAD"), dir)
+	if pushErr == nil {
+		return nil
 	}
-	return nil
+	// Host-side gt done can rewrite the branch (it rebases onto the target) and
+	// then fail at a later step. On the retry this push is rejected as
+	// non-fast-forward although the host already holds every patch. In that
+	// case there is nothing left to push and gt done can go ahead.
+	if hostHasAllPatches(ctx, dir, branch) {
+		return nil
+	}
+	hint := ""
+	switch {
+	case strings.Contains(pushOut, "non-fast-forward") || strings.Contains(pushOut, "fetch first"):
+		hint = fmt.Sprintf("\nThe host's copy of the branch has moved. Run: git pull --rebase origin %s", branch)
+	case strings.Contains(pushOut, "Could not update working tree") || strings.Contains(pushOut, "would be overwritten"):
+		hint = "\nThe host's worktree for this polecat has local changes or an untracked file in the way. It cannot be fixed from here: escalate so an operator can clean it."
+	}
+	return fmt.Errorf("pushing %s to the host before gt done: %v: %s%s", branch, pushErr, strings.TrimSpace(pushOut), hint)
+}
+
+// hostHasAllPatches reports whether every commit on HEAD is already on the
+// host's copy of branch, by patch rather than by hash, so a rebased equivalent
+// counts. The revision range is fed on stdin, not the command line.
+func hostHasAllPatches(ctx context.Context, dir, branch string) bool {
+	if _, err := runGit(exec.CommandContext(ctx, "git", "fetch", "--quiet", "origin"), dir); err != nil {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, "git", "rev-list", "--cherry-pick", "--right-only", "--no-merges", "--stdin")
+	cmd.Stdin = strings.NewReader("refs/remotes/origin/" + branch + "...HEAD\n")
+	out, err := runGit(cmd, dir)
+	return err == nil && strings.TrimSpace(out) == ""
+}
+
+// runGit runs a git command in dir and returns its combined output. It never
+// prompts: a credential prompt on a relay would otherwise block gt done with
+// no output. Callers build the command from literal arguments.
+func runGit(cmd *exec.Cmd, dir string) (string, error) {
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.WaitDelay = 10 * time.Second
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // toolNameFromArg0 extracts "gt" or "bd" from the argv[0] binary path.
