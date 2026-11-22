@@ -23,12 +23,40 @@ launchd job only.
 The orchestrator additionally needs `gt-worker-attach` and `gt-proxy-server`,
 which `make install` places next to `gt`. `gt-worker-attach` is the process the
 tmux pane runs in place of the agent. `gt-proxy-server` is what a worker's `gt`
-and `bd` call (`docs/proxy-server.md`); nothing starts it for you, so run it
-under your own supervisor on the orchestrator before enrolling a worker:
+and `bd` call (`docs/proxy-server.md`).
+
+## 0. Run the proxy on the orchestrator
+
+Before enrolling a worker, the proxy has to be running and reachable from it.
+First put the name or IP the worker will dial into the proxy's certificate —
+it is issued at startup — in `<town>/.runtime/proxy/config.json`:
+
+```json
+{ "extra_san_hosts": ["orchestrator.local"] }
+```
+
+Then, from inside the town:
 
 ```bash
-gt-proxy-server --listen 0.0.0.0:9876
+gt proxy service install --listen 0.0.0.0:9876
 ```
+
+That installs a launchd job (`com.gastown.proxy`) which runs the installed
+`gt-proxy-server` in place, from the town root, and keeps it running across
+crashes and reboots. `gt proxy service status` shows its state; logs land in
+`<town>/.runtime/proxy/proxy-server.log`. After any change to the config file:
+
+```bash
+gt proxy service restart
+```
+
+The job's environment holds a `PATH` and nothing else. The `PATH` is captured
+from the shell that ran `install`, as the daemon's is, so the `gt` and `bd`
+commands the proxy runs for a remote polecat find the same `git`, `gh`, `bd`
+and toolchain shims the town's own sessions do; install from a shell where
+those resolve. No credentials are passed: proxied commands are started with
+`HOME` and `PATH` only, and use the operator account's own `git` and `gh`
+sign-in.
 
 ## 1. Enroll the machine
 
@@ -92,7 +120,7 @@ gt worker service install \
 it** — not a loopback address, unless the worker and orchestrator are the same
 box. The proxy's certificate must carry that hostname or IP: set
 `extra_san_hosts` / `extra_san_ips` in `~/gt/.runtime/proxy/config.json` and
-restart the proxy, because the cert is issued at startup.
+restart the proxy (`gt proxy service restart`), because the cert is issued at startup.
 
 Then `gt worker service status`, and `gt worker service restart` after any
 config change. Logs land in `<state-dir>/worker.log`.
