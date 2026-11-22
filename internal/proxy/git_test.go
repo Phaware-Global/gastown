@@ -239,6 +239,19 @@ func TestAuthorizeReceivePack(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 	})
 
+	// A cert issued before names were restricted can carry a '/' in its name.
+	// Polecat "a" may push polecat/a/<segment>, which is also where a legacy
+	// "a/b" cert's own refs live, so such a cert must not push at all.
+	t.Run("CN whose name is outside the safe charset returns 403", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/git/rig/git-receive-pack",
+			bytes.NewReader(receivePackBody("refs/heads/polecat/a/b-123")))
+		ok, _ := srv.authorizeReceivePack(rec, req, "gt-rig-a/b")
+		assert.False(t, ok)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "safe charset")
+	})
+
 	t.Run("valid CN and valid refs — body is rewound correctly", func(t *testing.T) {
 		cn := "gt-gastown-furiosa"
 		body := receivePackBody("refs/heads/polecat/furiosa-abc123")

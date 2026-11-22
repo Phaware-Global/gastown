@@ -226,6 +226,13 @@ func (s *Server) authorizeReceivePack(w http.ResponseWriter, r *http.Request, cl
 		http.Error(w, "cannot determine polecat name from cert CN", http.StatusForbidden)
 		return false, nil
 	}
+	// The ref rules below treat '/' as the edge of a polecat's namespace.
+	// Both issuers refuse such a name today, but a cert signed before they
+	// did is still valid, so the rule is enforced here for every cert.
+	if !validIdentityComponent(cnName) {
+		http.Error(w, "cert name outside safe charset", http.StatusForbidden)
+		return false, nil
+	}
 
 	// Read only the pkt-line ref-update section (up to the flush packet),
 	// then stream the remaining pack data through to git untouched.

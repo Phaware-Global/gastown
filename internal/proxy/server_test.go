@@ -771,6 +771,19 @@ func TestAdminIssueCertEndpoint(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	})
 
+	// gt-MyRig-a-b parses back as rig "MyRig-a", name "b": a different
+	// identity from the pair that was asked for.
+	t.Run("hyphenated name returns 400", func(t *testing.T) {
+		resp, err := adminClient.Post(
+			"http://"+adminAddr+"/v1/admin/issue-cert",
+			"application/json",
+			strings.NewReader(`{"rig":"MyRig","name":"a-b"}`),
+		)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
 	t.Run("invalid ttl returns 400", func(t *testing.T) {
 		resp, err := adminClient.Post(
 			"http://"+adminAddr+"/v1/admin/issue-cert",
