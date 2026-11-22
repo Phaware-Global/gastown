@@ -244,9 +244,9 @@ func TestPreserveRemoteWork_PublishedAndAlreadyReleasedIsNotAtRisk(t *testing.T)
 }
 
 // The delete after a publish can fail while the ref is still there at the
-// published commit (its lock was held). Origin has the work, so removal goes
-// on, and the ref is deleted on the second try rather than left behind.
-func TestPreserveRemoteWork_PublishedRefStillThereIsDeletedOnRetry(t *testing.T) {
+// published commit (its lock is held). Origin has the work, so removal goes
+// on, but the ref that stays behind is named rather than left silently.
+func TestPreserveRemoteWork_PublishedRefThatCannotBeDeletedIsNamed(t *testing.T) {
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
 	p, err := mgr.AddWithOptions("toast", AddOptions{})
 	if err != nil {
@@ -259,15 +259,12 @@ func TestPreserveRemoteWork_PublishedRefStillThereIsDeletedOnRetry(t *testing.T)
 	leaveRemoteWork(t, p.ClonePath, p.Branch, "work pushed by the remote worker")
 	workRef := constants.RemoteWorkRef(p.Branch)
 
-	// Hold the ref's lock across the publish: origin's post-receive hook,
-	// which runs before the push returns, takes it and a background process
-	// releases it shortly after, so the first delete fails and the retry,
-	// which follows a recount, finds it free.
+	// Origin's post-receive hook takes the ref's lock during the publish and
+	// never releases it, so every delete that follows fails.
 	common := rwGit(t, p.ClonePath, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	lock := filepath.Join(common, workRef+".lock")
 	hook := filepath.Join(origin, "hooks", "post-receive")
-	script := "#!/bin/sh\n: > '" + lock + "'\n(sleep 1; rm -f '" + lock + "') >/dev/null 2>&1 &\n"
-	if err := os.WriteFile(hook, []byte(script), 0700); err != nil {
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n: > '"+lock+"'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 
@@ -276,7 +273,50 @@ func TestPreserveRemoteWork_PublishedRefStillThereIsDeletedOnRetry(t *testing.T)
 			t.Fatalf("RemoveWithOptions: %v", err)
 		}
 	})
-	if refExists(t, mayorRig, workRef) && !strings.Contains(stderr, "could not be deleted") {
-		t.Fatalf("the published work ref was left behind without a warning; stderr: %s", stderr)
+	if err := os.Remove(lock); err != nil {
+		t.Fatalf("the lock the hook should have taken: %v", err)
+	}
+	if !refExists(t, mayorRig, workRef) {
+		t.Fatal("the work ref was deleted although its lock was held")
+	}
+	if !strings.Contains(stderr, "published but could not be deleted") {
+		t.Fatalf("the leftover work ref was not named; stderr: %s", stderr)
+	}
+}
+
+// A worker push that lands after the publish leaves commits origin does not
+// have. The delete at the published commit fails, and removal is refused.
+func TestPreserveRemoteWork_WorkerPushDuringPublishIsRefused(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	rwGit(t, mayorRig, "clone", "-q", "--bare", mayorRig, origin)
+	rwGit(t, mayorRig, "remote", "set-url", "origin", origin)
+	rwGit(t, mayorRig, "fetch", "-q", "origin")
+	leaveRemoteWork(t, p.ClonePath, p.Branch, "work pushed by the remote worker")
+	workRef := constants.RemoteWorkRef(p.Branch)
+
+	// Stand in for the worker: while the publish is in flight, origin's
+	// pre-receive hook moves the host's work ref on by one commit.
+	later := rwGit(t, p.ClonePath, "commit-tree", "-p", workRef, "-m", "pushed during the publish", workRef+"^{tree}")
+	hook := filepath.Join(origin, "hooks", "pre-receive")
+	script := "#!/bin/sh\nunset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\ngit -C '" + p.ClonePath + "' update-ref '" + workRef + "' " + later + "\n"
+	if err := os.WriteFile(hook, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWithOptions err = %v, want *WorkAtRiskError", err)
+	}
+	if risk.Unpushed != 1 || !strings.Contains(risk.Reason, "moved") {
+		t.Errorf("risk = %d unpushed, reason %q; want the 1 later commit and the ref reported as moved", risk.Unpushed, risk.Reason)
+	}
+	if got := rwGit(t, mayorRig, "rev-parse", workRef); got != later {
+		t.Fatalf("work ref = %s, want the later commit %s kept", got, later)
 	}
 }

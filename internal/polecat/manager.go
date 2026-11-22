@@ -1595,26 +1595,31 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 		// is merged and deleted from origin. The delete names the commit that
 		// was published: if the worker pushed more meanwhile it fails, and
 		// those commits are at risk like any others.
-		if err := polecatGit.DeleteRef(work.Ref, work.Tip); err == nil {
-			return nil
-		}
-		// The delete can also fail because the ref is already gone (a gt done
-		// released it meanwhile). Look again: only commits origin still does
-		// not hold are at risk.
-		if work, err = polecatGit.UnpublishedRemoteWork(branch, "origin"); err != nil {
-			return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
-		}
-		if work.Unpublished == 0 {
-			// Origin holds everything. A ref that is still there (the delete
-			// lost a race for its lock, say) is tried once more, and named
-			// if it stays: left behind it is reported as unpublished work
-			// once the branch is merged and deleted from origin.
-			if work.Tip != "" {
-				if err := polecatGit.DeleteRef(work.Ref, work.Tip); err != nil {
-					style.PrintWarning("%s is published but could not be deleted: %v", work.Ref, err)
-				}
+		// The delete can fail because the ref is already gone (a gt done
+		// released it meanwhile), because its lock was held, or because the
+		// worker pushed more. Each failure is followed by a fresh look: only
+		// commits origin still does not hold are at risk. A ref that is
+		// still there with everything published is tried once more, and
+		// named if it stays: left behind it is reported as unpublished work
+		// once the branch is merged and deleted from origin.
+		for attempt := 0; ; attempt++ {
+			delErr := polecatGit.DeleteRef(work.Ref, work.Tip)
+			if delErr == nil {
+				return nil
 			}
-			return nil
+			if work, err = polecatGit.UnpublishedRemoteWork(branch, "origin"); err != nil {
+				return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
+			}
+			if work.Unpublished > 0 {
+				break
+			}
+			if work.Tip == "" {
+				return nil
+			}
+			if attempt == 1 {
+				style.PrintWarning("%s is published but could not be deleted: %v", work.Ref, delErr)
+				return nil
+			}
 		}
 		reason = "it moved while it was being published; run the removal again"
 	}
