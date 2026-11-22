@@ -366,3 +366,38 @@ func TestPlanWorkerService_RefusesAdHocCodesignIdentity(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "codesign-identity")
 }
+
+// identityListed is fed a captured `security find-identity -p codesigning`
+// listing: the hash is unquoted, the name quoted, and a self-signed identity
+// is flagged untrusted but still listed.
+func TestIdentityListed(t *testing.T) {
+	const listing = `
+Policy: Code Signing
+  Matching identities
+  1) 1111111111111111111111111111111111111111 "Apple Development: Someone (ABCDE12345)"
+  2) AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12 "gt-local" (CSSMERR_TP_NOT_TRUSTED)
+     2 identities found
+
+  Valid identities only
+  1) 1111111111111111111111111111111111111111 "Apple Development: Someone (ABCDE12345)"
+     1 valid identities found
+`
+	for _, name := range []string{
+		"gt-local",
+		"Apple Development: Someone (ABCDE12345)",
+		// codesign -s also takes the certificate's SHA-1, the only way to pick
+		// one of several identities that share a name. Either case.
+		"AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12",
+		"ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12",
+	} {
+		assert.True(t, identityListed(listing, name), "%q is in the listing", name)
+	}
+	for _, name := range []string{
+		"gt-loca", // a prefix of a name is not that name
+		"0000000000000000000000000000000000000000", // a hash that is not listed
+		"AB12CD34EF56AB12CD34EF56AB12CD34EF56AB1",  // 39 digits: not a hash, and not a name
+		"Matching identities",                      // text in the listing that is not an identity
+	} {
+		assert.False(t, identityListed(listing, name), "%q is not an identity in the listing", name)
+	}
+}

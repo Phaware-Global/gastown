@@ -515,5 +515,25 @@ var codesignIdentityInKeychain = func(name string) (found, checked bool) {
 	if err != nil {
 		return false, false
 	}
-	return strings.Contains(string(out), `"`+name+`"`), true
+	return identityListed(string(out), name), true
+}
+
+// identityListed reports whether a `security find-identity` listing contains
+// the identity. Each identity is a line holding an index, the certificate's
+// 40-hex SHA-1 and the quoted name. codesign -s accepts either the name or the
+// SHA-1, which is the only way to pick one of several identities that share a
+// name.
+func identityListed(listing, identity string) bool {
+	if strings.Contains(listing, `"`+identity+`"`) {
+		return true
+	}
+	if len(identity) != 40 {
+		return false
+	}
+	for _, line := range strings.Split(listing, "\n") {
+		if fields := strings.Fields(line); len(fields) >= 2 && strings.EqualFold(fields[1], identity) {
+			return true
+		}
+	}
+	return false
 }
