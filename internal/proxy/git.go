@@ -373,8 +373,9 @@ func validateReceivePackRefs(body []byte, cnName string) error {
 		//   - refs/heads/polecat/<cnName>/<issue>@<ts>, the branch a slung
 		//     polecat works on (polecat.Manager.buildBranchName) — the "/"
 		//     keeps it inside this polecat's own namespace, and exactly one
-		//     segment may follow it, so a ref can never reach the namespace
-		//     of a polecat whose own name contains a slash, and
+		//     segment may follow it. Names cannot contain a slash (both cert
+		//     issuing paths reject one), so no other polecat's refs live
+		//     under this prefix, and
 		//   - refs/checkpoints/polecat/<cnName>, the polecat's own checkpoint
 		//     ref (remote-polecat-execution.md §9.2) — exact name only, so
 		//     one polecat can never move another's checkpoint.
