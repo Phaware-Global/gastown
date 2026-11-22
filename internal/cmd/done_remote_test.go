@@ -82,6 +82,38 @@ func pushWorkerCommits(t *testing.T, host, workerMarker string) string {
 	return gitOut(t, worker, "rev-parse", "HEAD")
 }
 
+// pushMoreWork plays the worker pushing again: one more commit on top of
+// whatever the work ref holds. It returns the new commit.
+func pushMoreWork(t *testing.T, host, file string) string {
+	t.Helper()
+	worker := filepath.Join(t.TempDir(), "worker-again")
+	gitOut(t, filepath.Dir(worker), "clone", "-q", host, worker)
+	gitOut(t, worker, "config", "user.email", "worker@test.com")
+	gitOut(t, worker, "config", "user.name", "Worker")
+	ref := constants.RemoteWorkRef(remoteDoneBranch)
+	gitOut(t, worker, "fetch", "-q", "origin", ref)
+	gitOut(t, worker, "checkout", "-q", "-B", "more", "FETCH_HEAD")
+	commitFile(t, worker, file, "feat: more work")
+	gitOut(t, worker, "push", "-q", "origin", "HEAD:"+ref)
+	return gitOut(t, worker, "rev-parse", "HEAD")
+}
+
+// advanceOriginMain adds n commits to origin's main from a separate clone and
+// fetches them into host, as gt done's own fetch would.
+func advanceOriginMain(t *testing.T, host string, n int) {
+	t.Helper()
+	other := filepath.Join(t.TempDir(), "other")
+	gitOut(t, filepath.Dir(other), "clone", "-q", gitOut(t, host, "remote", "get-url", "origin"), other)
+	gitOut(t, other, "config", "user.email", "other@test.com")
+	gitOut(t, other, "config", "user.name", "Other")
+	gitOut(t, other, "checkout", "-q", "main")
+	for i := 0; i < n; i++ {
+		commitFile(t, other, "upstream-"+string(rune('a'+i))+".txt", "feat: upstream change")
+	}
+	gitOut(t, other, "push", "-q", "origin", "main")
+	gitOut(t, host, "fetch", "-q", "origin")
+}
+
 func remoteWork(t *testing.T, isPolecat bool) doneWork {
 	t.Helper()
 	rig := t.TempDir()
@@ -293,5 +325,161 @@ func TestReleaseRemoteWork(t *testing.T) {
 	}
 	if err := w.releaseRemoteWork(g); err != nil {
 		t.Fatalf("a second release must be a no-op: %v", err)
+	}
+}
+
+// The work ref is the only host copy of commits origin does not have, so it
+// is released only when origin holds everything it points at. A worker that
+// pushes again while gt done is finishing must not lose those commits.
+func TestReleaseRemoteWorkKeepsUnpublishedCommits(t *testing.T) {
+	ref := constants.RemoteWorkRef(remoteDoneBranch)
+
+	t.Run("never published", func(t *testing.T) {
+		host, _ := remoteDoneRepo(t)
+		pushWorkerCommits(t, host, filepath.Join(t.TempDir(), "unused"))
+		g := git.NewGit(host)
+		if err := remoteWork(t, true).releaseRemoteWork(g); err == nil {
+			t.Fatal("releasing a work ref origin does not hold must be refused")
+		}
+		if ok, err := g.RefExists(ref); err != nil || !ok {
+			t.Fatalf("the work ref must be kept: exists=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("worker pushed again after the publish", func(t *testing.T) {
+		host, _ := remoteDoneRepo(t)
+		pushWorkerCommits(t, host, filepath.Join(t.TempDir(), "unused"))
+		g := git.NewGit(host)
+		w := remoteWork(t, true)
+		if err := w.push(g, w.refspec(remoteDoneBranch, remoteDoneBranch)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		later := pushMoreWork(t, host, "later.txt")
+		if err := w.releaseRemoteWork(g); err == nil {
+			t.Fatal("a work ref that moved past the published commit must not be released")
+		}
+		if got := gitOut(t, host, "rev-parse", ref); got != later {
+			t.Fatalf("work ref = %s, want the later commit %s kept", got, later)
+		}
+	})
+}
+
+// A push checkpoint from an earlier run lets a retry skip the push. For a
+// remote polecat it holds only while origin's branch is at the work ref's
+// commit; after another worker push the retry must publish again.
+func TestRemotePushCheckpointHoldsOnlyWhileOriginHasTheWork(t *testing.T) {
+	host, _ := remoteDoneRepo(t)
+	pushWorkerCommits(t, host, filepath.Join(t.TempDir(), "unused"))
+	g := git.NewGit(host)
+	w := remoteWork(t, true)
+
+	if w.pushCheckpointHolds(g, remoteDoneBranch) {
+		t.Fatal("nothing is on origin yet: the checkpoint must not hold")
+	}
+	if err := w.push(g, w.refspec(remoteDoneBranch, remoteDoneBranch)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if !w.pushCheckpointHolds(g, remoteDoneBranch) {
+		t.Fatal("origin is at the work commit: the checkpoint must hold")
+	}
+	pushMoreWork(t, host, "later.txt")
+	if w.pushCheckpointHolds(g, remoteDoneBranch) {
+		t.Fatal("the worker pushed again: the checkpoint must not hold")
+	}
+	if local := resolveDoneWork(t.TempDir(), remoteDoneBranch, true); !local.pushCheckpointHolds(g, remoteDoneBranch) {
+		t.Fatal("a local polecat's checkpoint is unchanged: it always holds")
+	}
+}
+
+// gt done's staleness thresholds must measure the work ref for a remote
+// polecat. The host worktree stays at the start point, so its HEAD only falls
+// further behind and a worker-side rebase would never clear the block.
+func TestRemoteContaminationMeasuresTheWorkRef(t *testing.T) {
+	host, _ := remoteDoneRepo(t)
+	pushWorkerCommits(t, host, filepath.Join(t.TempDir(), "unused"))
+	advanceOriginMain(t, host, 3)
+	g := git.NewGit(host)
+	w := remoteWork(t, true)
+
+	got, err := w.contamination(g, "origin/main")
+	if err != nil {
+		t.Fatalf("contamination: %v", err)
+	}
+	if got.Behind != 3 || got.Ahead != 2 {
+		t.Fatalf("before the worker rebases: behind=%d ahead=%d, want 3 and 2", got.Behind, got.Ahead)
+	}
+
+	// The worker rebases onto the new base and pushes again.
+	worker := filepath.Join(t.TempDir(), "rebase")
+	gitOut(t, filepath.Dir(worker), "clone", "-q", host, worker)
+	gitOut(t, worker, "config", "user.email", "worker@test.com")
+	gitOut(t, worker, "config", "user.name", "Worker")
+	ref := constants.RemoteWorkRef(remoteDoneBranch)
+	gitOut(t, worker, "fetch", "-q", "origin", ref)
+	gitOut(t, worker, "checkout", "-q", "-B", "rebased", "FETCH_HEAD")
+	gitOut(t, worker, "fetch", "-q", gitOut(t, host, "remote", "get-url", "origin"), "main")
+	gitOut(t, worker, "rebase", "-q", "FETCH_HEAD")
+	gitOut(t, worker, "push", "-q", "--force", "origin", "HEAD:"+ref)
+
+	got, err = w.contamination(g, "origin/main")
+	if err != nil {
+		t.Fatalf("contamination after rebase: %v", err)
+	}
+	if got.Behind != 0 || got.Ahead != 2 {
+		t.Fatalf("after the worker rebases: behind=%d ahead=%d, want 0 and 2", got.Behind, got.Ahead)
+	}
+	// The host worktree's own HEAD is what the check used to read.
+	if stale, err := g.CheckBranchContamination("origin/main"); err != nil || stale.Behind != 3 {
+		t.Fatalf("host HEAD: behind=%d err=%v, want 3 (the start point never moves)", stale.Behind, err)
+	}
+}
+
+// The shared-commit guard asks which patches the MR would carry. For a remote
+// polecat that is the work ref, not the host worktree's HEAD, which carries
+// none of them.
+func TestRemoteMRGuardReadsTheWorkRef(t *testing.T) {
+	host, _ := remoteDoneRepo(t)
+	pushWorkerCommits(t, host, filepath.Join(t.TempDir(), "unused"))
+	g := git.NewGit(host)
+
+	remote, err := remoteWork(t, true).mrGuardEnv(g).RangePatchIDs("origin/main", "HEAD")
+	if err != nil {
+		t.Fatalf("remote RangePatchIDs: %v", err)
+	}
+	if len(remote) != 2 {
+		t.Fatalf("remote polecat: %d patches, want the worker's 2", len(remote))
+	}
+	local, err := resolveDoneWork(t.TempDir(), remoteDoneBranch, true).mrGuardEnv(g).RangePatchIDs("origin/main", "HEAD")
+	if err != nil {
+		t.Fatalf("local RangePatchIDs: %v", err)
+	}
+	if len(local) != 0 {
+		t.Fatalf("local polecat: %d patches, want HEAD's 0", len(local))
+	}
+}
+
+// A direct push lands on a protected branch, and the rig's pre-push hook is
+// what refuses one that would land an integration branch there. It must run
+// for a remote polecat too. The hook that runs is the host's: the worker's
+// committed hook is never in the host worktree.
+func TestRemoteDirectPushRunsTheHostPrePushHook(t *testing.T) {
+	host, hostMarker := remoteDoneRepo(t)
+	workerMarker := filepath.Join(t.TempDir(), "worker-hook-ran")
+	workCommit := pushWorkerCommits(t, host, workerMarker)
+	g := git.NewGit(host)
+	w := remoteWork(t, true)
+
+	if err := w.pushDirect(g, w.refspec(remoteDoneBranch, "main")); err != nil {
+		t.Fatalf("direct push: %v", err)
+	}
+	origin := gitOut(t, host, "remote", "get-url", "origin")
+	if got := gitOut(t, origin, "rev-parse", "refs/heads/main"); got != workCommit {
+		t.Fatalf("origin main = %s, want the work commit %s", got, workCommit)
+	}
+	if !exists(hostMarker) {
+		t.Error("the host's pre-push hook did not run for a remote polecat's direct push")
+	}
+	if exists(workerMarker) {
+		t.Error("the hook the worker committed ran on the host")
 	}
 }

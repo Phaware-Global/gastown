@@ -86,6 +86,73 @@ func (w doneWork) push(g *git.Git, refspec string) error {
 	return g.Push("origin", refspec, false)
 }
 
+// pushDirect publishes the work straight to a protected branch (the direct
+// merge strategy). Hooks stay on, for a remote polecat too: the rig's pre-push
+// hook is what refuses a push that would land an integration branch on the
+// default branch, and it must see this push. Running it is safe — the hooks
+// path resolves in the host worktree, which holds the branch's start point
+// and never the worker's files, so the hook that runs is the host's own.
+func (w doneWork) pushDirect(g *git.Git, refspec string) error {
+	return g.Push("origin", refspec, false)
+}
+
+// contamination measures how far the work has fallen behind base and how many
+// commits it adds. gt done's staleness thresholds read it, so for a remote
+// polecat it must describe the work ref: the host worktree's HEAD stays at the
+// start point and only ever falls further behind, however often the worker
+// rebases.
+func (w doneWork) contamination(g *git.Git, base string) (git.BranchContamination, error) {
+	if !w.remote {
+		return g.CheckBranchContamination(base)
+	}
+	var result git.BranchContamination
+	behind, err := g.CountCommitsBetween(w.rev, base)
+	if err != nil {
+		return result, fmt.Errorf("counting commits behind %s: %w", base, err)
+	}
+	result.Behind = behind
+	ahead, err := g.CommitsAhead(base, w.rev)
+	if err != nil {
+		return result, fmt.Errorf("counting commits ahead of %s: %w", base, err)
+	}
+	result.Ahead = ahead
+	return result, nil
+}
+
+// mrGuardEnv is the environment the merge-request submit guards run in. The
+// guards ask which patches the MR would carry by naming HEAD; for a remote
+// polecat that question is about the work ref, the commit the MR records.
+func (w doneWork) mrGuardEnv(g *git.Git) mrGuardEnv {
+	env := realMRGuardEnv(g)
+	if !w.remote {
+		return env
+	}
+	patchIDs := env.RangePatchIDs
+	env.RangePatchIDs = func(base, tip string) ([]string, error) {
+		if tip == "HEAD" {
+			tip = w.rev
+		}
+		return patchIDs(base, tip)
+	}
+	return env
+}
+
+// pushCheckpointHolds reports whether a push checkpoint from an earlier run
+// still stands, so the push can be skipped. For a remote polecat it stands
+// only while origin's branch is at the work ref's current commit: the worker
+// may have pushed more since, and skipping would record an MR for a commit
+// origin does not have.
+func (w doneWork) pushCheckpointHolds(g *git.Git, branch string) bool {
+	if !w.remote {
+		return true
+	}
+	tip, err := g.Rev(w.rev)
+	if err != nil {
+		return false
+	}
+	return g.VerifyPushedCommit("origin", branch, tip) == nil
+}
+
 // requireRemoteWork refuses a COMPLETED gt done for a remote polecat whose
 // work never reached the host. Without the work ref there is nothing to
 // publish, and completing would close the bead with no work behind it.
@@ -116,6 +183,12 @@ func (w doneWork) requireRemoteWork(g *git.Git, branch string) error {
 // session for the same branch resumes from the work ref when one exists, and
 // would silently restart from this old tip instead of the branch's current
 // one. On any failure the ref is kept so the work can be recovered.
+//
+// The ref is deleted only if origin holds every commit it points at, and only
+// while it still points there. A worker can push again while gt done is busy
+// with the merge request; those commits exist nowhere else on the host, so a
+// ref that has moved on, or that origin does not fully hold, is left in place
+// and reported.
 func (w doneWork) releaseRemoteWork(g *git.Git) error {
 	if !w.remote {
 		return nil
@@ -124,5 +197,16 @@ func (w doneWork) releaseRemoteWork(g *git.Git) error {
 	if err != nil || !exists {
 		return err
 	}
-	return g.DeleteRef(w.srcRef)
+	tip, err := g.Rev(w.srcRef)
+	if err != nil {
+		return err
+	}
+	unpublished, err := g.CommitsNotOnRemote(tip, "origin")
+	if err != nil {
+		return err
+	}
+	if unpublished > 0 {
+		return fmt.Errorf("it holds %d commit(s) origin does not have; left in place", unpublished)
+	}
+	return g.DeleteRef(w.srcRef, tip)
 }

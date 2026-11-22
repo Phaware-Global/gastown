@@ -1023,7 +1023,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if fetchErr := g.Fetch("origin"); fetchErr != nil {
 			style.PrintWarning("could not fetch origin before contamination check: %v (proceeding with local refs)", fetchErr)
 		}
-		contam, err := g.CheckBranchContamination(contaminationBase)
+		contam, err := work.contamination(g, contaminationBase)
 		if err == nil && contam.Behind > 0 {
 			const warnThreshold = 50
 			const blockThreshold = 200
@@ -1121,7 +1121,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				pushSubmoduleChanges(g, defaultBranch)
 			}
 			directRefspec := work.refspec(branch, defaultBranch)
-			directPushErr := work.push(g, directRefspec)
+			directPushErr := work.pushDirect(g, directRefspec)
 			if directPushErr != nil {
 				pushFailed = true
 				errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
@@ -1178,13 +1178,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Validate checkpoint branch matches current branch (ge-sbo: stale checkpoint
 		// on polecat reassignment causes new work to skip push for old branch).
 		if checkpoints[CheckpointPushed] != "" {
-			if checkpoints[CheckpointPushed] == branch {
+			switch {
+			case checkpoints[CheckpointPushed] != branch:
+				// Stale checkpoint from a previous assignment — discard and push normally.
+				fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
+					checkpoints[CheckpointPushed], branch)
+			case !work.pushCheckpointHolds(g, branch):
+				// A remote worker pushed more after the checkpointed push.
+				fmt.Printf("→ Discarding push checkpoint: %s has moved since it was published\n", work.srcRef)
+			default:
 				fmt.Printf("%s Branch already pushed (resumed from checkpoint)\n", style.Bold.Render("✓"))
 				goto afterPush
 			}
-			// Stale checkpoint from a previous assignment — discard and push normally.
-			fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
-				checkpoints[CheckpointPushed], branch)
 		}
 
 		// Never publish a commit made with commit hooks bypassed (durable
@@ -1708,7 +1713,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			// Push branch directly to main (the earlier push went to origin/<branch>)
 			directRefspec := work.refspec(branch, defaultBranch)
-			directPushErr := work.push(g, directRefspec)
+			directPushErr := work.pushDirect(g, directRefspec)
 			if directPushErr != nil {
 				// Direct push failed — fall through to normal MR creation
 				style.PrintWarning("late direct push to %s failed: %v — falling through to MR", defaultBranch, directPushErr)
@@ -1800,7 +1805,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// gt-beuz: refuse an MR that is self-referential, targets the wrong base,
 		// or carries commits already on another open PR (e.g. a copy of a draft PR's branch).
-		if guardWarnings, guardErr := checkMRSubmitGuards(realMRGuardEnv(g), branch, target); guardErr != nil {
+		if guardWarnings, guardErr := checkMRSubmitGuards(work.mrGuardEnv(g), branch, target); guardErr != nil {
 			clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 			return guardErr
 		} else {
@@ -2190,7 +2195,7 @@ notifyWitness:
 			// The published branch on origin is now the record of a remote
 			// polecat's work; drop the host's copy of it (see releaseRemoteWork).
 			if err := work.releaseRemoteWork(g); err != nil {
-				style.PrintWarning("could not delete %s: %v", work.srcRef, err)
+				style.PrintWarning("kept %s: %v", work.srcRef, err)
 			}
 		}
 
