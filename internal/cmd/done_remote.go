@@ -68,20 +68,11 @@ func (w doneWork) refspec(branch, target string) string {
 	return branch + ":" + target
 }
 
-// remoteDonePushEnv disables every client-side hook for the publish of a
-// remote polecat's work. The push runs in a host repository whose hooks path
-// may resolve inside a worktree; the work being published was written on
-// another machine, and no hook may run on its account.
-var remoteDonePushEnv = []string{
-	"GIT_CONFIG_COUNT=1",
-	"GIT_CONFIG_KEY_0=core.hooksPath",
-	"GIT_CONFIG_VALUE_0=/dev/null",
-}
-
 // push publishes refspec to origin from g.
 func (w doneWork) push(g *git.Git, refspec string) error {
 	if w.remote {
-		return g.PushWithEnv("origin", refspec, false, remoteDonePushEnv)
+		// No client-side hook runs for work written on another machine.
+		return g.PushWithEnv("origin", refspec, false, git.HooksDisabledEnv())
 	}
 	return g.Push("origin", refspec, false)
 }
