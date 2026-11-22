@@ -146,7 +146,11 @@ func TestPublishRemoteWork_PublishesWithoutHooksOrCheckout(t *testing.T) {
 	rwGit(t, host, "config", "core.hooksPath", ".githooks")
 	headBefore := rwGit(t, host, "rev-parse", "HEAD")
 
-	if err := g.PublishRemoteWork(remoteWorkBranch, "origin"); err != nil {
+	examined, err := g.UnpublishedRemoteWork(remoteWorkBranch, "origin")
+	if err != nil {
+		t.Fatalf("UnpublishedRemoteWork: %v", err)
+	}
+	if err := g.PublishRemoteWork(remoteWorkBranch, examined.Tip, "origin"); err != nil {
 		t.Fatalf("PublishRemoteWork: %v", err)
 	}
 
@@ -165,5 +169,46 @@ func TestPublishRemoteWork_PublishesWithoutHooksOrCheckout(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("a pre-push hook ran while publishing remote work")
+	}
+}
+
+// The worker can push to the work ref while the host is publishing it. What
+// reaches origin must be the commit the host examined, never whatever the ref
+// holds by the time the push runs.
+func TestPublishRemoteWork_PublishesTheExaminedCommitNotTheRef(t *testing.T) {
+	host, origin := remoteWorkRepo(t)
+	pushRemoteWork(t, host, 1)
+	g := NewGit(host)
+
+	examined, err := g.UnpublishedRemoteWork(remoteWorkBranch, "origin")
+	if err != nil {
+		t.Fatalf("UnpublishedRemoteWork: %v", err)
+	}
+	// The worker pushes again after the host looked.
+	later := filepath.Join(t.TempDir(), "later")
+	rwGit(t, host, "clone", "-q", host, later)
+	rwGit(t, later, "config", "user.email", "worker@example.com")
+	rwGit(t, later, "config", "user.name", "Worker")
+	rwGit(t, later, "fetch", "-q", "origin", constants.RemoteWorkRef(remoteWorkBranch))
+	rwGit(t, later, "checkout", "-q", "-B", "more", "FETCH_HEAD")
+	rwGit(t, later, "commit", "-q", "--allow-empty", "-m", "arrived after the host looked")
+	rwGit(t, later, "push", "-q", host, "HEAD:"+constants.RemoteWorkRef(remoteWorkBranch))
+
+	if err := g.PublishRemoteWork(remoteWorkBranch, examined.Tip, "origin"); err != nil {
+		t.Fatalf("PublishRemoteWork: %v", err)
+	}
+	if got := rwGit(t, origin, "rev-parse", "refs/heads/"+remoteWorkBranch); got != examined.Tip {
+		t.Fatalf("origin branch = %s, want the examined commit %s", got, examined.Tip)
+	}
+	// The later commit is still only in the work ref, and still counted.
+	after, err := g.UnpublishedRemoteWork(remoteWorkBranch, "origin")
+	if err != nil {
+		t.Fatalf("UnpublishedRemoteWork: %v", err)
+	}
+	if after.Unpublished != 1 {
+		t.Fatalf("Unpublished = %d after the later push, want 1", after.Unpublished)
+	}
+	if err := g.DeleteRef(after.Ref, examined.Tip); err == nil {
+		t.Fatal("deleting the work ref at the examined commit must fail once it has moved")
 	}
 }

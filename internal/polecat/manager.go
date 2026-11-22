@@ -1590,17 +1590,44 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 		reason = m.publishRemoteWork(polecatGit, branch, work)
 	}
 	if reason == "" {
-		return nil
+		// Origin holds the work now, so the host's copy goes with the polecat.
+		// Left behind it would read as unpublished work again once the branch
+		// is merged and deleted from origin. The delete names the commit that
+		// was published: if the worker pushed more meanwhile it fails, and
+		// those commits are at risk like any others.
+		err := polecatGit.DeleteRef(work.Ref, work.Tip)
+		if err == nil {
+			return nil
+		}
+		reason = fmt.Sprintf("the worker pushed more while %s was being published (%v); run the removal again", work.Ref, err)
 	}
 	reason = fmt.Sprintf("%d commit(s) pushed by the remote worker are only in %s: %s", work.Unpublished, work.Ref, reason)
 	if !discard {
 		return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: work.Unpublished, Reason: reason}
 	}
 	style.PrintWarning("discarding remote work on branch %s (%s) at the operator's explicit request", branch, reason)
-	if err := polecatGit.DeleteRef(work.Ref, work.Tip); err != nil {
-		style.PrintWarning("could not delete %s: %v", work.Ref, err)
-	}
+	discardRemoteWorkRef(polecatGit, work.Ref)
 	return nil
+}
+
+// discardRemoteWorkRef deletes a work ref at whatever commit it holds now.
+// It is only for an explicit discard, where the operator has said the work is
+// not wanted.
+func discardRemoteWorkRef(g *git.Git, ref string) {
+	tip, err := g.Rev(ref)
+	if err == nil {
+		err = g.DeleteRef(ref, tip)
+	}
+	if err != nil {
+		style.PrintWarning("could not delete %s: %v", ref, err)
+	}
+}
+
+// orphanWorkRefNotice describes a work ref that no polecat owns and that holds
+// unpublished commits. The ref's name is chosen by a worker, so it is quoted
+// and never placed inside a command for the operator to copy.
+func orphanWorkRefNotice(ref string, unpublished int) string {
+	return fmt.Sprintf("keeping work ref %q: %d commit(s) pushed by a remote worker are on no remote. Inspect it and publish or delete it by hand (see docs/socket-worker.md)", ref, unpublished)
 }
 
 // publishRemoteWork publishes a remote polecat's work ref to origin as its
@@ -1608,17 +1635,21 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 // The commits pass the checks pushUnpushedBranch applies to a local branch.
 func (m *Manager) publishRemoteWork(polecatGit *git.Git, branch string, work git.RemoteWork) string {
 	defaultBranches := []string{m.rig.DefaultBranch()}
-	if badSHA, err := git.HasUnverifiedCommitAt(polecatGit, "origin", work.Ref, defaultBranches); err != nil {
+	// Every step names work.Tip, the commit that was counted, and never the
+	// ref: the worker may still be running and can push between the checks and
+	// the publish, and a commit that arrives then must not reach origin
+	// unchecked.
+	if badSHA, err := git.HasUnverifiedCommitAt(polecatGit, "origin", work.Tip, defaultBranches); err != nil {
 		return fmt.Sprintf("could not verify its commits before publishing: %v", err)
 	} else if badSHA != "" {
 		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed, so it is not published", badSHA[:8])
 	}
-	if wipSHA, err := git.HasWIPCommit(polecatGit, "origin", work.Ref, checkpoint.WIPCommitPrefix, defaultBranches); err != nil {
+	if wipSHA, err := git.HasWIPCommit(polecatGit, "origin", work.Tip, checkpoint.WIPCommitPrefix, defaultBranches); err != nil {
 		return fmt.Sprintf("could not verify its commits before publishing: %v", err)
 	} else if wipSHA != "" {
 		return fmt.Sprintf("checkpoint auto-save commit %s is not published", wipSHA[:8])
 	}
-	if err := polecatGit.PublishRemoteWork(branch, "origin"); err != nil {
+	if err := polecatGit.PublishRemoteWork(branch, work.Tip, "origin"); err != nil {
 		return fmt.Sprintf("publishing failed: %v", err)
 	}
 	return ""
@@ -1689,6 +1720,9 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard boo
 	reason := fmt.Sprintf("tip %s is on no remote and the worktree is gone, so it is not pushed; pass --discard-unpushed to delete it", tip[:8])
 	if discard {
 		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, reason)
+		if work.Unpublished > 0 {
+			discardRemoteWorkRef(repoGit, work.Ref)
+		}
 		return nil
 	}
 	// The shared bare repo has no work dir; it is the repo's own git dir.
@@ -3370,7 +3404,7 @@ func (m *Manager) CleanupStaleBranches() (int, error) {
 			continue
 		}
 		if work.Unpublished > 0 {
-			style.PrintWarning("keeping %s: %d commit(s) pushed by a remote worker are on no remote; publish it (git push origin %s:refs/heads/%s) or delete it by hand", work.Ref, work.Unpublished, work.Ref, branch)
+			style.PrintWarning("%s", orphanWorkRefNotice(work.Ref, work.Unpublished))
 			continue
 		}
 		if err := repoGit.DeleteRef(work.Ref, work.Tip); err != nil {

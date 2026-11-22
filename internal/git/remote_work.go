@@ -82,13 +82,21 @@ func HooksDisabledEnv() []string {
 	return append([]string(nil), hooksDisabledEnv...)
 }
 
-// PublishRemoteWork pushes the work ref for branch to remote as the branch
-// itself, with client-side hooks disabled and without checking anything out.
-func (g *Git) PublishRemoteWork(branch, remote string) error {
+// PublishRemoteWork pushes tip, a commit of the work ref for branch, to remote
+// as the branch itself, with client-side hooks disabled and without checking
+// anything out.
+//
+// The caller names the commit, not the ref: the worker can push to the ref at
+// any moment, and what reaches the remote must be exactly the commit the
+// caller examined.
+func (g *Git) PublishRemoteWork(branch, tip, remote string) error {
 	if remote == "" {
 		remote = "origin"
 	}
-	return g.PushWithEnv(remote, constants.RemoteWorkRef(branch)+":refs/heads/"+branch, false, hooksDisabledEnv)
+	if tip == "" {
+		return fmt.Errorf("publishing remote work for %s: no commit given", branch)
+	}
+	return g.PushWithEnv(remote, tip+":refs/heads/"+branch, false, hooksDisabledEnv)
 }
 
 // withRemoteWork folds unpublished remote work for branch into a preservation
