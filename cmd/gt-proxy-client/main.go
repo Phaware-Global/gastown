@@ -136,7 +136,9 @@ func pushWorkBeforeDone(tool string, args []string, dir string) error {
 	if !strings.HasPrefix(branch, "polecat/") {
 		return nil
 	}
-	push := exec.Command("git", "push", "origin", "HEAD:refs/heads/"+branch)
+	// push.default=current sends HEAD to the same-named branch on the host,
+	// whatever upstream the worktree has configured.
+	push := exec.Command("git", "-c", "push.default=current", "push", "origin", "HEAD")
 	push.Dir = dir
 	if out, err := push.CombinedOutput(); err != nil {
 		return fmt.Errorf("pushing %s to the host before gt done: %v: %s", branch, err, strings.TrimSpace(string(out)))
