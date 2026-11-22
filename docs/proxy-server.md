@@ -383,7 +383,7 @@ curl -s https://api.ipify.org
 | **Exec allowlist** | Containers can only call `gt` and `bd` (or the configured set) | `--allowed-cmds` checked on every `/v1/exec` request |
 | **Subcommand allowlist** | Polecats may only invoke permitted subcommands of `gt`/`bd` | `--allowed-subcmds` checked on every `/v1/exec` request; missing or disallowed subcommands → 403 |
 | **Subcommand injection** | Polecat identity is injected as `--identity <rig>/<name>` and cannot be overridden | Server derives identity from the client certificate, not from the request body |
-| **Branch scope** | A polecat can only push to `refs/heads/polecat/<name>-*` or `refs/heads/polecat/<name>/<one segment>` | pkt-line stream parsed and validated before `git-receive-pack` is invoked |
+| **Branch scope** | A polecat can only push to `refs/heads/polecat/<name>-*` or `refs/heads/polecat/<name>/<one segment>`, the same two forms under `refs/remote-work/`, and its checkpoint ref | pkt-line stream parsed and validated before `git-receive-pack` is invoked |
 | **Rig scope** | A polecat can only push to its own rig's repo | The rig in the cert CN must equal the rig in the URL; checked before any ref is read |
 | **Path traversal** | Rig names are validated against `[a-zA-Z0-9_-]+` | Rejects `../` and other traversal attempts |
 | **Body size limits** | `/v1/exec` body capped at 1 MiB; receive-pack ref list capped at 32 MiB | `http.MaxBytesReader` applied before reading |
@@ -497,9 +497,18 @@ allowed scope:
 ```
 refs/heads/polecat/<name>-*   ✓ allowed
 refs/heads/polecat/<name>/*   ✓ allowed (a slung polecat's <issue>@<ts> branch; one segment only)
+refs/remote-work/polecat/<name>-*, refs/remote-work/polecat/<name>/*
+                              ✓ allowed (a remote polecat's work; same two forms)
 refs/heads/main               ✗ denied (403 Forbidden)
 refs/heads/polecat/other-*    ✗ denied (belongs to another polecat)
 ```
+
+A push never writes into a host worktree. `receive.denyCurrentBranch` is left at
+git's default, so a push to a branch that a host worktree has checked out is
+refused. A remote polecat's host worktree does have its work branch checked
+out, which is why its work goes to `refs/remote-work/<branch>` instead: the
+rig resolves git hooks from the worktree, and a pushed tree checked out there
+would let a worker plant a hook for host-side git to run.
 
 The pkt-line stream is then rewound and fed to `git-receive-pack` unchanged, so
 git sees a normal push body.

@@ -336,6 +336,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if rigName == "" {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
+	if err := remotePolecatDoneError(filepath.Join(townRoot, rigName), rigName); err != nil {
+		return err
+	}
 
 	// Get configured default branch for this rig. Resolved here (before the
 	// gt-pvx auto-save below) rather than at first use, because it is also

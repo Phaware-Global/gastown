@@ -116,6 +116,29 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("remote work ref for own branch allowed", func(t *testing.T) {
+		// A remote polecat pushes its work branch to refs/remote-work/<branch>,
+		// which no host worktree has checked out.
+		for _, ref := range []string{
+			"refs/remote-work/polecat/furiosa/gt-abc12@mv3cxv4t",
+			"refs/remote-work/polecat/furiosa-abc123",
+		} {
+			assert.NoError(t, validateReceivePackRefs(receivePackBody(ref), "furiosa"), ref)
+		}
+	})
+
+	t.Run("remote work ref outside own namespace denied", func(t *testing.T) {
+		for _, ref := range []string{
+			"refs/remote-work/polecat/nux/gt-abc12@mv3cxv4t", // another polecat
+			"refs/remote-work/polecat/furiosa",               // bare name
+			"refs/remote-work/polecat/furiosa/",              // empty segment
+			"refs/remote-work/polecat/furiosa/x/gt-1@ts",     // more than one segment
+			"refs/remote-work/main",                          // not a polecat ref
+		} {
+			assert.Error(t, validateReceivePackRefs(receivePackBody(ref), "furiosa"), ref)
+		}
+	})
+
 	t.Run("own checkpoint ref is allowed", func(t *testing.T) {
 		// remote-polecat-execution.md §9.2: the worker force-pushes
 		// refs/checkpoints/polecat/<name> through the proxy.

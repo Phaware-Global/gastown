@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/sockproto"
 	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/worker"
@@ -647,6 +648,10 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 			fail(replyID, "checkout", fmt.Errorf("git checkout %s: %v: %s", open.Branch, err, strings.TrimSpace(string(out))))
 			return
 		}
+		if err := useRemoteWorkRef(buCtx, worktree, open.Branch); err != nil {
+			fail(replyID, "work ref", err)
+			return
+		}
 	}
 
 	// Container mode: prepare the idle work container (§6.1.2 via the shared
@@ -1082,4 +1087,40 @@ func (s *Service) loadPersisted() {
 		sum.State = "orphaned"
 		s.orphans[sum.Session] = sum
 	}
+}
+
+// useRemoteWorkRef points the clone's pushes for branch at the host's work ref
+// (constants.RemoteWorkRef) and resumes from it when it already exists.
+//
+// The host has branch checked out in the polecat's host worktree, so a push to
+// refs/heads/<branch> is refused there — and must be: a push that updated
+// that worktree would put this machine's files, hooks included, onto the host.
+// With the push refspec set, a plain `git push origin` sends the branch to
+// its work ref instead. The matching fetch refspec gives the work ref a
+// remote-tracking ref, which is what --force-with-lease checks against.
+//
+// A work ref that already exists holds what an earlier session of this
+// polecat pushed (the clone is replaced on every bringup), so the branch
+// starts from it rather than from the branch's start point.
+func useRemoteWorkRef(ctx context.Context, worktree, branch string) error {
+	workRef := constants.RemoteWorkRef(branch)
+	tracking := "refs/remotes/origin-work/" + branch
+	for _, args := range [][]string{
+		{"config", "remote.origin.push", "refs/heads/" + branch + ":" + workRef},
+		// A pattern, not the one ref: fetching a named ref that does not
+		// exist yet is an error, a pattern that matches nothing is not.
+		{"config", "--add", "remote.origin.fetch", "+" + constants.RemoteWorkRefPrefix + "*:refs/remotes/origin-work/*"},
+		{"fetch", "--quiet", "origin"},
+	} {
+		if out, err := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...).CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
+		}
+	}
+	if exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", tracking).Run() != nil {
+		return nil // nothing pushed yet
+	}
+	if out, err := exec.CommandContext(ctx, "git", "-C", worktree, "reset", "--hard", "--quiet", tracking).CombinedOutput(); err != nil {
+		return fmt.Errorf("resuming from %s: %v: %s", workRef, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

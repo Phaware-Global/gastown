@@ -122,19 +122,19 @@ func main() {
 // exec RPC's own ceiling: past that the proxied gt done could not run anyway.
 const pushTimeout = 5 * time.Minute
 
-// pushWorkBeforeDone pushes the polecat's branch to the host before a proxied
-// `gt done`. gt done runs on the host, against the host's copy of the branch;
-// commits that exist only in this worktree would be invisible to it, and the
-// bead would complete without the work. A failed push is therefore an error
-// that stops gt done.
+// pushWorkBeforeDone pushes the polecat's work to the host before a proxied
+// `gt done`. gt done runs on the host and reads the commits the session
+// pushed to its work ref there; commits that exist only in this worktree
+// would be invisible to it, and the bead would complete without the work. A
+// failed push is therefore an error that stops gt done, and so are tracked
+// changes that were never committed.
 //
 // sessionBranch is the work branch the session was started on (GT_BRANCH).
 // When it is set it is authoritative: gt done is refused from a detached
 // HEAD, from another branch, or from outside the worktree, because each of
 // those would forward gt done with nothing pushed. Without it (a session that
-// predates the branch being sent, or a detached host worktree, which reports
-// "HEAD") only a checked-out polecat/ branch is pushed and anything else is
-// left alone.
+// predates the branch being sent) only a checked-out polecat/ branch is
+// pushed and anything else is left alone.
 func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) error {
 	if tool != "gt" || len(args) == 0 || args[0] != "done" {
 		return nil
@@ -158,40 +158,26 @@ func pushWorkBeforeDone(tool string, args []string, dir, sessionBranch string) e
 		return nil // not a worktree, a detached HEAD or some other branch: nothing of ours to push
 	}
 
-	// push.default=current sends HEAD to the same-named branch on the host,
-	// whatever upstream the worktree has configured.
-	pushOut, pushErr := runGit(exec.CommandContext(ctx, "git", "-c", "push.default=current", "push", "origin", "HEAD"), dir)
+	// gt done on the host reads the pushed commits, never this worktree, so
+	// tracked changes that are not committed would be silently left out of
+	// the work. (A local polecat's gt done commits them itself; here that is
+	// the agent's job.) Untracked files are not work and are ignored.
+	if status, err := runGit(exec.CommandContext(ctx, "git", "status", "--porcelain", "--untracked-files=no"), dir); err != nil {
+		return fmt.Errorf("checking for uncommitted changes before gt done: %v: %s", err, strings.TrimSpace(status))
+	} else if strings.TrimSpace(status) != "" {
+		return fmt.Errorf("uncommitted changes to tracked files: commit them (or discard them) and run gt done again; nothing was pushed to the host:\n%s", strings.TrimRight(status, "\n"))
+	}
+
+	// The session's clone sends the work branch to its work ref on the host
+	// (remote.origin.push, set when the worker brought the session up), so a
+	// plain push with no refspec is all that is needed. Only this session
+	// writes that ref; the lease lets a rewritten history (an amend or a
+	// rebase after an earlier push) replace it, and nothing else.
+	pushOut, pushErr := runGit(exec.CommandContext(ctx, "git", "push", "--force-with-lease", "origin"), dir)
 	if pushErr == nil {
 		return nil
 	}
-	// Host-side gt done can rewrite the branch (it rebases onto the target) and
-	// then fail at a later step. On the retry this push is rejected as
-	// non-fast-forward although the host already holds every patch. In that
-	// case there is nothing left to push and gt done can go ahead.
-	if hostHasAllPatches(ctx, dir, branch) {
-		return nil
-	}
-	hint := ""
-	switch {
-	case strings.Contains(pushOut, "non-fast-forward") || strings.Contains(pushOut, "fetch first"):
-		hint = fmt.Sprintf("\nThe host's copy of the branch has moved. Run: git pull --rebase origin %s", branch)
-	case strings.Contains(pushOut, "Could not update working tree") || strings.Contains(pushOut, "would be overwritten"):
-		hint = "\nThe host's worktree for this polecat has local changes or an untracked file in the way. It cannot be fixed from here: escalate so an operator can clean it."
-	}
-	return fmt.Errorf("pushing %s to the host before gt done: %v: %s%s", branch, pushErr, strings.TrimSpace(pushOut), hint)
-}
-
-// hostHasAllPatches reports whether every commit on HEAD is already on the
-// host's copy of branch, by patch rather than by hash, so a rebased equivalent
-// counts. The revision range is fed on stdin, not the command line.
-func hostHasAllPatches(ctx context.Context, dir, branch string) bool {
-	if _, err := runGit(exec.CommandContext(ctx, "git", "fetch", "--quiet", "origin"), dir); err != nil {
-		return false
-	}
-	cmd := exec.CommandContext(ctx, "git", "rev-list", "--cherry-pick", "--right-only", "--no-merges", "--stdin")
-	cmd.Stdin = strings.NewReader("refs/remotes/origin/" + branch + "...HEAD\n")
-	out, err := runGit(cmd, dir)
-	return err == nil && strings.TrimSpace(out) == ""
+	return fmt.Errorf("pushing %s to the host before gt done: %v: %s", branch, pushErr, strings.TrimSpace(pushOut))
 }
 
 // runGit runs a git command in dir and returns its combined output. It never
