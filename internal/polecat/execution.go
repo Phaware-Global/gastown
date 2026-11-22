@@ -50,7 +50,7 @@ func remoteAgentFiles(agentArgv []string) (map[string]string, error) {
 			continue
 		}
 		path := agentArgv[i+1]
-		data, err := os.ReadFile(path) //nolint:gosec // path is the settings file this process just ensured
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("reading agent settings for remote delivery: %w", err)
 		}
