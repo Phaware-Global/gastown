@@ -199,7 +199,46 @@ func TestOrphanWorkRefNotice_IsNotAPasteableCommand(t *testing.T) {
 	if strings.Contains(notice, "git push") || strings.Contains(notice, "git update-ref") {
 		t.Fatalf("notice offers a command built from a worker-chosen name: %s", notice)
 	}
-	if !strings.Contains(notice, `"`+ref+`"`) {
-		t.Fatalf("notice should quote the ref name, got: %s", notice)
+	// The printed token, pasted into a shell, must give back the literal name.
+	for _, name := range []string{ref, "refs/remote-work/polecat/foo/it's`id`"} {
+		token, _, ok := strings.Cut(strings.TrimPrefix(orphanWorkRefNotice(name, 2), "keeping work ref "), ": 2 commit(s)")
+		if !ok {
+			t.Fatalf("unexpected notice shape: %s", orphanWorkRefNotice(name, 2))
+		}
+		out, err := exec.Command("sh", "-c", "printf %s "+token).CombinedOutput()
+		if err != nil || string(out) != name {
+			t.Fatalf("sh expanded %s to %q (err %v), want the literal %q", token, out, err, name)
+		}
+	}
+}
+
+// When the delete after a publish fails because the ref is already gone, as
+// when a gt done released it meanwhile, nothing is at risk and removal goes on.
+func TestPreserveRemoteWork_PublishedAndAlreadyReleasedIsNotAtRisk(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	rwGit(t, mayorRig, "clone", "-q", "--bare", mayorRig, origin)
+	rwGit(t, mayorRig, "remote", "set-url", "origin", origin)
+	rwGit(t, mayorRig, "fetch", "-q", "origin")
+	leaveRemoteWork(t, p.ClonePath, p.Branch, "work pushed by the remote worker")
+	workRef := constants.RemoteWorkRef(p.Branch)
+
+	// Stand in for the concurrent release: a pre-receive hook on origin
+	// deletes the host's work ref while the publish is in flight.
+	hook := filepath.Join(origin, "hooks", "pre-receive")
+	script := "#!/bin/sh\nunset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\ngit -C '" + p.ClonePath + "' update-ref -d '" + workRef + "'\n"
+	if err := os.WriteFile(hook, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v", err)
+	}
+	if refExists(t, mayorRig, workRef) {
+		t.Fatal("the work ref is still there")
 	}
 }

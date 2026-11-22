@@ -1595,11 +1595,19 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 		// is merged and deleted from origin. The delete names the commit that
 		// was published: if the worker pushed more meanwhile it fails, and
 		// those commits are at risk like any others.
-		err := polecatGit.DeleteRef(work.Ref, work.Tip)
-		if err == nil {
+		if err := polecatGit.DeleteRef(work.Ref, work.Tip); err == nil {
 			return nil
 		}
-		reason = fmt.Sprintf("the worker pushed more while %s was being published (%v); run the removal again", work.Ref, err)
+		// The delete can also fail because the ref is already gone (a gt done
+		// released it meanwhile). Look again: only commits origin still does
+		// not hold are at risk.
+		if work, err = polecatGit.UnpublishedRemoteWork(branch, "origin"); err != nil {
+			return m.unverifiedWorkRisk(name, clonePath, branch, err, discard)
+		}
+		if work.Unpublished == 0 {
+			return nil
+		}
+		reason = "it moved while it was being published; run the removal again"
 	}
 	reason = fmt.Sprintf("%d commit(s) pushed by the remote worker are only in %s: %s", work.Unpublished, work.Ref, reason)
 	if !discard {
@@ -1624,10 +1632,12 @@ func discardRemoteWorkRef(g *git.Git, ref string) {
 }
 
 // orphanWorkRefNotice describes a work ref that no polecat owns and that holds
-// unpublished commits. The ref's name is chosen by a worker, so it is quoted
-// and never placed inside a command for the operator to copy.
+// unpublished commits. The ref's name is chosen by a worker and can hold shell
+// syntax, so it is never placed inside a command, and it is printed
+// single-quoted for the shell: an operator who copies the token into a git
+// command gets the literal name.
 func orphanWorkRefNotice(ref string, unpublished int) string {
-	return fmt.Sprintf("keeping work ref %q: %d commit(s) pushed by a remote worker are on no remote. Inspect it and publish or delete it by hand (see docs/socket-worker.md)", ref, unpublished)
+	return fmt.Sprintf("keeping work ref %s: %d commit(s) pushed by a remote worker are on no remote. Inspect it and publish or delete it by hand (see docs/socket-worker.md)", shellQuote(ref), unpublished)
 }
 
 // publishRemoteWork publishes a remote polecat's work ref to origin as its
