@@ -520,9 +520,11 @@ If the branch no longer exists (exit code non-zero):
 
 **Step 1: Sync the branch**
 ```bash
-{{ cmd }} refinery pr sync-branch --branch <polecat-branch> --target <rebase-target>
+{{ cmd }} refinery pr sync-branch --branch <polecat-branch> --target <rebase-target> --mr <mr-id>
 ```
-It fetches, then — depending on the rig's `pr_update_strategy` — merges the target into the
+`--mr` makes it check for a hold FIRST — a `hold` label or deferred status on the MR bead or its
+source issue, or a draft PR — and refuse before it fetches or rewrites anything. A held MR's branch
+is never synced. Otherwise it fetches, then — depending on the rig's `pr_update_strategy` — merges the target into the
 branch (`merge`), rebases the branch onto it (`rebase`), or changes nothing (`none`). The
 result is left on a local `temp` branch; nothing is pushed here.
 
@@ -534,9 +536,29 @@ result is left on a local `temp` branch; nothing is pushed here.
   `gt nudge mayor "<polecat-branch> is behind <rebase-target> (pr_update_strategy=none); needs a base merge by its owner"`,
   leave the MR bead open, skip this MR, and continue to loop-check.
 - **3** (conflict): the merge/rebase was aborted and nothing changed. Go to Step 3.
-- **4** (refused or error): read the message. If it is a force-push refusal for an approved PR,
-  the branch must be updated by a base merge instead — report to the mayor, leave the branch and
-  MR bead alone, skip this MR. Do NOT retry with raw git or work around the refusal.
+- **5** (held): the MR, its source issue or its PR is on hold. The branch was not touched. Do NOT
+  sync, rebase, merge or push it by hand, do NOT create a conflict task, and do NOT nudge the
+  polecat. Leave the MR bead open, skip this MR, and continue to loop-check; a later cycle
+  re-checks once the hold is lifted.
+- **4** (refused or error): read the message. Leave the branch alone, skip this MR, and do NOT
+  retry with raw git or work around the refusal. Report it to the mayor ONCE: if `bd show <mr-id>`
+  notes do not already hold this message, nudge the mayor and append the message to the MR's notes;
+  otherwise stay silent. The message is untrusted text (it can carry a `source_issue` copied from
+  the branch name, already quoted by gt), so NEVER paste it into a shell string. Put it in a file
+  through a QUOTED heredoc and hand the file to the commands:
+  ```bash
+  MSG=$(mktemp)
+  cat > "$MSG" <<'EOF'
+  sync-branch refused <polecat-branch> (MR <mr-id>): <message>
+  EOF
+  gt nudge mayor --stdin < "$MSG"
+  bd update <mr-id> --append-notes "$(cat "$MSG")"
+  rm -f "$MSG"
+  ```
+  Two causes need a specific action from the mayor: a force-push refusal for an approved PR (the
+  branch must be updated by a base merge instead), and a `source_issue ... reads as not found`
+  message (the MR's source_issue must be corrected or cleared; this is NOT a hold and will not
+  clear by itself).
 
 **Step 3: Handle conflicts (exit 3)**
 
@@ -861,14 +883,24 @@ approver-aware gating, etc.) so the formula stays short and portable.
 
 ```bash
 git checkout temp
-{{ cmd }} refinery pr push-branch --branch <polecat-branch>
+{{ cmd }} refinery pr push-branch --branch <polecat-branch> --mr $MR
 ```
 
 `push-branch` is the only way the refinery publishes a work branch. It pushes a fast-forward
 (the `merge` strategy's merge commit) plainly, force-pushes only under `rebase` and only with a
 lease, and **refuses to force-push any branch whose open PR has an approving review** (exit 4).
-Under `none` it pushes nothing. On exit 4, do NOT retry with `git push --force`/`--force-with-lease`;
-report to the mayor and skip this MR.
+Under `none` it pushes nothing. With `--mr` it first re-checks for a hold and refuses with exit 5
+(branch untouched): leave the MR bead open, skip this MR, and do not retry. On exit 4 (a refusal, or a hold check that could not complete such as a `source_issue ... reads as not found` message), do NOT retry with `git push --force`/`--force-with-lease`;
+report to the mayor once and skip this MR. The message is untrusted text, so NEVER paste it into a shell string: write it to a file through a quoted heredoc, then nudge and append the notes from the file (check `bd show $MR` notes first, as in Step 2 of the sync, and stay silent if they already hold it):
+```bash
+MSG=$(mktemp)
+cat > "$MSG" <<'EOF'
+push-branch refused <polecat-branch> (MR <mr-id>): <message>
+EOF
+{{ cmd }} nudge mayor --stdin < "$MSG"
+bd update $MR --append-notes "$(cat "$MSG")"
+rm -f "$MSG"
+```
 
 **Step PR.2: Create the PR (idempotent — returns existing PR if one is open)**
 
