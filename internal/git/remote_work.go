@@ -47,12 +47,8 @@ func (g *Git) UnpublishedRemoteWork(branch, remote string) (RemoteWork, error) {
 	if work.Tip, err = g.Rev(work.Ref); err != nil {
 		return work, fmt.Errorf("resolving %s: %w", work.Ref, err)
 	}
-	out, err := g.run("rev-list", "--count", work.Ref, "--not", "--remotes="+remote)
-	if err != nil {
+	if work.Unpublished, err = g.CommitsNotOnRemote(work.Tip, remote); err != nil {
 		return work, fmt.Errorf("counting commits in %s: %w", work.Ref, err)
-	}
-	if _, err := fmt.Sscanf(out, "%d", &work.Unpublished); err != nil {
-		return work, fmt.Errorf("parsing commit count for %s: %w", work.Ref, err)
 	}
 	return work, nil
 }

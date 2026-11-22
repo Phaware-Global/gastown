@@ -1597,7 +1597,7 @@ func (m *Manager) preserveRemoteWork(polecatGit *git.Git, name, clonePath, branc
 		return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: work.Unpublished, Reason: reason}
 	}
 	style.PrintWarning("discarding remote work on branch %s (%s) at the operator's explicit request", branch, reason)
-	if err := polecatGit.DeleteRef(work.Ref); err != nil {
+	if err := polecatGit.DeleteRef(work.Ref, work.Tip); err != nil {
 		style.PrintWarning("could not delete %s: %v", work.Ref, err)
 	}
 	return nil
@@ -3373,7 +3373,7 @@ func (m *Manager) CleanupStaleBranches() (int, error) {
 			style.PrintWarning("keeping %s: %d commit(s) pushed by a remote worker are on no remote; publish it (git push origin %s:refs/heads/%s) or delete it by hand", work.Ref, work.Unpublished, work.Ref, branch)
 			continue
 		}
-		if err := repoGit.DeleteRef(work.Ref); err != nil {
+		if err := repoGit.DeleteRef(work.Ref, work.Tip); err != nil {
 			style.PrintWarning("could not delete %s: %v", work.Ref, err)
 			continue
 		}
