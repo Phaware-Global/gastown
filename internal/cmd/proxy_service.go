@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -151,6 +152,12 @@ func planProxyService(o proxyServiceOpts) (*proxyServicePlan, error) {
 		if !json.Valid(data) {
 			return nil, fmt.Errorf("--config %s is not valid JSON", cfg)
 		}
+		// Valid JSON can still be a config the server exits on: a string
+		// where a list belongs, an exec_timeout out of range. The server is
+		// the one authority on its schema, so ask it.
+		if out, err := exec.Command(binary, "-config", cfg, "-check-config").CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("--config %s is not one gt-proxy-server starts on: %s", cfg, strings.TrimSpace(string(out)))
+		}
 	case os.IsNotExist(err):
 		if o.Config != "" {
 			return nil, fmt.Errorf("--config %s: %w", cfg, err)
@@ -219,7 +226,49 @@ func installProxyService(plan *proxyServicePlan) error {
 	if out, err := exec.Command("launchctl", "bootstrap", guiDomain(), plan.PlistPath).CombinedOutput(); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %s", strings.TrimSpace(string(out)))
 	}
+	// launchd accepting the job is not the server staying up. One that fails
+	// at startup (its port already held by a hand-run proxy, an unwritable CA
+	// dir) exits within milliseconds and is restarted forever, so look again
+	// once it has had time to fail.
+	time.Sleep(proxyServiceSettle)
+	out, err := exec.Command("launchctl", "print", guiDomain()+"/"+proxyServiceLabel).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("the job was loaded but launchd no longer reports it: %s", strings.TrimSpace(string(out)))
+	}
+	if err := proxyServiceRunning(string(out)); err != nil {
+		return fmt.Errorf("the job is installed but gt-proxy-server did not stay up (%w); see %s. If a proxy started by hand is still running, stop it and run `gt proxy service restart`", err, plan.LogPath)
+	}
 	return nil
+}
+
+// proxyServiceSettle is how long a freshly started server gets to fail before
+// its state is read. Startup failures are immediate; launchd waits far longer
+// than this before the next attempt.
+const proxyServiceSettle = 2 * time.Second
+
+// proxyServiceRunning reads `launchctl print` output for the job and reports
+// an error unless the server process is running.
+func proxyServiceRunning(launchctlPrint string) error {
+	state, lastExit := "", ""
+	for _, line := range strings.Split(launchctlPrint, "\n") {
+		t := strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(t, "state = "); ok && state == "" {
+			state = v
+		}
+		if v, ok := strings.CutPrefix(t, "last exit code = "); ok && lastExit == "" {
+			lastExit = v
+		}
+	}
+	if state == "running" {
+		return nil
+	}
+	if state == "" {
+		state = "unknown"
+	}
+	if lastExit == "" {
+		return fmt.Errorf("state %s", state)
+	}
+	return fmt.Errorf("state %s, last exit code %s", state, lastExit)
 }
 
 var proxyServiceUninstallCmd = &cobra.Command{

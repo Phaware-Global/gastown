@@ -41,6 +41,11 @@ Then, from inside the town:
 gt proxy service install --listen 0.0.0.0:9876
 ```
 
+`install` first has the server check the config file, and refuses one it
+would not start on. It then loads the job and confirms the server stayed up.
+Stop any `gt-proxy-server` started by hand before installing: it holds the
+same ports, and the job's server would exit at once.
+
 That installs a launchd job (`com.gastown.proxy`) which runs the installed
 `gt-proxy-server` in place, from the town root, and keeps it running across
 crashes and reboots. `gt proxy service status` shows its state; logs land in

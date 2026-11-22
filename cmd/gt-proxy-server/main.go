@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -34,7 +35,8 @@ func main() {
 		allowedCmds    = flag.String("allowed-cmds", "gt,bd", "comma-separated list of allowed commands")
 		allowedSubcmds = flag.String("allowed-subcmds", discoverAllowedSubcmds(),
 			`semicolon-separated list of "cmd:sub1,sub2,..." subcommand allowlists`)
-		townRoot = flag.String("town-root", "", "Gas Town root directory (default: $GT_TOWN or ~/gt)")
+		townRoot    = flag.String("town-root", "", "Gas Town root directory (default: $GT_TOWN or ~/gt)")
+		checkConfig = flag.Bool("check-config", false, "validate the config file and exit without starting the server")
 	)
 	flag.Parse()
 
@@ -48,6 +50,13 @@ func main() {
 	cfgPath := *configFile
 	if cfgPath == "" {
 		cfgPath = filepath.Join(home, "gt", ".runtime", "proxy", "config.json")
+	}
+	if *checkConfig {
+		if err := checkConfigFile(cfgPath); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", cfgPath, err)
+			os.Exit(1)
+		}
+		return
 	}
 	fileCfg, err := loadConfig(cfgPath)
 	if err != nil {

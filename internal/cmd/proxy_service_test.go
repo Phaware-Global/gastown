@@ -121,6 +121,51 @@ func TestPlanProxyService_Preflight(t *testing.T) {
 	})
 }
 
+// A config can be valid JSON and still be one the server exits on (a string
+// where a list belongs, an out-of-range exec_timeout). The server is the only
+// authority on that, so the preflight asks it, and a refusal stops the install.
+func TestPlanProxyService_AsksTheServerToCheckTheConfig(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "gt-proxy-server")
+	// Stands in for the server's -check-config: refuse, and record the call.
+	script := "#!/bin/sh\necho \"$@\" > " + filepath.Join(dir, "args") + "\necho 'cannot unmarshal string into Go struct field' >&2\nexit 1\n"
+	require.NoError(t, os.WriteFile(bin, []byte(script), 0755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	town := t.TempDir()
+	cfg := filepath.Join(town, "config.json")
+	require.NoError(t, os.WriteFile(cfg, []byte(`{"extra_san_hosts": "orchestrator.local"}`), 0600))
+
+	_, err := planProxyService(proxyServiceOpts{TownRoot: town, Config: cfg})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--config")
+	assert.Contains(t, err.Error(), "cannot unmarshal string")
+
+	args, readErr := os.ReadFile(filepath.Join(dir, "args"))
+	require.NoError(t, readErr)
+	assert.Equal(t, "-config "+cfg+" -check-config", strings.TrimSpace(string(args)))
+}
+
+// launchctl accepting the job says nothing about the server staying up: one
+// that cannot bind its port exits at once and is restarted forever.
+func TestProxyServiceRunning(t *testing.T) {
+	running := "gui/501/com.gastown.proxy = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = (never exited)\n}"
+	assert.NoError(t, proxyServiceRunning(running))
+
+	for name, out := range map[string]string{
+		"exited and waiting to respawn": "gui/501/com.gastown.proxy = {\n\tstate = spawn scheduled\n\tlast exit code = 1\n}",
+		"not running":                   "gui/501/com.gastown.proxy = {\n\tstate = not running\n\tlast exit code = 1\n}",
+		"no state at all":               "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, proxyServiceRunning(out))
+		})
+	}
+}
+
 // TestPlanProxyService_RequiresServerBinary: a job pointing at a binary that
 // is not there loads and never runs.
 func TestPlanProxyService_RequiresServerBinary(t *testing.T) {

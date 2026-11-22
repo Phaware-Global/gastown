@@ -231,3 +231,30 @@ func TestLoadConfig_ExecTimeout(t *testing.T) {
 		require.Error(t, err, v)
 	}
 }
+
+// checkConfigFile is what `-check-config` runs: everything the server would refuse
+// to start on, without starting it. A value of the wrong JSON type parses as
+// JSON but not as this config, and exec_timeout has bounds of its own.
+func TestCheckConfig(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
+		return path
+	}
+
+	require.NoError(t, checkConfigFile(filepath.Join(t.TempDir(), "absent.json")), "a missing file is an empty config")
+	require.NoError(t, checkConfigFile(write(t, `{"extra_san_hosts":["orchestrator.local"],"exec_timeout":"4m"}`)))
+
+	for name, body := range map[string]string{
+		"string where a list is expected":   `{"extra_san_hosts": "orchestrator.local"}`,
+		"number where a string is expected": `{"listen_addr": 9876}`,
+		"top-level array":                   `[]`,
+		"exec_timeout over the ceiling":     `{"exec_timeout": "10m"}`,
+		"not JSON":                          `{"extra_san_hosts": [`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, checkConfigFile(write(t, body)))
+		})
+	}
+}
