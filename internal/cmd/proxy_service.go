@@ -228,23 +228,63 @@ func installProxyService(plan *proxyServicePlan) error {
 	}
 	// launchd accepting the job is not the server staying up. One that fails
 	// at startup (its port already held by a hand-run proxy, an unwritable CA
-	// dir) exits within milliseconds and is restarted forever, so look again
-	// once it has had time to fail.
-	time.Sleep(proxyServiceSettle)
-	out, err := exec.Command("launchctl", "print", guiDomain()+"/"+proxyServiceLabel).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("the job was loaded but launchd no longer reports it: %s", strings.TrimSpace(string(out)))
+	// dir) is restarted forever, so watch it for long enough to see that.
+	sample := func() (string, error) {
+		out, err := exec.Command("launchctl", "print", guiDomain()+"/"+proxyServiceLabel).CombinedOutput()
+		return string(out), err
 	}
-	if err := proxyServiceRunning(string(out)); err != nil {
+	if err := proxyServiceStayedUp(sample, int(proxyServiceWatch/proxyServicePoll), time.Sleep); err != nil {
 		return fmt.Errorf("the job is installed but gt-proxy-server did not stay up (%w); see %s. If a proxy started by hand is still running, stop it and run `gt proxy service restart`", err, plan.LogPath)
 	}
 	return nil
 }
 
-// proxyServiceSettle is how long a freshly started server gets to fail before
-// its state is read. Startup failures are immediate; launchd waits far longer
-// than this before the next attempt.
-const proxyServiceSettle = 2 * time.Second
+// A freshly started server is watched for proxyServiceWatch, sampled every
+// proxyServicePoll. The server does not fail at once: before it binds its
+// listener it runs gt to discover the allowed subcommands, which alone takes
+// about a second on an idle machine. The window therefore covers a slow start
+// plus launchd's 10 second wait before it respawns a job that exited, so a
+// crash loop shows up as a sample that is not running or as a new pid.
+const (
+	proxyServiceWatch = 12 * time.Second
+	proxyServicePoll  = 500 * time.Millisecond
+)
+
+// proxyServiceStayedUp samples `launchctl print` for the job samples times,
+// sleeping proxyServicePoll between them, and reports an error unless every
+// sample shows the same server process running.
+func proxyServiceStayedUp(sample func() (string, error), samples int, sleep func(time.Duration)) error {
+	pid := ""
+	for i := 0; i < samples; i++ {
+		if i > 0 {
+			sleep(proxyServicePoll)
+		}
+		out, err := sample()
+		if err != nil {
+			return fmt.Errorf("launchd no longer reports the job: %s", strings.TrimSpace(out))
+		}
+		if err := proxyServiceRunning(out); err != nil {
+			return err
+		}
+		now := proxyServicePid(out)
+		if pid != "" && now != pid {
+			return fmt.Errorf("the server was restarted (pid %s, then %s)", pid, now)
+		}
+		pid = now
+	}
+	return nil
+}
+
+// proxyServicePid returns the job's pid from `launchctl print` output, or ""
+// when it has none.
+func proxyServicePid(launchctlPrint string) string {
+	for _, line := range strings.Split(launchctlPrint, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "pid = "); ok {
+			return v
+		}
+	}
+	return ""
+}
 
 // proxyServiceRunning reads `launchctl print` output for the job and reports
 // an error unless the server process is running.

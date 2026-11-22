@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -163,6 +165,45 @@ func TestProxyServiceRunning(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			require.Error(t, proxyServiceRunning(out))
 		})
+	}
+}
+
+// The server takes a while to reach its listener (it runs gt to discover the
+// allowed subcommands first), so one early sample can read "running" for a
+// job that is about to fail and be respawned forever. The check has to watch
+// the job across a launchd respawn interval.
+func TestProxyServiceStayedUp(t *testing.T) {
+	running := func(pid string) string {
+		return "\tstate = running\n\tpid = " + pid + "\n"
+	}
+	samples := func(outs ...string) func() (string, error) {
+		i := 0
+		return func() (string, error) {
+			out := outs[len(outs)-1]
+			if i < len(outs) {
+				out = outs[i]
+			}
+			i++
+			return out, nil
+		}
+	}
+	noSleep := func(time.Duration) {}
+
+	if err := proxyServiceStayedUp(samples(running("41")), 5, noSleep); err != nil {
+		t.Fatalf("a server that stays up: %v", err)
+	}
+	crashed := "\tstate = spawn scheduled\n\tlast exit code = 1\n"
+	if err := proxyServiceStayedUp(samples(running("41"), running("41"), crashed), 5, noSleep); err == nil {
+		t.Fatal("a server that exits after the first samples must be reported")
+	} else if !strings.Contains(err.Error(), "last exit code 1") {
+		t.Fatalf("error should carry the exit code, got: %v", err)
+	}
+	if err := proxyServiceStayedUp(samples(running("41"), running("57")), 5, noSleep); err == nil {
+		t.Fatal("a respawn between two running samples (the pid changed) must be reported")
+	}
+	gone := func() (string, error) { return "Could not find service", fmt.Errorf("exit status 113") }
+	if err := proxyServiceStayedUp(gone, 5, noSleep); err == nil {
+		t.Fatal("a job launchd no longer reports must be an error")
 	}
 }
 
