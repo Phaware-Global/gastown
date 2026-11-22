@@ -1,6 +1,8 @@
 package formula
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -730,5 +732,96 @@ func TestRefineryPatrolExit4ReportKeepsMessageOutOfShellStrings(t *testing.T) {
 				t.Errorf("%s exit 4 still puts the message in a shell string via %q", name, banned)
 			}
 		}
+	}
+}
+
+// TestRefineryPatrolOrphanCheckSkipsPreserveBranches runs the Step 1
+// ORPHAN_CANDIDATES pipeline from the embedded formula against a fixture
+// branch list. Branches agents push on purpose to keep work
+// (polecat/preserve*, polecat/<name>/preserve*, *-preserved) must never be
+// reported as orphans; ordinary polecat branches still must be.
+func TestRefineryPatrolOrphanCheckSkipsPreserveBranches(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+	var desc string
+	for i := range f.Steps {
+		if f.Steps[i].ID == "orphan-branch-check" {
+			desc = f.Steps[i].Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("mol-refinery-patrol is missing the `orphan-branch-check` step")
+	}
+
+	// Pull the first bash fence (Step 1) out of the step description.
+	_, rest, ok := strings.Cut(desc, "```bash\n")
+	if !ok {
+		t.Fatal("orphan-branch-check has no bash block")
+	}
+	script, _, ok := strings.Cut(rest, "```")
+	if !ok {
+		t.Fatal("orphan-branch-check bash block is unterminated")
+	}
+	if !strings.Contains(script, "ORPHAN_CANDIDATES=") {
+		t.Fatalf("first bash block is not the ORPHAN_CANDIDATES pipeline:\n%s", script)
+	}
+
+	// Stub git: `fetch` is a no-op, `branch -r` prints the fixture.
+	fixture := strings.Join([]string{
+		"  origin/HEAD -> origin/main",
+		"  origin/main",
+		"  origin/polecat/slit/gt-abc@1234",
+		"  origin/polecat/nux/gt-def@5678",
+		"  origin/polecat/preserve",
+		"  origin/polecat/preserve-gt-xyz",
+		"  origin/polecat/slit/preserve-old-work",
+		"  origin/polecat/slit/gt-ghi-preserved",
+		"  origin/polecat/gt-jkl-preserved",
+		"  origin/polecat/slit/gt-preserved-but-not-really@abcd",
+	}, "\n")
+	harness := "set -euo pipefail\n" +
+		"git() {\n" +
+		"  case \"$1\" in\n" +
+		"    fetch) return 0 ;;\n" +
+		"    branch) printf '%s\\n' \"$FIXTURE\" ;;\n" +
+		"  esac\n" +
+		"}\n" +
+		script + "\nprintf '%s\\n' \"$ORPHAN_CANDIDATES\"\n"
+
+	cmd := exec.Command(bashPath, "-c", harness)
+	cmd.Env = append(os.Environ(), "FIXTURE="+fixture)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running Step 1 pipeline: %v\n%s", err, out)
+	}
+
+	got := strings.Fields(string(out))
+	want := []string{
+		"polecat/nux/gt-def@5678",
+		"polecat/slit/gt-abc@1234",
+		"polecat/slit/gt-preserved-but-not-really@abcd",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("ORPHAN_CANDIDATES = %q, want %q", got, want)
+	}
+
+	// All-preserve steady state must not abort under set -e/pipefail.
+	cmd = exec.Command(bashPath, "-c", harness)
+	cmd.Env = append(os.Environ(), "FIXTURE=  origin/polecat/preserve-x\n  origin/polecat/a/b-preserved")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("pipeline aborted when every branch is a preserve branch: %v\n%s", err, out)
+	} else if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("expected no candidates, got %q", out)
 	}
 }
