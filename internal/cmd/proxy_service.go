@@ -252,7 +252,11 @@ const (
 
 // proxyServiceStayedUp samples `launchctl print` for the job samples times,
 // sleeping proxyServicePoll between them, and reports an error unless every
-// sample shows the same server process running.
+// sample shows the same server process running and it was running at the end.
+//
+// Right after bootstrap launchd reports the job as "xpcproxy": the process
+// exists, with the pid it will keep, but has not exec'd the server yet. That
+// is a job still starting, not one that failed.
 func proxyServiceStayedUp(sample func() (string, error), samples int, sleep func(time.Duration)) error {
 	pid := ""
 	for i := 0; i < samples; i++ {
@@ -263,8 +267,11 @@ func proxyServiceStayedUp(sample func() (string, error), samples int, sleep func
 		if err != nil {
 			return fmt.Errorf("launchd no longer reports the job: %s", strings.TrimSpace(out))
 		}
-		if err := proxyServiceRunning(out); err != nil {
-			return err
+		starting := proxyServiceState(out) == "xpcproxy"
+		if !starting || i == samples-1 {
+			if err := proxyServiceRunning(out); err != nil {
+				return err
+			}
 		}
 		now := proxyServicePid(out)
 		if pid != "" && now != pid {
@@ -273,6 +280,17 @@ func proxyServiceStayedUp(sample func() (string, error), samples int, sleep func
 		pid = now
 	}
 	return nil
+}
+
+// proxyServiceState returns the job's state from `launchctl print` output,
+// or "" when it reports none.
+func proxyServiceState(launchctlPrint string) string {
+	for _, line := range strings.Split(launchctlPrint, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "state = "); ok {
+			return v
+		}
+	}
+	return ""
 }
 
 // proxyServicePid returns the job's pid from `launchctl print` output, or ""

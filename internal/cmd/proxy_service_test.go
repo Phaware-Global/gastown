@@ -192,6 +192,18 @@ func TestProxyServiceStayedUp(t *testing.T) {
 	if err := proxyServiceStayedUp(samples(running("41")), 5, noSleep); err != nil {
 		t.Fatalf("a server that stays up: %v", err)
 	}
+	// launchd reports a job it has spawned but not yet exec'd as xpcproxy,
+	// with the pid the server will run as. That is starting, not failed.
+	starting := "\tstate = xpcproxy\n\tpid = 41\n"
+	if err := proxyServiceStayedUp(samples(starting, running("41")), 5, noSleep); err != nil {
+		t.Fatalf("a server seen while it was still starting: %v", err)
+	}
+	if err := proxyServiceStayedUp(samples(starting), 5, noSleep); err == nil {
+		t.Fatal("a job that never gets past starting must be reported")
+	}
+	if err := proxyServiceStayedUp(samples(starting, running("57")), 5, noSleep); err == nil {
+		t.Fatal("a pid change between starting and running must be reported")
+	}
 	crashed := "\tstate = spawn scheduled\n\tlast exit code = 1\n"
 	if err := proxyServiceStayedUp(samples(running("41"), running("41"), crashed), 5, noSleep); err == nil {
 		t.Fatal("a server that exits after the first samples must be reported")
