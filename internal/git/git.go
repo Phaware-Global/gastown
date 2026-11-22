@@ -1065,6 +1065,16 @@ func (g *Git) PushForceWithLease(remote, src, dst, expectedSHA string) error {
 	return err
 }
 
+// DeleteRef deletes a fully-qualified ref (refs/...). Deleting a ref that does
+// not exist is an error.
+func (g *Git) DeleteRef(ref string) error {
+	if !strings.HasPrefix(ref, "refs/") {
+		return fmt.Errorf("refusing to delete %q: not a fully-qualified ref", ref)
+	}
+	_, err := g.run("update-ref", "-d", ref)
+	return err
+}
+
 // CountCommitsBetween returns how many commits are reachable from `to` but not
 // from `from` (git rev-list --count from..to).
 func (g *Git) CountCommitsBetween(from, to string) (int, error) {

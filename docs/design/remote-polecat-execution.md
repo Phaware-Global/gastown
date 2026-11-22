@@ -812,7 +812,9 @@ from the reuse-the-worktree pool model and is carved out explicitly for
 > at its start point and never receives the agent's files. The durable
 > artifact is `refs/remote-work/<branch>` in the rig repo, not the branch
 > itself: a push to the checked-out branch is refused, and nothing a worker
-> pushes is ever checked out on the host.
+> pushes is ever checked out on the host. `gt done` completes from that ref:
+> it publishes it to origin as the polecat branch with hooks disabled, and
+> deletes it once the push and the merge request have both succeeded.
 
 ### 9.2 Recovery — git push via proxy (no storage snapshots)
 
