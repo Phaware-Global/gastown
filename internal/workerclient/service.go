@@ -391,6 +391,10 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
 		return
 	}
+	if m.Branch != "" && !validBranch(m.Branch) {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: fmt.Sprintf("branch %q is not a safe branch name", m.Branch)})
+		return
+	}
 	modeOK := false
 	for _, em := range s.cfg.ExecModes {
 		if em == m.ExecMode {
@@ -628,6 +632,19 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 	if out, err := exec.CommandContext(buCtx, "git", "clone", "--", cloneURL, worktree).CombinedOutput(); err != nil {
 		fail(replyID, "clone", fmt.Errorf("git clone via relay: %v: %s", err, strings.TrimSpace(string(out))))
 		return
+	}
+	// Land the worktree on the polecat's work branch. The host creates it in
+	// the rig repo before the session starts, so it is normally a remote
+	// branch to track; one the host repo does not have is created here.
+	if open.Branch != "" {
+		args := []string{"-C", worktree, "checkout", "-b", open.Branch}
+		if exec.CommandContext(buCtx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+open.Branch).Run() == nil {
+			args = append(args, "--track", "origin/"+open.Branch)
+		}
+		if out, err := exec.CommandContext(buCtx, "git", args...).CombinedOutput(); err != nil {
+			fail(replyID, "checkout", fmt.Errorf("git checkout %s: %v: %s", open.Branch, err, strings.TrimSpace(string(out))))
+			return
+		}
 	}
 
 	// Container mode: prepare the idle work container (§6.1.2 via the shared

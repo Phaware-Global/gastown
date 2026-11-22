@@ -185,6 +185,7 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 		NetworkMode:        b.cfg.NetworkMode(),
 		CheckpointInterval: b.cfg.CheckpointInterval().String(),
 		MaxRuntime:         durationOrEmpty(b.cfg),
+		Branch:             spec.Branch,
 	}
 	resp, err := c.request(ctx, open)
 	if err != nil {

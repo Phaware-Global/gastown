@@ -142,6 +142,9 @@ type Message struct {
 	CheckpointInterval string            `json:"checkpoint_interval,omitempty"`
 	MaxRuntime         string            `json:"max_runtime,omitempty"`
 	Env                map[string]string `json:"env,omitempty"` // NON-secret only (core §7.4)
+	// Branch is the polecat's work branch; the worker checks the cloned
+	// worktree out on it. Empty keeps the clone's default branch.
+	Branch string `json:"branch,omitempty"`
 
 	// push_binaries (§4.1). Chunks carry Data; the final chunk sets EOF and the
 	// whole-file SHA256, which the worker verifies before anything is installed.

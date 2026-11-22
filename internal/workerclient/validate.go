@@ -38,6 +38,28 @@ func validateSessionFields(session, rig, polecat string) error {
 	return nil
 }
 
+// safeBranch bounds the orchestrator-supplied branch name before it reaches
+// git on the worker host. It admits the polecat branch forms
+// (polecat/<name>/<issue>@<ts>, polecat/<name>-<ts>) and nothing git could
+// read as an option, a revision expression or a path escape.
+var safeBranch = regexp.MustCompile(`^[A-Za-z0-9._@/-]+$`)
+
+// validBranch reports whether v is a branch name safe to hand to git.
+func validBranch(v string) bool {
+	if !safeBranch.MatchString(v) || strings.HasPrefix(v, "-") {
+		return false
+	}
+	if strings.Contains(v, "..") || strings.Contains(v, "@{") {
+		return false
+	}
+	for _, part := range strings.Split(v, "/") {
+		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
 // underRoot asserts that a joined path stays within root — defense in depth
 // behind validateSessionFields, so a joined path can never escape the state
 // dir even if the validation were somehow bypassed.
