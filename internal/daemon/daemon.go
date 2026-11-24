@@ -190,6 +190,9 @@ type Daemon struct {
 	scriptPluginsRunning sync.Map
 	scriptPluginWG       sync.WaitGroup
 
+	// diskGuard holds the disk-free check's escalation-throttling state.
+	diskGuard *diskGuard
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
@@ -1033,6 +1036,12 @@ func (d *Daemon) heartbeat(state *State) {
 	// a single read; invalidating here ensures we pick up rigs.json changes
 	// between ticks.
 	d.invalidateKnownRigsCache()
+
+	// 0-pre. Warn before the data volume fills and kills Dolt. Runs first and
+	// is independent of every later phase: it only stats a path.
+	if d.isPatrolActive("disk_guard") {
+		d.checkDiskFree()
+	}
 
 	// 0a. Reload prefix registry so new/changed rigs get correct session names.
 	// Without this, rigs added after daemon startup get the "gt" default prefix,

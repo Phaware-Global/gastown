@@ -131,7 +131,12 @@ type PatrolsConfig struct {
 	// drift forever from the reviewed, merged source (gt-2ea1 — the
 	// dolt-archive plugin ran a 3-month-stale copy because nothing else
 	// deployed it, and nobody noticed). Set {"enabled": false} to opt out.
-	PluginSync           *PatrolConfig               `json:"plugin_sync,omitempty"`
+	PluginSync *PatrolConfig `json:"plugin_sync,omitempty"`
+	// DiskGuard escalates when free space on the Dolt data volume runs low.
+	// Like Reviewer and PluginSync it defaults to ENABLED when unset: a full
+	// volume kills Dolt and with it every write, including the escalation that
+	// would report it. Set {"enabled": false} to opt out.
+	DiskGuard            *DiskGuardConfig            `json:"disk_guard,omitempty"`
 	DoltServer           *DoltServerConfig           `json:"dolt_server,omitempty"`
 	DoltRemotes          *DoltRemotesConfig          `json:"dolt_remotes,omitempty"`
 	DoltBackup           *DoltBackupConfig           `json:"dolt_backup,omitempty"`
@@ -145,6 +150,24 @@ type PatrolsConfig struct {
 	QuotaDog             *QuotaDogConfig             `json:"quota_dog,omitempty"`
 	RestartTracker       *RestartTrackerConfig       `json:"restart_tracker,omitempty"`
 	Telegraph            *TelegraphServerConfig      `json:"telegraph,omitempty"`
+}
+
+// DiskGuardConfig holds configuration for the disk_guard patrol.
+type DiskGuardConfig struct {
+	// Enabled controls whether the disk guard runs during heartbeat.
+	Enabled bool `json:"enabled"`
+
+	// WarnFreeGB escalates HIGH when free space drops below this many GiB.
+	// Default: 30.
+	WarnFreeGB float64 `json:"warn_free_gb,omitempty"`
+
+	// CriticalFreeGB escalates CRITICAL when free space drops below this many
+	// GiB. Must be below WarnFreeGB. Default: 10.
+	CriticalFreeGB float64 `json:"critical_free_gb,omitempty"`
+
+	// Path is the location whose volume is checked. Default: the Dolt data
+	// directory under the town root.
+	Path string `json:"path,omitempty"`
 }
 
 // TelegraphServerConfig holds configuration for the daemon-managed Telegraph subprocess.
@@ -445,6 +468,10 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 	case "plugin_sync":
 		if config.Patrols.PluginSync != nil {
 			return config.Patrols.PluginSync.Enabled
+		}
+	case "disk_guard":
+		if config.Patrols.DiskGuard != nil {
+			return config.Patrols.DiskGuard.Enabled
 		}
 	}
 	return true // Default: enabled
