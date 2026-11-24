@@ -31,6 +31,12 @@ const (
 	// DiskGuardCriticalCooldown rate-limits repeat CRITICAL escalations.
 	DiskGuardCriticalCooldown = 15 * time.Minute
 
+	// diskGuardRecoveryMargin is how far above the warn threshold free space
+	// must climb before the escalation throttle clears. It keeps a volume that
+	// hovers at the threshold (build output created and deleted, or macOS
+	// purgeable space shifting) from re-escalating on every dip.
+	diskGuardRecoveryMargin = 1.1
+
 	// diskGuardEscalateTimeout bounds the gt escalate subprocess; it runs inline
 	// on the heartbeat path.
 	diskGuardEscalateTimeout = 20 * time.Second
@@ -55,8 +61,10 @@ type diskGuard struct {
 	escalate  func(severity, message string) error
 	logf      func(format string, args ...interface{})
 
-	lastLevel     diskLevel
-	lastEscalated time.Time
+	// lastWarnAt and lastCriticalAt are when an escalation of that severity
+	// was last delivered; zero means none is outstanding.
+	lastWarnAt     time.Time
+	lastCriticalAt time.Time
 }
 
 // thresholds returns the effective (warn, critical) free-space limits in GiB.
@@ -82,9 +90,14 @@ func (g *diskGuard) thresholds() (warn, critical float64) {
 }
 
 // check reads free space at path and escalates if it is below a threshold.
-// Repeats are suppressed for a cooldown per severity, but a worsening level
-// (warn -> critical) escalates immediately, and a recovery resets the
-// throttle so a later dip is reported at once.
+//
+// Throttling is per severity: a HIGH is suppressed for DiskGuardWarnCooldown
+// after any delivered escalation, a CRITICAL for DiskGuardCriticalCooldown
+// after a delivered CRITICAL. A first CRITICAL is therefore never held back by
+// an earlier HIGH. The throttle clears only once free space is back above the
+// warn threshold plus diskGuardRecoveryMargin, so a volume hovering at a
+// threshold does not escalate on every dip. Throttle state is committed only
+// after the escalation is delivered; a failed one is retried on the next tick.
 func (g *diskGuard) check(path string, now time.Time) {
 	free, err := g.freeBytes(path)
 	if err != nil {
@@ -105,39 +118,63 @@ func (g *diskGuard) check(path string, now time.Time) {
 	}
 
 	if level == diskOK {
-		g.lastLevel = diskOK
-		g.lastEscalated = time.Time{}
+		if freeGB >= warn*diskGuardRecoveryMargin {
+			g.lastWarnAt = time.Time{}
+			g.lastCriticalAt = time.Time{}
+		}
 		return
 	}
 
-	cooldown := DiskGuardWarnCooldown
-	severity := "HIGH"
-	limit := warn
+	severity, limit := "HIGH", warn
 	if level == diskCritical {
-		cooldown = DiskGuardCriticalCooldown
-		severity = "CRITICAL"
-		limit = critical
+		severity, limit = "CRITICAL", critical
 	}
-
-	worsened := level > g.lastLevel
-	g.lastLevel = level
-	if !worsened && !g.lastEscalated.IsZero() && now.Sub(g.lastEscalated) < cooldown {
+	if g.throttled(level, now) {
 		return
 	}
-	g.lastEscalated = now
 
 	msg := fmt.Sprintf("Disk space low: %s free at %s (below %.0f GiB). "+
 		"Dolt cannot write once the volume is full; free space now "+
 		"(stale build output in polecat scratch directories is the usual culprit).",
 		util.FormatBytesHuman(free), path, limit)
 	g.logf("disk_guard: %s: %s", severity, msg)
-	_ = g.escalate(severity, msg)
+	if err := g.escalate(severity, msg); err != nil {
+		g.logf("disk_guard: %s escalation not delivered, will retry next tick: %v", severity, err)
+		return
+	}
+	if level == diskCritical {
+		g.lastCriticalAt = now
+	} else {
+		g.lastWarnAt = now
+	}
 }
 
-// resolveDiskGuardPath returns the path whose volume is checked.
+// throttled reports whether an escalation at level is still inside the
+// cooldown of a delivered one. A delivered CRITICAL also quiets HIGH: dropping
+// from critical to warn is an improvement, not news.
+func (g *diskGuard) throttled(level diskLevel, now time.Time) bool {
+	within := func(at time.Time, cooldown time.Duration) bool {
+		return !at.IsZero() && now.Sub(at) < cooldown
+	}
+	if level == diskCritical {
+		return within(g.lastCriticalAt, DiskGuardCriticalCooldown)
+	}
+	return within(g.lastWarnAt, DiskGuardWarnCooldown) || within(g.lastCriticalAt, DiskGuardWarnCooldown)
+}
+
+// resolveDiskGuardPath returns the path whose volume is checked: the
+// configured path, else the managed Dolt server's data directory, else the
+// conventional <town>/.dolt-data. Only the conventional default falls back to
+// the town root when it does not exist (default layout: same volume). A
+// configured or managed path is returned as-is even if missing, so the guard
+// keeps naming it and logs the read failure instead of silently watching a
+// different disk.
 func resolveDiskGuardPath(cfg *DiskGuardConfig, managedDataDir, townRoot string, exists func(string) bool) string {
 	if cfg != nil && cfg.Path != "" {
 		return cfg.Path
+	}
+	if managedDataDir != "" {
+		return managedDataDir
 	}
 	path := filepath.Join(townRoot, ".dolt-data")
 	if !exists(path) {
@@ -168,7 +205,11 @@ func (d *Daemon) checkDiskFree() {
 	}
 	d.diskGuard.config = cfg
 
-	path := resolveDiskGuardPath(cfg, "", d.config.TownRoot, func(p string) bool {
+	managed := ""
+	if d.doltServer != nil && d.doltServer.IsEnabled() {
+		managed = d.doltServer.config.DataDir
+	}
+	path := resolveDiskGuardPath(cfg, managed, d.config.TownRoot, func(p string) bool {
 		_, err := os.Stat(p)
 		return err == nil
 	})
@@ -180,10 +221,17 @@ func (d *Daemon) escalateDiskFree(severity, message string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), diskGuardEscalateTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", severity, "Disk: "+message)
+	gt := d.gtPath
+	if gt == "" {
+		gt = "gt"
+	}
+	cmd := exec.CommandContext(ctx, gt, "escalate", "-s", severity, "Disk: "+message) //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
 	util.SetDetachedProcessGroup(cmd)
+	// The context deadline alone does not bound a child whose grandchild
+	// (bd, dolt) keeps the output pipe open; WaitDelay does.
+	cmd.WaitDelay = 5 * time.Second
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
 		return err
