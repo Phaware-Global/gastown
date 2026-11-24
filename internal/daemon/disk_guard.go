@@ -199,8 +199,7 @@ func (d *Daemon) checkDiskFree() {
 				}
 				return info.AvailableBytes, nil
 			},
-			escalate: d.escalateDiskFree,
-			logf:     d.logger.Printf,
+			logf: d.logger.Printf,
 		}
 	}
 	d.diskGuard.config = cfg
@@ -213,28 +212,42 @@ func (d *Daemon) checkDiskFree() {
 		_, err := os.Stat(p)
 		return err == nil
 	})
+	d.diskGuard.escalate = func(severity, message string) error {
+		return d.escalateDiskFree(severity, path, message)
+	}
 	d.diskGuard.check(path, time.Now())
 }
 
-// escalateDiskFree files an escalation via gt escalate at the given severity.
-func (d *Daemon) escalateDiskFree(severity, message string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), diskGuardEscalateTimeout)
+// diskGuardEscalateArgs builds the gt escalate argument list for a disk alert.
+func diskGuardEscalateArgs(severity, path, message string) []string {
+	return []string{"escalate", "-s", severity, "Disk: " + message}
+}
+
+// runDiskGuardEscalation runs gt with args in dir, bounded by timeout.
+func runDiskGuardEscalation(gt, dir string, args []string, timeout time.Duration, logf func(string, ...interface{})) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	gt := d.gtPath
-	if gt == "" {
-		gt = "gt"
-	}
-	cmd := exec.CommandContext(ctx, gt, "escalate", "-s", severity, "Disk: "+message) //nolint:gosec // G204: args are constructed internally
-	cmd.Dir = d.config.TownRoot
+	cmd := exec.CommandContext(ctx, gt, args...) //nolint:gosec // G204: args are constructed internally
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
 	util.SetDetachedProcessGroup(cmd)
 	// The context deadline alone does not bound a child whose grandchild
 	// (bd, dolt) keeps the output pipe open; WaitDelay does.
 	cmd.WaitDelay = 5 * time.Second
 	if output, err := cmd.CombinedOutput(); err != nil {
-		d.logger.Printf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
+		logf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
 		return err
 	}
 	return nil
+}
+
+// escalateDiskFree files an escalation via gt escalate at the given severity.
+func (d *Daemon) escalateDiskFree(severity, path, message string) error {
+	gt := d.gtPath
+	if gt == "" {
+		gt = "gt"
+	}
+	return runDiskGuardEscalation(gt, d.config.TownRoot,
+		diskGuardEscalateArgs(severity, path, message), diskGuardEscalateTimeout, d.logger.Printf)
 }
