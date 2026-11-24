@@ -494,3 +494,27 @@ func TestDiskGuardEscalateArgs_NoFingerprint(t *testing.T) {
 		}
 	}
 }
+
+func TestDiskGuard_HighStillAlertsAfterCriticalGaveUp(t *testing.T) {
+	free := 4 * gib
+	g, _ := newTestDiskGuard(&free, nil, nil)
+	var severities []string
+	g.escalate = func(severity, message string) error {
+		severities = append(severities, severity)
+		if severity == "CRITICAL" {
+			return errors.New("timeout")
+		}
+		return nil
+	}
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Minute)) // CRITICAL: 3 failed attempts, gives up
+	}
+	free = 20 * gib
+	g.check("/data", now.Add(9*time.Minute)) // still low, nobody told: HIGH must go out
+	g.check("/data", now.Add(12*time.Minute))
+	want := "CRITICAL,CRITICAL,CRITICAL,HIGH"
+	if got := strings.Join(severities, ","); got != want {
+		t.Fatalf("severities = %s, want %s", got, want)
+	}
+}

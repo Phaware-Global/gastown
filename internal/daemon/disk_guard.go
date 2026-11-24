@@ -68,6 +68,8 @@ const (
 //     repeat is deliberate: it is also what recovers a lost alert). HIGH never
 //     repeats. A delivered CRITICAL covers HIGH for the same stretch, so
 //     dropping from critical back to the warn range is not announced again.
+//     If CRITICAL gave up undelivered, nobody may know, so a HIGH episode that
+//     starts or continues after that still alerts.
 //  3. Delivery. Bounded duplicates are acceptable; a lost alert is not. There
 //     is no duplicate-suppression key and no "suppressed" exit path. An alert
 //     counts as sent only after gt escalate exits 0. Any failure (non-zero
