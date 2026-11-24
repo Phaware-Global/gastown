@@ -155,7 +155,7 @@ type PatrolsConfig struct {
 // DiskGuardConfig holds configuration for the disk_guard patrol.
 type DiskGuardConfig struct {
 	// Enabled controls whether the disk guard runs during heartbeat.
-	Enabled bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
 
 	// WarnFreeGB escalates HIGH when free space drops below this many GiB.
 	// Default: 30.
@@ -471,7 +471,7 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 		}
 	case "disk_guard":
 		if config.Patrols.DiskGuard != nil {
-			return config.Patrols.DiskGuard.Enabled
+			return config.Patrols.DiskGuard.Enabled != nil && *config.Patrols.DiskGuard.Enabled
 		}
 	}
 	return true // Default: enabled

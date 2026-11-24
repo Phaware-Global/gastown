@@ -52,7 +52,7 @@ type diskGuard struct {
 	config *DiskGuardConfig
 
 	freeBytes func(path string) (uint64, error)
-	escalate  func(severity, message string)
+	escalate  func(severity, message string) error
 	logf      func(format string, args ...interface{})
 
 	lastLevel     diskLevel
@@ -131,16 +131,19 @@ func (g *diskGuard) check(path string, now time.Time) {
 		"(stale build output in polecat scratch directories is the usual culprit).",
 		util.FormatBytesHuman(free), path, limit)
 	g.logf("disk_guard: %s: %s", severity, msg)
-	g.escalate(severity, msg)
+	_ = g.escalate(severity, msg)
 }
 
-// diskGuardPath returns the path whose volume is checked: the configured path,
-// or the Dolt data directory under the town root.
-func diskGuardPath(cfg *DiskGuardConfig, townRoot string) string {
+// resolveDiskGuardPath returns the path whose volume is checked.
+func resolveDiskGuardPath(cfg *DiskGuardConfig, managedDataDir, townRoot string, exists func(string) bool) string {
 	if cfg != nil && cfg.Path != "" {
 		return cfg.Path
 	}
-	return filepath.Join(townRoot, ".dolt-data")
+	path := filepath.Join(townRoot, ".dolt-data")
+	if !exists(path) {
+		return townRoot
+	}
+	return path
 }
 
 // checkDiskFree is the heartbeat hook for the disk guard.
@@ -165,17 +168,15 @@ func (d *Daemon) checkDiskFree() {
 	}
 	d.diskGuard.config = cfg
 
-	path := diskGuardPath(cfg, d.config.TownRoot)
-	if _, err := os.Stat(path); err != nil {
-		// No Dolt data dir yet (or a custom layout): the town root shares the
-		// volume in the default layout, so check that instead.
-		path = d.config.TownRoot
-	}
+	path := resolveDiskGuardPath(cfg, "", d.config.TownRoot, func(p string) bool {
+		_, err := os.Stat(p)
+		return err == nil
+	})
 	d.diskGuard.check(path, time.Now())
 }
 
 // escalateDiskFree files an escalation via gt escalate at the given severity.
-func (d *Daemon) escalateDiskFree(severity, message string) {
+func (d *Daemon) escalateDiskFree(severity, message string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), diskGuardEscalateTimeout)
 	defer cancel()
 
@@ -185,5 +186,7 @@ func (d *Daemon) escalateDiskFree(severity, message string) {
 	util.SetDetachedProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
+		return err
 	}
+	return nil
 }
