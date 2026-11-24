@@ -3,8 +3,6 @@
 package daemon
 
 import (
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,136 +35,89 @@ func countLines(t *testing.T, path string) int {
 	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
 }
 
-func fakeGtDaemon(dir, gt string) *Daemon {
-	return &Daemon{
-		config: &Config{TownRoot: dir},
-		logger: log.New(io.Discard, "", 0),
-		gtPath: gt,
+func readTrimmed(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return strings.TrimSpace(string(data))
 }
 
-// A fake gt that follows the real CLI contract: with --fingerprint it files
-// once and answers later calls for the same fingerprint with "duplicate
-// suppressed" (exit 0) while the first is open. Without one it files every time.
-// Filing exits non-zero, like gt escalate does when a notification contact is
-// missing after the bead and mail were already written.
-const fakeGtWritesThenFails = `
-fp=""
-while [ $# -gt 0 ]; do
-  case "$1" in --fingerprint) fp="$2" ;; esac
-  shift
-done
-if [ -n "$fp" ] && grep -qx -- "$fp" "$STATE" 2>/dev/null; then
-  echo "Duplicate escalation suppressed"
-  exit 0
-fi
-[ -n "$fp" ] && echo "$fp" >> "$STATE"
-echo filed >> "$FILED"
-echo "escalation created but notification skipped" >&2
-exit 1
-`
+func gone(pid int) bool { return syscall.Kill(pid, 0) != nil }
 
-func TestDiskGuardEscalation_DeliveredButNonZeroIsNotRefiled(t *testing.T) {
+// The fake gt writes its state and then hangs past the timeout, like a gt
+// escalate that wrote the bead and was stuck before sending mail. The alert is
+// not delivered: it must be retried on the next heartbeat, and the retries
+// must stop after 3 attempts.
+func TestDiskGuardEscalation_HangAfterWriteIsRetriedThreeTimesThenStops(t *testing.T) {
 	dir := t.TempDir()
-	state, filed := filepath.Join(dir, "state"), filepath.Join(dir, "filed")
-	gt := writeFakeGt(t, dir, "STATE="+state+"\nFILED="+filed+"\n"+fakeGtWritesThenFails)
+	calls := filepath.Join(dir, "calls")
+	gt := writeFakeGt(t, dir, "echo wrote >> "+calls+"\nexec sleep 300\n")
 
-	d := fakeGtDaemon(dir, gt)
 	free := 20 * gib
 	g, _ := newTestDiskGuard(&free, nil, nil)
-	g.escalate = func(severity, message string) error { return d.escalateDiskFree(severity, "/data", message) }
-
-	now := time.Now()
-	for i := 0; i < 5; i++ {
-		// The message carries the free-bytes figure, which changes every tick.
-		free = 20*gib - uint64(i)*(1<<20)
-		g.check("/data", now.Add(time.Duration(i)*3*time.Minute))
+	g.escalate = func(severity, message string) error {
+		return runDiskGuardEscalation(gt, dir, []string{"escalate"}, 300*time.Millisecond, func(string, ...interface{}) {})
 	}
-	if n := countLines(t, filed); n != 1 {
-		t.Fatalf("a delivered escalation must be filed once across heartbeats, filed %d times", n)
-	}
-}
-
-func TestDiskGuardEscalation_FailureBeforeAnyWriteIsRetried(t *testing.T) {
-	dir := t.TempDir()
-	calls, filed := filepath.Join(dir, "calls"), filepath.Join(dir, "filed")
-	gt := writeFakeGt(t, dir, `
-echo call >> `+calls+`
-if [ "$(wc -l < `+calls+`)" -lt 2 ]; then echo "bd: write timeout" >&2; exit 1; fi
-echo filed >> `+filed+`
-exit 0
-`)
-	d := fakeGtDaemon(dir, gt)
-	free := 20 * gib
-	g, _ := newTestDiskGuard(&free, nil, nil)
-	g.escalate = func(severity, message string) error { return d.escalateDiskFree(severity, "/data", message) }
-
 	now := time.Now()
 	g.check("/data", now)
+	if n := countLines(t, calls); n != 1 {
+		t.Fatalf("first attempt: gt called %d times", n)
+	}
 	g.check("/data", now.Add(3*time.Minute))
-	g.check("/data", now.Add(6*time.Minute))
 	if n := countLines(t, calls); n != 2 {
-		t.Fatalf("expected a retry after a failure with no write, then quiet; gt called %d times", n)
+		t.Fatalf("a timed-out alert is not sent; it must be retried next heartbeat, gt called %d times", n)
 	}
-	if n := countLines(t, filed); n != 1 {
-		t.Fatalf("expected one filed escalation, got %d", n)
+	for i := 2; i < 8; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Minute))
 	}
-}
-
-func TestDiskGuardEscalateArgs_FingerprintIsStable(t *testing.T) {
-	fp := func(args []string) string {
-		for i, a := range args {
-			if a == "--fingerprint" && i+1 < len(args) {
-				return args[i+1]
-			}
-		}
-		return ""
-	}
-	a := fp(diskGuardEscalateArgs("HIGH", "/data", "Disk space low: 20.0 GB free"))
-	b := fp(diskGuardEscalateArgs("HIGH", "/data", "Disk space low: 19.9 GB free"))
-	if a == "" {
-		t.Fatal("escalation must carry a --fingerprint")
-	}
-	if a != b {
-		t.Errorf("fingerprint must not depend on the free-bytes text: %q vs %q", a, b)
-	}
-	if a == fp(diskGuardEscalateArgs("CRITICAL", "/data", "x")) {
-		t.Error("fingerprint must differ by severity")
-	}
-	if a == fp(diskGuardEscalateArgs("HIGH", "/other", "x")) {
-		t.Error("fingerprint must differ by path")
-	}
-	if want := "disk_guard:/data:HIGH"; a != want {
-		t.Errorf("fingerprint = %q, want %q", a, want)
+	if n := countLines(t, calls); n != 3 {
+		t.Fatalf("retries must stop after 3 attempts, gt called %d times", n)
 	}
 }
 
-func TestDiskGuardEscalation_TimeoutKillsGrandchild(t *testing.T) {
+// bd is started by gt in its own process group, so the fake gt starts its
+// grandchild the same way (job control gives it a group of its own). A timeout
+// must still take it down.
+func TestDiskGuardEscalation_TimeoutKillsGrandchildInItsOwnProcessGroup(t *testing.T) {
 	dir := t.TempDir()
-	pidFile := filepath.Join(dir, "grandchild.pid")
-	gt := writeFakeGt(t, dir, "sleep 300 &\necho $! > "+pidFile+"\nwait\n")
+	pidFile, pgidFile := filepath.Join(dir, "pid"), filepath.Join(dir, "pgid")
+	gt := writeFakeGt(t, dir, "set -m\nsleep 300 &\npid=$!\necho $pid > "+pidFile+"\nps -o pgid= -p $pid > "+pgidFile+"\nwait\n")
 
 	err := runDiskGuardEscalation(gt, dir, []string{"escalate"}, 500*time.Millisecond, func(string, ...interface{}) {})
 	if err == nil {
 		t.Fatal("a timed-out escalation must report an error")
 	}
 
-	data, rerr := os.ReadFile(pidFile)
-	if rerr != nil {
-		t.Fatalf("fake gt never recorded its grandchild: %v", rerr)
-	}
-	pid, perr := strconv.Atoi(strings.TrimSpace(string(data)))
+	pid, perr := strconv.Atoi(readTrimmed(t, pidFile))
 	if perr != nil {
 		t.Fatal(perr)
 	}
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	if got := readTrimmed(t, pgidFile); got != strconv.Itoa(pid) {
+		t.Fatalf("test topology is wrong: grandchild pgid %q is not its own pid %d", got, pid)
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if syscall.Kill(pid, 0) != nil {
-			return // gone
+		if gone(pid) {
+			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("grandchild pid %d survived the escalation timeout", pid)
+	t.Fatalf("grandchild pid %d (own process group) survived the escalation timeout", pid)
+}
+
+func TestDiskGuardEscalation_BdTimeoutIsBelowOuterTimeout(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "env")
+	gt := writeFakeGt(t, dir, "echo \"$GT_BD_TIMEOUT_SEC\" > "+out+"\n")
+	if err := runDiskGuardEscalation(gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := strconv.Atoi(readTrimmed(t, out))
+	if err != nil || n <= 0 || n >= 20 {
+		t.Fatalf("GT_BD_TIMEOUT_SEC = %q, want a positive integer below the 20s outer timeout", readTrimmed(t, out))
+	}
 }

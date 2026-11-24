@@ -112,23 +112,19 @@ func TestDiskGuard_InvalidThresholdsFallBackToDefaults(t *testing.T) {
 	}
 }
 
-func TestDiskGuard_CooldownSuppressesRepeatEscalation(t *testing.T) {
+func TestDiskGuard_HighDoesNotRepeatWithinEpisode(t *testing.T) {
 	free := 20 * gib
 	g, got := newTestDiskGuard(&free, nil, nil)
 	now := time.Now()
-	g.check("/data", now)
-	g.check("/data", now.Add(3*time.Minute))
-	g.check("/data", now.Add(30*time.Minute))
-	if len(*got) != 1 {
-		t.Fatalf("expected escalation once within cooldown, got %d: %+v", len(*got), *got)
+	for i := 0; i < 30; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Hour))
 	}
-	g.check("/data", now.Add(DiskGuardWarnCooldown+time.Minute))
-	if len(*got) != 2 {
-		t.Fatalf("expected re-escalation after cooldown, got %d", len(*got))
+	if len(*got) != 1 {
+		t.Fatalf("HIGH must be sent once per episode however long it lasts, got %d", len(*got))
 	}
 }
 
-func TestDiskGuard_WorseningBypassesCooldown(t *testing.T) {
+func TestDiskGuard_WorseningToCriticalAlertsImmediately(t *testing.T) {
 	free := 20 * gib
 	g, got := newTestDiskGuard(&free, nil, nil)
 	now := time.Now()
@@ -347,5 +343,154 @@ func TestDiskGuard_UnreadableExplicitPathIsLoggedNotEscalatedOrSwitched(t *testi
 	}
 	if len(*got) != 0 {
 		t.Fatalf("unreadable path must not escalate as low disk, got %+v", *got)
+	}
+}
+
+func TestDiskGuard_CriticalRepeatsEvery15MinutesWithinEpisode(t *testing.T) {
+	free := 4 * gib
+	g, got := newTestDiskGuard(&free, nil, nil)
+	now := time.Now()
+	g.check("/data", now)
+	g.check("/data", now.Add(14*time.Minute))
+	if len(*got) != 1 {
+		t.Fatalf("no repeat before 15 minutes, got %d alerts", len(*got))
+	}
+	g.check("/data", now.Add(15*time.Minute))
+	if len(*got) != 2 {
+		t.Fatalf("CRITICAL must repeat at 15 minutes, got %d alerts", len(*got))
+	}
+	g.check("/data", now.Add(29*time.Minute))
+	g.check("/data", now.Add(30*time.Minute))
+	if len(*got) != 3 {
+		t.Fatalf("CRITICAL must repeat every 15 minutes, got %d alerts", len(*got))
+	}
+	for _, e := range *got {
+		if e.severity != "CRITICAL" {
+			t.Fatalf("every repeat must be CRITICAL, got %+v", *got)
+		}
+	}
+}
+
+func TestDiskGuard_NewEpisodeAfterRecoveryAlertsAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		low      uint64
+		severity string
+	}{{"high", 20 * gib, "HIGH"}, {"critical", 4 * gib, "CRITICAL"}} {
+		free := tc.low
+		g, got := newTestDiskGuard(&free, nil, nil)
+		now := time.Now()
+		g.check("/data", now)
+		free = 200 * gib
+		g.check("/data", now.Add(3*time.Minute)) // recovered above threshold + margin
+		free = tc.low
+		g.check("/data", now.Add(6*time.Minute)) // new dip = new episode
+		if len(*got) != 2 || (*got)[1].severity != tc.severity {
+			t.Errorf("%s: a dip after recovery must alert again, got %+v", tc.name, *got)
+		}
+	}
+}
+
+func TestDiskGuard_RecoveryRequiresMarginAboveThreshold(t *testing.T) {
+	free := gibs(29.9)
+	g, got := newTestDiskGuard(&free, nil, nil)
+	now := time.Now()
+	g.check("/data", now)
+	free = gibs(32) // above 30 but inside the 10% margin: episode continues
+	g.check("/data", now.Add(3*time.Minute))
+	free = gibs(29.9)
+	g.check("/data", now.Add(6*time.Minute))
+	if len(*got) != 1 {
+		t.Fatalf("hovering inside the recovery margin must stay one episode, got %d alerts", len(*got))
+	}
+}
+
+func TestDiskGuard_StopsAfterThreeFailedAttemptsPerAlert(t *testing.T) {
+	free := 20 * gib
+	g, _ := newTestDiskGuard(&free, nil, nil)
+	attempts := 0
+	g.escalate = func(severity, message string) error { attempts++; return errors.New("timeout") }
+	var logged []string
+	g.logf = func(format string, args ...interface{}) { logged = append(logged, fmt.Sprintf(format, args...)) }
+
+	now := time.Now()
+	for i := 0; i < 20; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Minute))
+	}
+	if attempts != 3 {
+		t.Fatalf("a HIGH alert gets at most 3 attempts per episode, got %d", attempts)
+	}
+	found := false
+	for _, l := range logged {
+		if strings.Contains(l, "/data") && strings.Contains(l, "HIGH") && strings.Contains(strings.ToLower(l), "giving up") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("giving up must log an error naming the path and severity, logged: %v", logged)
+	}
+}
+
+func TestDiskGuard_CriticalGivesUpThenRetriesAtNextScheduledRepeat(t *testing.T) {
+	free := 4 * gib
+	g, _ := newTestDiskGuard(&free, nil, nil)
+	attempts := 0
+	g.escalate = func(severity, message string) error { attempts++; return errors.New("timeout") }
+	now := time.Now()
+	at := func(m int) { g.check("/data", now.Add(time.Duration(m)*time.Minute)) }
+
+	at(0)
+	at(3)
+	at(6)
+	at(9)
+	at(12)
+	if attempts != 3 {
+		t.Fatalf("3 attempts then silence until the next repeat, got %d", attempts)
+	}
+	at(15)
+	at(18)
+	at(21)
+	at(24)
+	if attempts != 6 {
+		t.Fatalf("the repeat at 15 minutes starts a fresh set of 3 attempts, got %d", attempts)
+	}
+}
+
+func TestDiskGuard_AlertIsSentOnlyAfterEscalateSucceeds(t *testing.T) {
+	free := 20 * gib
+	g, _ := newTestDiskGuard(&free, nil, nil)
+	attempts := 0
+	g.escalate = func(severity, message string) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("timeout")
+		}
+		return nil
+	}
+	now := time.Now()
+	for i := 0; i < 8; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Minute))
+	}
+	if attempts != 3 {
+		t.Fatalf("two failures then a success, then quiet: attempts = %d, want 3", attempts)
+	}
+}
+
+func TestDiskGuard_EpisodesArePerPath(t *testing.T) {
+	free := 20 * gib
+	g, got := newTestDiskGuard(&free, nil, nil)
+	now := time.Now()
+	g.check("/a", now)
+	g.check("/b", now.Add(3*time.Minute))
+	if len(*got) != 2 {
+		t.Fatalf("a different path is a different episode, got %d alerts", len(*got))
+	}
+}
+
+func TestDiskGuardEscalateArgs_NoFingerprint(t *testing.T) {
+	for _, a := range diskGuardEscalateArgs("HIGH", "/data", "low") {
+		if a == "--fingerprint" {
+			t.Fatal("escalation must not use fingerprint dedup: a suppressed retry can hide a lost alert")
+		}
 	}
 }
