@@ -282,7 +282,13 @@ func diskGuardBdTimeoutSec(timeout time.Duration) int {
 func runDiskGuardEscalation(gt, dir string, args []string, timeout time.Duration, logf func(string, ...interface{})) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return runDiskGuardEscalationCtx(ctx, gt, dir, args, timeout, logf)
+}
 
+// runDiskGuardEscalationCtx is runDiskGuardEscalation under a caller-supplied
+// context; timeout only sizes the bd timeout handed to gt. Canceling ctx takes
+// the same kill path as a deadline.
+func runDiskGuardEscalationCtx(ctx context.Context, gt, dir string, args []string, timeout time.Duration, logf func(string, ...interface{})) error {
 	cmd := exec.CommandContext(ctx, gt, args...) //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
