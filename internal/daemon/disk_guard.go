@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,20 +26,22 @@ const (
 	// escalates CRITICAL.
 	DefaultDiskCriticalFreeGB = 10.0
 
-	// DiskGuardWarnCooldown rate-limits repeat HIGH escalations.
-	DiskGuardWarnCooldown = time.Hour
+	// DiskGuardCriticalRepeat is how often a CRITICAL alert repeats while its
+	// episode lasts. HIGH never repeats.
+	DiskGuardCriticalRepeat = 15 * time.Minute
 
-	// DiskGuardCriticalCooldown rate-limits repeat CRITICAL escalations.
-	DiskGuardCriticalCooldown = 15 * time.Minute
+	// DiskGuardMaxAttempts is how many times one alert is attempted before the
+	// guard logs an error and stops until the next scheduled repeat or episode.
+	DiskGuardMaxAttempts = 3
 
-	// diskGuardRecoveryMargin is how far above the warn threshold free space
-	// must climb before the escalation throttle clears. It keeps a volume that
-	// hovers at the threshold (build output created and deleted, or macOS
-	// purgeable space shifting) from re-escalating on every dip.
+	// diskGuardRecoveryMargin is how far above a threshold free space must
+	// climb for an episode to end. It keeps a volume that hovers at the
+	// threshold (build output created and deleted, or macOS purgeable space
+	// shifting) from starting a new episode on every dip.
 	diskGuardRecoveryMargin = 1.1
 
-	// diskGuardEscalateGrace is how long a timed-out gt escalate process group
-	// gets after SIGTERM before SIGKILL.
+	// diskGuardEscalateGrace is how long a timed-out gt escalate session gets
+	// after SIGTERM before SIGKILL.
 	diskGuardEscalateGrace = 3 * time.Second
 
 	// diskGuardEscalateTimeout bounds the gt escalate subprocess; it runs inline
@@ -54,10 +57,41 @@ const (
 	diskCritical
 )
 
+// Disk-guard alert contract
+//
+//  1. Episodes. An episode for a path and a severity starts when free space
+//     falls below that severity's threshold and ends when it recovers above
+//     the threshold plus a 10% margin. A new dip after recovery is a new
+//     episode. Changing the watched path starts fresh episodes.
+//  2. Alerts. One escalation when an episode starts. CRITICAL repeats every
+//     15 minutes while free space stays below the critical threshold (the
+//     repeat is deliberate: it is also what recovers a lost alert). HIGH never
+//     repeats. A delivered CRITICAL covers HIGH for the same stretch, so
+//     dropping from critical back to the warn range is not announced again.
+//  3. Delivery. Bounded duplicates are acceptable; a lost alert is not. There
+//     is no duplicate-suppression key and no "suppressed" exit path. An alert
+//     counts as sent only after gt escalate exits 0. Any failure (non-zero
+//     exit or timeout) is retried on the next heartbeat, at most 3 attempts
+//     per alert; after that the guard logs an error naming the path and
+//     severity and stays quiet until the next scheduled CRITICAL repeat or the
+//     next episode.
+//  4. No orphans. gt runs in its own session and a timeout signals every
+//     process in it, including the bd children gt starts in their own process
+//     groups. gt's bd calls get a timeout below the outer one, so they end on
+//     their own first.
+
+// diskEpisode is one severity's alert state for the path being watched.
+type diskEpisode struct {
+	active   bool      // free space is below this severity's threshold (episode in progress)
+	due      time.Time // earliest time the next attempt may run; zero = nothing scheduled
+	attempts int       // failed attempts of the current alert
+	alertAt  time.Time // when the current alert was first attempted
+}
+
 // diskGuard escalates when free space on a volume drops below configured
-// thresholds. It holds only the escalation-throttling state; the free-space
-// reader and the escalator are injected so tests need neither a real
-// filesystem nor a gt binary.
+// thresholds, following the contract above. It holds only the per-episode
+// alert state; the free-space reader and the escalator are injected so tests
+// need neither a real filesystem nor a gt binary.
 type diskGuard struct {
 	config *DiskGuardConfig
 
@@ -65,10 +99,9 @@ type diskGuard struct {
 	escalate  func(severity, message string) error
 	logf      func(format string, args ...interface{})
 
-	// lastWarnAt and lastCriticalAt are when an escalation of that severity
-	// was last delivered; zero means none is outstanding.
-	lastWarnAt     time.Time
-	lastCriticalAt time.Time
+	path string
+	warn diskEpisode
+	crit diskEpisode
 }
 
 // thresholds returns the effective (warn, critical) free-space limits in GiB.
@@ -93,15 +126,8 @@ func (g *diskGuard) thresholds() (warn, critical float64) {
 	return warn, critical
 }
 
-// check reads free space at path and escalates if it is below a threshold.
-//
-// Throttling is per severity: a HIGH is suppressed for DiskGuardWarnCooldown
-// after any delivered escalation, a CRITICAL for DiskGuardCriticalCooldown
-// after a delivered CRITICAL. A first CRITICAL is therefore never held back by
-// an earlier HIGH. The throttle clears only once free space is back above the
-// warn threshold plus diskGuardRecoveryMargin, so a volume hovering at a
-// threshold does not escalate on every dip. Throttle state is committed only
-// after the escalation is delivered; a failed one is retried on the next tick.
+// check reads free space at path and sends whatever alert the contract calls
+// for. An alert is recorded as sent only after the escalation succeeds.
 func (g *diskGuard) check(path string, now time.Time) {
 	free, err := g.freeBytes(path)
 	if err != nil {
@@ -110,30 +136,33 @@ func (g *diskGuard) check(path string, now time.Time) {
 		return
 	}
 
+	if path != g.path {
+		g.path, g.warn, g.crit = path, diskEpisode{}, diskEpisode{}
+	}
+
 	warn, critical := g.thresholds()
 	freeGB := float64(free) / float64(1<<30)
 
-	level := diskOK
+	for _, e := range []struct {
+		ep    *diskEpisode
+		limit float64
+	}{{&g.warn, warn}, {&g.crit, critical}} {
+		switch {
+		case freeGB >= e.limit*diskGuardRecoveryMargin:
+			*e.ep = diskEpisode{}
+		case freeGB < e.limit && !e.ep.active:
+			*e.ep = diskEpisode{active: true, due: now}
+		}
+	}
+
+	severity, limit, ep := "HIGH", warn, &g.warn
 	switch {
 	case freeGB < critical:
-		level = diskCritical
-	case freeGB < warn:
-		level = diskWarn
-	}
-
-	if level == diskOK {
-		if freeGB >= warn*diskGuardRecoveryMargin {
-			g.lastWarnAt = time.Time{}
-			g.lastCriticalAt = time.Time{}
-		}
+		severity, limit, ep = "CRITICAL", critical, &g.crit
+	case freeGB >= warn:
 		return
 	}
-
-	severity, limit := "HIGH", warn
-	if level == diskCritical {
-		severity, limit = "CRITICAL", critical
-	}
-	if g.throttled(level, now) {
+	if !ep.active || ep.due.IsZero() || now.Before(ep.due) {
 		return
 	}
 
@@ -142,28 +171,37 @@ func (g *diskGuard) check(path string, now time.Time) {
 		"(stale build output in polecat scratch directories is the usual culprit).",
 		util.FormatBytesHuman(free), path, limit)
 	g.logf("disk_guard: %s: %s", severity, msg)
+
+	if ep.attempts == 0 {
+		ep.alertAt = now
+	}
 	if err := g.escalate(severity, msg); err != nil {
-		g.logf("disk_guard: %s escalation not delivered, will retry next tick: %v", severity, err)
+		ep.attempts++
+		if ep.attempts < DiskGuardMaxAttempts {
+			g.logf("disk_guard: %s escalation for %s not delivered (attempt %d of %d), retrying next heartbeat: %v",
+				severity, path, ep.attempts, DiskGuardMaxAttempts, err)
+			return
+		}
+		ep.attempts = 0
+		ep.due = time.Time{}
+		next := "the next episode"
+		if severity == "CRITICAL" {
+			ep.due = ep.alertAt.Add(DiskGuardCriticalRepeat)
+			next = "the next scheduled repeat"
+		}
+		g.logf("disk_guard: ERROR: giving up on %s alert for %s after %d failed attempts; no further attempts until %s: %v",
+			severity, path, DiskGuardMaxAttempts, next, err)
 		return
 	}
-	if level == diskCritical {
-		g.lastCriticalAt = now
-	} else {
-		g.lastWarnAt = now
-	}
-}
 
-// throttled reports whether an escalation at level is still inside the
-// cooldown of a delivered one. A delivered CRITICAL also quiets HIGH: dropping
-// from critical to warn is an improvement, not news.
-func (g *diskGuard) throttled(level diskLevel, now time.Time) bool {
-	within := func(at time.Time, cooldown time.Duration) bool {
-		return !at.IsZero() && now.Sub(at) < cooldown
+	ep.attempts = 0
+	if severity == "CRITICAL" {
+		ep.due = now.Add(DiskGuardCriticalRepeat)
+		// A delivered CRITICAL covers HIGH while free space is still low.
+		g.warn.due, g.warn.attempts = time.Time{}, 0
+	} else {
+		ep.due = time.Time{}
 	}
-	if level == diskCritical {
-		return within(g.lastCriticalAt, DiskGuardCriticalCooldown)
-	}
-	return within(g.lastWarnAt, DiskGuardWarnCooldown) || within(g.lastCriticalAt, DiskGuardWarnCooldown)
 }
 
 // resolveDiskGuardPath returns the path whose volume is checked: the
@@ -216,41 +254,43 @@ func (d *Daemon) checkDiskFree() {
 		_, err := os.Stat(p)
 		return err == nil
 	})
-	d.diskGuard.escalate = func(severity, message string) error {
-		return d.escalateDiskFree(severity, path, message)
-	}
+	d.diskGuard.escalate = d.escalateDiskFree
 	d.diskGuard.check(path, time.Now())
 }
 
 // diskGuardEscalateArgs builds the gt escalate argument list for a disk alert.
-//
-// The fingerprint is gt escalate's duplicate-suppression key: while an open
-// escalation carries it, a repeat call files nothing and exits 0. gt escalate
-// can write the bead and mail and still exit non-zero (a configured email/sms
-// contact is missing, or the timeout fires after the write), so a retry after
-// such an exit must find the first escalation rather than file another. The
-// key is built from path and severity only; the free-bytes text changes every
-// tick and would defeat it.
-func diskGuardEscalateArgs(severity, path, message string) []string {
-	return []string{"escalate", "-s", severity,
-		"--fingerprint", "disk_guard:" + path + ":" + severity,
-		"Disk: " + message}
+// It deliberately carries no --fingerprint: a duplicate-suppressed exit 0 would
+// count as delivered even when the original attempt wrote the bead but never
+// sent mail, and a lost alert is worse than a bounded duplicate.
+func diskGuardEscalateArgs(severity, message string) []string {
+	return []string{"escalate", "-s", severity, "Disk: " + message}
 }
 
-// runDiskGuardEscalation runs gt with args in dir, bounded by timeout.
+// diskGuardBdTimeoutSec is the timeout handed to the bd calls gt makes: half
+// the outer timeout, so a hung bd ends on its own before the outer kill.
+func diskGuardBdTimeoutSec(timeout time.Duration) int {
+	if n := int(timeout / 2 / time.Second); n > 1 {
+		return n
+	}
+	return 1
+}
+
+// runDiskGuardEscalation runs gt with args in dir, bounded by timeout. Any
+// non-zero exit or deadline is an error.
 func runDiskGuardEscalation(gt, dir string, args []string, timeout time.Duration, logf func(string, ...interface{})) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, gt, args...) //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
-	// On timeout, signal the whole process group (TERM, then KILL after the
-	// grace period). Killing only gt would leave a hung bd/dolt grandchild
-	// holding a Dolt connection, once per retry.
-	util.SetGracefulProcessGroup(cmd, diskGuardEscalateGrace)
+	cmd.Env = append(os.Environ(),
+		"BD_ACTOR=daemon",
+		"GT_BD_TIMEOUT_SEC="+strconv.Itoa(diskGuardBdTimeoutSec(timeout)))
+	// gt starts each bd in its own process group, so a group kill of gt alone
+	// would orphan a hung bd: run gt in its own session and signal all of it.
+	setEscalationSession(cmd, diskGuardEscalateGrace)
 	// WaitDelay is the backstop that closes the output pipes if a descendant
-	// outlives the group signal.
+	// outlives the signal.
 	cmd.WaitDelay = 5 * time.Second
 	if output, err := cmd.CombinedOutput(); err != nil {
 		logf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
@@ -260,11 +300,11 @@ func runDiskGuardEscalation(gt, dir string, args []string, timeout time.Duration
 }
 
 // escalateDiskFree files an escalation via gt escalate at the given severity.
-func (d *Daemon) escalateDiskFree(severity, path, message string) error {
+func (d *Daemon) escalateDiskFree(severity, message string) error {
 	gt := d.gtPath
 	if gt == "" {
 		gt = "gt"
 	}
 	return runDiskGuardEscalation(gt, d.config.TownRoot,
-		diskGuardEscalateArgs(severity, path, message), diskGuardEscalateTimeout, d.logger.Printf)
+		diskGuardEscalateArgs(severity, message), diskGuardEscalateTimeout, d.logger.Printf)
 }

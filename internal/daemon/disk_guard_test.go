@@ -488,7 +488,7 @@ func TestDiskGuard_EpisodesArePerPath(t *testing.T) {
 }
 
 func TestDiskGuardEscalateArgs_NoFingerprint(t *testing.T) {
-	for _, a := range diskGuardEscalateArgs("HIGH", "/data", "low") {
+	for _, a := range diskGuardEscalateArgs("HIGH", "low") {
 		if a == "--fingerprint" {
 			t.Fatal("escalation must not use fingerprint dedup: a suppressed retry can hide a lost alert")
 		}
