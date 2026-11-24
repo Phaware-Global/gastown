@@ -37,6 +37,10 @@ const (
 	// purgeable space shifting) from re-escalating on every dip.
 	diskGuardRecoveryMargin = 1.1
 
+	// diskGuardEscalateGrace is how long a timed-out gt escalate process group
+	// gets after SIGTERM before SIGKILL.
+	diskGuardEscalateGrace = 3 * time.Second
+
 	// diskGuardEscalateTimeout bounds the gt escalate subprocess; it runs inline
 	// on the heartbeat path.
 	diskGuardEscalateTimeout = 20 * time.Second
@@ -219,8 +223,18 @@ func (d *Daemon) checkDiskFree() {
 }
 
 // diskGuardEscalateArgs builds the gt escalate argument list for a disk alert.
+//
+// The fingerprint is gt escalate's duplicate-suppression key: while an open
+// escalation carries it, a repeat call files nothing and exits 0. gt escalate
+// can write the bead and mail and still exit non-zero (a configured email/sms
+// contact is missing, or the timeout fires after the write), so a retry after
+// such an exit must find the first escalation rather than file another. The
+// key is built from path and severity only; the free-bytes text changes every
+// tick and would defeat it.
 func diskGuardEscalateArgs(severity, path, message string) []string {
-	return []string{"escalate", "-s", severity, "Disk: " + message}
+	return []string{"escalate", "-s", severity,
+		"--fingerprint", "disk_guard:" + path + ":" + severity,
+		"Disk: " + message}
 }
 
 // runDiskGuardEscalation runs gt with args in dir, bounded by timeout.
@@ -231,9 +245,12 @@ func runDiskGuardEscalation(gt, dir string, args []string, timeout time.Duration
 	cmd := exec.CommandContext(ctx, gt, args...) //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
-	util.SetDetachedProcessGroup(cmd)
-	// The context deadline alone does not bound a child whose grandchild
-	// (bd, dolt) keeps the output pipe open; WaitDelay does.
+	// On timeout, signal the whole process group (TERM, then KILL after the
+	// grace period). Killing only gt would leave a hung bd/dolt grandchild
+	// holding a Dolt connection, once per retry.
+	util.SetGracefulProcessGroup(cmd, diskGuardEscalateGrace)
+	// WaitDelay is the backstop that closes the output pipes if a descendant
+	// outlives the group signal.
 	cmd.WaitDelay = 5 * time.Second
 	if output, err := cmd.CombinedOutput(); err != nil {
 		logf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
