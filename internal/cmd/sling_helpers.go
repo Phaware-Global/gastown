@@ -930,7 +930,8 @@ func nudgeRefinery(rigName, message string, extraPayload ...string) {
 	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", refineryNudgePayload(message, extraPayload...))
+		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT",
+			append(refineryNudgePayload(message, extraPayload...), "rig="+rigName))
 	}
 
 	t := tmux.NewTmux()

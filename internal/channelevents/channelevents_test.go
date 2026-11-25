@@ -113,3 +113,22 @@ func TestEmitToTown_CreatesDirectory(t *testing.T) {
 		t.Errorf("channel dir should exist after emit: %v", err)
 	}
 }
+
+func TestEmitToTown_RigScopedChannel(t *testing.T) {
+	t.Parallel()
+	town := t.TempDir()
+
+	path, err := EmitToTown(town, "refinery", "MQ_SUBMIT", []string{"rig=alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(town, "events", "refinery", "alpha"); filepath.Dir(path) != want {
+		t.Errorf("event dir = %q, want %q", filepath.Dir(path), want)
+	}
+
+	for _, pairs := range [][]string{nil, {"rig="}, {"rig=../escape"}} {
+		if _, err := EmitToTown(town, "refinery", "MQ_SUBMIT", pairs); err == nil {
+			t.Errorf("payload %v: expected an error", pairs)
+		}
+	}
+}
