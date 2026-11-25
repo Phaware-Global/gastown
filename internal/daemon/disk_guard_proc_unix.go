@@ -4,35 +4,46 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // setEscalationSession runs cmd as the leader of a new session and makes a
 // context timeout take down everything gt started: SIGTERM to its whole
-// process tree at once, then SIGKILL to whatever survives after grace.
+// process tree at once, then SIGKILL to whatever survives after grace. logf
+// reports a failed process listing, which can leave descendants running.
 //
 // A process-group kill is not enough. gt starts each bd in its own process
 // group, so kill(-gtpid) misses it, and a hung bd would be orphaned on every
 // retry. The tree is found by walking parent pids from gt while gt is still
-// alive (pgrep -s and ps's session column are not portable to macOS, and
-// once gt dies its children reparent and can no longer be traced to it).
-func setEscalationSession(cmd *exec.Cmd, grace time.Duration) {
+// alive. A second look after SIGTERM catches anything started after that
+// snapshot: once gt dies its children reparent, so they are matched by session
+// ID as well as by ancestry.
+func setEscalationSession(cmd *exec.Cmd, grace time.Duration, logf func(string, ...interface{})) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
 		root := cmd.Process.Pid
-		tree := processTree(root)
+		procs := listProcessesLogged(logf)
+		tree := processTree(procs, root)
 		_ = syscall.Kill(-root, syscall.SIGTERM) // same-group stragglers
 		for _, p := range tree {
 			_ = syscall.Kill(p.pid, syscall.SIGTERM)
 		}
-		time.AfterFunc(grace, func() { killSurvivors(root, tree) })
+		late := lateProcesses(listProcessesLogged(logf), root, tree)
+		for _, p := range late {
+			_ = syscall.Kill(p.pid, syscall.SIGTERM)
+		}
+		all := append(tree, late...)
+		time.AfterFunc(grace, func() { killSurvivors(root, all, logf) })
 		return nil
 	}
 }
@@ -45,12 +56,12 @@ type procInfo struct {
 }
 
 // listProcesses returns every process keyed by pid.
-func listProcesses() map[int]procInfo {
+func listProcesses() (map[int]procInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=,lstart=").Output()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ps: %w", err)
 	}
 	procs := map[int]procInfo{}
 	for _, line := range strings.Split(string(out), "\n") {
@@ -65,12 +76,21 @@ func listProcesses() map[int]procInfo {
 		}
 		procs[pid] = procInfo{pid: pid, ppid: ppid, started: strings.Join(f[2:], " ")}
 	}
+	return procs, nil
+}
+
+// listProcessesLogged is listProcesses for the kill path, which carries on
+// without a listing but must say that it did.
+func listProcessesLogged(logf func(string, ...interface{})) map[int]procInfo {
+	procs, err := listProcesses()
+	if err != nil {
+		logf("disk_guard: cannot list processes, descendants of gt may be left running: %v", err)
+	}
 	return procs
 }
 
-// processTree returns root and all of its descendants.
-func processTree(root int) []procInfo {
-	procs := listProcesses()
+// processTree returns root and all of its descendants found in procs.
+func processTree(procs map[int]procInfo, root int) []procInfo {
 	children := map[int][]int{}
 	for _, p := range procs {
 		children[p.ppid] = append(children[p.ppid], p.pid)
@@ -93,10 +113,37 @@ func processTree(root int) []procInfo {
 	return tree
 }
 
+// lateProcesses returns the members of procs that are not in known but belong
+// to root's session or descend from a process in known.
+func lateProcesses(procs map[int]procInfo, root int, known []procInfo) []procInfo {
+	seen := map[int]bool{}
+	for _, p := range known {
+		seen[p.pid] = true
+	}
+	var late []procInfo
+	add := func(p procInfo) {
+		if !seen[p.pid] {
+			seen[p.pid] = true
+			late = append(late, p)
+		}
+	}
+	for _, p := range known {
+		for _, d := range processTree(procs, p.pid) {
+			add(d)
+		}
+	}
+	for pid, p := range procs {
+		if sid, err := unix.Getsid(pid); err == nil && sid == root {
+			add(p)
+		}
+	}
+	return late
+}
+
 // killSurvivors SIGKILLs the members of tree that are still the same
 // processes (same pid and start time), plus gt's process group if gt is.
-func killSurvivors(root int, tree []procInfo) {
-	procs := listProcesses()
+func killSurvivors(root int, tree []procInfo, logf func(string, ...interface{})) {
+	procs := listProcessesLogged(logf)
 	for _, p := range tree {
 		cur, ok := procs[p.pid]
 		if !ok || cur.started != p.started {
