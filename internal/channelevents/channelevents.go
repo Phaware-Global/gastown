@@ -91,6 +91,10 @@ func Payload(pairs []string) map[string]string {
 
 // emitToDir writes an event file to the given directory.
 func emitToDir(eventDir, channel, eventType string, payload map[string]string) (string, error) {
+	if !ValidChannelName.MatchString(channel) {
+		return "", fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
+	}
+
 	now := time.Now()
 	event := map[string]interface{}{
 		"type":      eventType,
