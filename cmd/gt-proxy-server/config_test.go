@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -198,4 +199,35 @@ func TestParseAllowedSubcmdsRoundTrip(t *testing.T) {
 		reparsed := parseAllowedSubcmds(built)
 		assert.Empty(t, reparsed, "empty sub-list is lost on round-trip")
 	})
+}
+
+// gt done runs through the proxy for a remote polecat and pushes, opens a PR
+// and updates beads: the 60s default can be too short, so it is configurable.
+func TestLoadConfig_ExecTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"exec_timeout":"4m"}`), 0600))
+	cfg, err := loadConfig(path)
+	require.NoError(t, err)
+
+	d, err := cfg.execTimeout()
+	require.NoError(t, err)
+	assert.Equal(t, 4*time.Minute, d)
+
+	d, err = ProxyConfig{}.execTimeout()
+	require.NoError(t, err)
+	assert.Zero(t, d, "unset keeps the server default")
+
+	_, err = ProxyConfig{ExecTimeout: "soon"}.execTimeout()
+	require.Error(t, err)
+
+	// Not positive: it would remove the per-command deadline altogether.
+	for _, v := range []string{"-1s", "0s"} {
+		_, err = ProxyConfig{ExecTimeout: v}.execTimeout()
+		require.Error(t, err, v)
+	}
+	// At or above the five-minute transport ceiling: it could never take effect.
+	for _, v := range []string{"5m", "10m"} {
+		_, err = ProxyConfig{ExecTimeout: v}.execTimeout()
+		require.Error(t, err, v)
+	}
 }

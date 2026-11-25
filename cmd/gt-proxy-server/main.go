@@ -22,7 +22,7 @@ import (
 // defaultAllowedSubcmds lists the safe subcommands for gt and bd.
 // Dangerous subcommands (e.g. gt polecat, gt rig, gt admin, gt nuke) are excluded.
 const defaultAllowedSubcmds = "" +
-	"gt:prime,hook,done,mail,nudge,mol,status,handoff,version,convoy,sling;" +
+	"gt:prime,hook,done,mail,nudge,mol,status,handoff,version,convoy,sling,tap,escalate;" +
 	"bd:create,update,close,show,list,ready,dep,export,prime,stats,blocked,doctor"
 
 func main() {
@@ -127,7 +127,14 @@ func main() {
 		}
 	}
 
+	execTimeout, err := fileCfg.execTimeout()
+	if err != nil {
+		slog.Error("invalid config", "path", cfgPath, "err", err)
+		os.Exit(1)
+	}
+
 	cfg := proxy.Config{
+		ExecTimeout:        execTimeout,
 		ListenAddr:         *listen,
 		AdminListenAddr:    *adminListen,
 		AllowedCommands:    cmds,

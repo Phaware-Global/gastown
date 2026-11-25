@@ -15,6 +15,9 @@ import (
 // execRequest is the body for POST /v1/exec.
 type execRequest struct {
 	Argv []string `json:"argv"`
+	// Stdin is fed to the subprocess. Hook handlers (gt tap guard …) read the
+	// agent's tool input from it. It shares the 1 MiB request-body limit.
+	Stdin string `json:"stdin,omitempty"`
 }
 
 // execResponse is the response for POST /v1/exec.
@@ -107,7 +110,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		execCtx, cancel = context.WithTimeout(execCtx, s.execTimeout)
 		defer cancel()
 	}
-	out, errOut, exitCode := runCommand(execCtx, argv, identity, s.sessionIdentityEnv(identity), envOverride)
+	out, errOut, exitCode := runCommandStdin(execCtx, argv, identity, s.sessionIdentityEnv(identity), req.Stdin, envOverride)
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
 	if exitCode == 0 {
@@ -211,7 +214,14 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 }
 
 func runCommand(ctx context.Context, argv []string, identity string, sessionEnv []string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
+	return runCommandStdin(ctx, argv, identity, sessionEnv, "", envOverride...)
+}
+
+// runCommandStdin is runCommand with the subprocess's stdin set to stdin. An
+// empty stdin is an empty stream, never the server's own stdin.
+func runCommandStdin(ctx context.Context, argv []string, identity string, sessionEnv []string, stdin string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdin = strings.NewReader(stdin)
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
