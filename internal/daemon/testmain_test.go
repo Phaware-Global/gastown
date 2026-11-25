@@ -11,7 +11,16 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
+// helperProcessHook, when set by a test file, runs before any package setup
+// and does not return if this process was re-exec'd as a test helper. Helper
+// processes must not start a Dolt container or touch tmux.
+var helperProcessHook func()
+
 func TestMain(m *testing.M) {
+	if helperProcessHook != nil {
+		helperProcessHook()
+	}
+
 	// Start an ephemeral Dolt container for this package's tests.
 	// convoy_manager_test.go calls setupTestStore which sets BEADS_TEST_MODE=1,
 	// causing the beads SDK to create testdb_<hash> databases. By routing

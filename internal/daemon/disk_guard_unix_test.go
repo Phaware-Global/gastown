@@ -1,0 +1,205 @@
+//go:build !windows
+
+package daemon
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// writeFakeGt writes an executable shell script standing in for gt. Tests
+// never run the real gt, so they can never file a live escalation or mail.
+func writeFakeGt(t *testing.T, dir, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-gt")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
+}
+
+func readTrimmed(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// The fake gt writes its state and then hangs past the timeout, like a gt
+// escalate that wrote the bead and was stuck before sending mail. The alert is
+// not delivered: it must be retried on the next heartbeat, and the retries
+// must stop after 3 attempts.
+func TestDiskGuardEscalation_HangAfterWriteIsRetriedThreeTimesThenStops(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	gt := writeFakeGt(t, dir, "echo wrote >> "+calls+"\nexec sleep 300\n")
+
+	free := 20 * gib
+	g, _ := newTestDiskGuard(&free, nil, nil)
+	g.escalate = func(severity, message string) error {
+		return runDiskGuardEscalation(gt, dir, []string{"escalate"}, 300*time.Millisecond, func(string, ...interface{}) {})
+	}
+	now := time.Now()
+	g.check("/data", now)
+	if n := countLines(t, calls); n != 1 {
+		t.Fatalf("first attempt: gt called %d times", n)
+	}
+	g.check("/data", now.Add(3*time.Minute))
+	if n := countLines(t, calls); n != 2 {
+		t.Fatalf("a timed-out alert is not sent; it must be retried next heartbeat, gt called %d times", n)
+	}
+	for i := 2; i < 8; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Minute))
+	}
+	if n := countLines(t, calls); n != 3 {
+		t.Fatalf("retries must stop after 3 attempts, gt called %d times", n)
+	}
+}
+
+// zombieOrGone reports whether pid no longer runs: it does not exist, or it is
+// a zombie waiting for a reaper (a killed process whose parent died stays a
+// zombie in a container without an init that reaps).
+func zombieOrGone(pid int) bool {
+	if syscall.Kill(pid, 0) != nil {
+		return true
+	}
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	return err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+const helperEnv = "GT_DISKGUARD_TEST_HELPER"
+
+func init() { helperProcessHook = runDiskGuardHelper }
+
+// runDiskGuardHelper is the body of the fake gt's helper process. The fake gt
+// re-execs the test binary into it (the usual Go helper-process pattern, run
+// from TestMain before any setup) so the process topology does not depend on
+// shell job control, which differs between shells and platforms. As gt does
+// with bd, it starts its child with Setpgid, so the child leads a process
+// group of its own. It returns immediately in an ordinary test run.
+func runDiskGuardHelper() {
+	dir := os.Getenv(helperEnv)
+	if dir == "" {
+		return
+	}
+	child := exec.Command("sleep", "300")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		os.Exit(3)
+	}
+	childPgid, _ := syscall.Getpgid(child.Process.Pid)
+	record := map[string]int{
+		"pid":        child.Process.Pid,
+		"pgid":       childPgid,
+		"parentpgid": syscall.Getpgrp(),
+	}
+	for name, v := range record {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strconv.Itoa(v)), 0o644); err != nil {
+			os.Exit(4)
+		}
+	}
+	_ = child.Wait()
+	os.Exit(0)
+}
+
+// writeHelperGt writes a fake gt that re-execs this test binary into the
+// helper process above (selected by helperEnv).
+func writeHelperGt(t *testing.T, dir string) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return writeFakeGt(t, dir, "exec '"+exe+"'\n")
+}
+
+// bd is started by gt in its own process group, so a group kill of gt alone
+// misses it. The fake gt starts a grandchild the same way, and a timeout must
+// still take it down.
+func TestDiskGuardEscalation_TimeoutKillsGrandchildInItsOwnProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(helperEnv, dir)
+	gt := writeHelperGt(t, dir)
+
+	// Cancel only after the helper has recorded its topology; the test binary
+	// takes about a second to start, so a short timeout would race it. A
+	// cancelled context takes the same kill path as a deadline.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDiskGuardEscalationCtx(ctx, gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {})
+	}()
+	ready := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "parentpgid")); err == nil {
+			break
+		}
+		if time.Now().After(ready) {
+			cancel()
+			t.Fatal("helper never recorded its topology")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // let the other record files land
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("a cancelled escalation must report an error")
+	}
+
+	read := func(name string) int {
+		n, perr := strconv.Atoi(readTrimmed(t, filepath.Join(dir, name)))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		return n
+	}
+	pid, pgid, parentPgid := read("pid"), read("pgid"), read("parentpgid")
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	if pgid != pid || pgid == parentPgid {
+		t.Fatalf("test topology is wrong: grandchild pid %d pgid %d must lead its own group, distinct from gt's group %d", pid, pgid, parentPgid)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if zombieOrGone(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("grandchild pid %d (own process group) survived the escalation timeout", pid)
+}
+
+func TestDiskGuardEscalation_BdTimeoutIsBelowOuterTimeout(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "env")
+	gt := writeFakeGt(t, dir, "echo \"$GT_BD_TIMEOUT_SEC\" > "+out+"\n")
+	if err := runDiskGuardEscalation(gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := strconv.Atoi(readTrimmed(t, out))
+	if err != nil || n <= 0 || n >= 20 {
+		t.Fatalf("GT_BD_TIMEOUT_SEC = %q, want a positive integer below the 20s outer timeout", readTrimmed(t, out))
+	}
+}
