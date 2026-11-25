@@ -125,6 +125,17 @@ func runDiskGuardHelper() {
 			os.Exit(4)
 		}
 	}
+	// A second child in the helper's own process group, which a group kill
+	// reaches.
+	peer := exec.Command("sleep", "300")
+	if err := peer.Start(); err != nil {
+		os.Exit(3)
+	}
+	for name, v := range map[string]int{"gtpid": os.Getpid(), "peerpid": peer.Process.Pid} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strconv.Itoa(v)), 0o644); err != nil {
+			os.Exit(4)
+		}
+	}
 	go spawnLateChild(dir)
 	_ = child.Wait()
 	os.Exit(0)
@@ -190,6 +201,26 @@ func writeFakePs(t *testing.T, dir string) {
 		": > " + q("spawn") + "\n" +
 		"while [ ! -e " + q("latepid") + " ]; do sleep 0.01; done\n" +
 		"printf '%s\\n' \"$out\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// writeReusedRootPs puts a ps on PATH that, once the "armed" file exists,
+// reports another start time for the helper's pid, as if gt had been reaped and
+// its pid given to a new process.
+func writeReusedRootPs(t *testing.T, dir string) {
+	t.Helper()
+	realPs, err := exec.LookPath("ps")
+	if err != nil {
+		t.Skipf("no ps: %v", err)
+	}
+	q := func(name string) string { return "'" + filepath.Join(dir, name) + "'" }
+	script := "#!/bin/sh\n" +
+		"if [ ! -e " + q("armed") + " ]; then exec " + realPs + " \"$@\"; fi\n" +
+		"read -r gt < " + q("gtpid") + "\n" +
+		realPs + " \"$@\" | awk -v gt=\"$gt\" '$1 == gt { $0 = $1 \" \" $2 \" reused\" } { print }'\n"
 	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -451,6 +482,29 @@ func TestLateProcesses(t *testing.T) {
 		}
 		if got := lateProcesses(procs, root, known); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: got %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Cancel can run after Wait has reaped gt, so gt's pid may name an unrelated
+// process by the time it is signaled. That process's group, descendants and
+// session must be left alone.
+func TestDiskGuardEscalation_ReusedRootPidIsNotSignaled(t *testing.T) {
+	dir := t.TempDir()
+	writeReusedRootPs(t, dir)
+	cancelHelperEscalation(t, dir)
+
+	for name, what := range map[string]string{
+		"peerpid": "a member of its process group",
+		"pid":     "its child in another group of its session",
+	} {
+		pid, err := strconv.Atoi(readTrimmed(t, filepath.Join(dir, name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+		if zombieOrGone(pid) {
+			t.Errorf("%s (pid %d) was signaled through a reused pid", what, pid)
 		}
 	}
 }
