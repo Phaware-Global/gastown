@@ -137,6 +137,24 @@ esac
 	assertProcessExits(t, childPIDPath)
 }
 
+// killRecordedProcess kills the process recorded in pidPath, if it is still running.
+func killRecordedProcess(t *testing.T, pidPath string) {
+	t.Helper()
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Errorf("read child pid: %v", err)
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Errorf("parse child pid %q: %v", data, err)
+		return
+	}
+	if process, err := os.FindProcess(pid); err == nil {
+		_ = process.Kill() // fails harmlessly if it already exited
+	}
+}
+
 // assertProcessExits waits for the process recorded in pidPath to go away.
 func assertProcessExits(t *testing.T, pidPath string) {
 	t.Helper()
@@ -189,13 +207,23 @@ esac
 }
 
 func TestCheckPendingEscalations_BoundsSlowBdList(t *testing.T) {
+	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
+	// A bd timeout kills only the direct process, so the background sleep
+	// outlives it holding stdout open: only WaitDelay can end the call.
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
-	  "list --status=open --tag=escalation --json --flat") exec sleep `+slowToolSleep+` ;;
+	  "list --status=open --tag=escalation --json --flat")
+	sleep `+slowToolSleep+` &
+	echo $! > "$PRIME_CHILD_PID"
+	wait
+	exit 0
+	;;
 esac
 `, `
 `)
 	shortenPrimeToolTimeout(t)
+	t.Setenv("PRIME_CHILD_PID", childPIDPath)
+	t.Cleanup(func() { killRecordedProcess(t, childPIDPath) })
 
 	start := time.Now()
 	output := captureStdout(t, func() {
