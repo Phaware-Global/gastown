@@ -699,7 +699,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if parts := strings.Split(sender, "/"); len(parts) >= 2 {
 		polecatName = parts[len(parts)-1]
 	}
-	worker = preferKnownWorker(branch, worker, polecatName)
 
 	var assignedIssueIDs []string
 	loadAssignedIssueIDs := func() []string {
@@ -737,6 +736,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("branch %q embeds issue %s but %s has multiple active assignments; use --issue to disambiguate", branch, info.Issue, sender)
 		}
 	}
+
+	worker = preferKnownWorker(branch, worker, polecatName, issueID)
 
 	// Write done-intent label EARLY, before push/MR operations.
 	// If gt done crashes after this point, the Witness can detect the intent
@@ -1419,7 +1420,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					prBodyBuilder.WriteString("```\n\n")
 				}
 				prBodyBuilder.WriteString("---\n")
-				prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
+				footer := "Issue: " + issueID
+				if worker != "" {
+					footer = "Polecat: " + worker + " | " + footer
+				}
+				prBodyBuilder.WriteString("*" + footer + "*\n")
 				prBody := prBodyBuilder.String()
 
 				ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",

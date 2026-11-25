@@ -139,7 +139,10 @@ case " $* " in
   *) echo '[]' ;;
 esac
 `, 0o755)
-	writeFile(filepath.Join(binDir, "tmux"), "#!/bin/sh\nexit 1\n", 0o755)
+	// Keep notifications and GitHub calls away from whatever the host has.
+	for _, tool := range []string{"gt", "gh", "tmux"} {
+		writeFile(filepath.Join(binDir, tool), "#!/bin/sh\nexit 1\n", 0o755)
+	}
 	writeFile(filepath.Join(root, "gitconfig"),
 		"[user]\n\tname = Test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n", 0o644)
 

@@ -58,18 +58,7 @@ func parseBranchName(branch string) branchInfo {
 		// polecat/<worker>-<timestamp> or polecat/<worker>-<bead-id>. Neither
 		// yields an issue here: gt done uses the hook_bead fallback.
 		if len(parts) == 2 {
-			// A timestamp has no hyphen, so everything before it is the
-			// worker. A bead ID does, so the worker ends at the first hyphen;
-			// that truncates hyphenated names, which preferKnownWorker covers.
-			rest := parts[1]
-			info.Worker = rest
-			if last := strings.LastIndex(rest, "-"); last > 0 {
-				end := last
-				if !branchTimestampPattern.MatchString(rest[last+1:]) {
-					end = strings.Index(rest, "-")
-				}
-				info.Worker = rest[:end]
-			}
+			info.Worker = flatBranchWorker(parts[1])
 			return info
 		}
 	}
@@ -83,13 +72,41 @@ func parseBranchName(branch string) branchInfo {
 	return info
 }
 
-// preferKnownWorker returns polecat when branch is one of that polecat's
-// polecat/<worker>-<suffix> branches, and parsed otherwise. A branch name alone
-// cannot say where a hyphenated worker name ends and a bead ID begins.
-func preferKnownWorker(branch, parsed, polecat string) string {
-	rest, ok := strings.CutPrefix(branch, constants.BranchPolecatPrefix)
-	if ok && polecat != "" && !strings.Contains(rest, "/") && strings.HasPrefix(rest, polecat+"-") {
-		return polecat
+// flatBranchWorker returns the worker in <worker>-<timestamp> or
+// <worker>-<bead-id>, or "" when more than one worker/bead-ID split is possible,
+// as in bullet-farmer-gt-abc. A wrong name is worse than none: the worker is
+// sent the merge request's failure notices.
+func flatBranchWorker(rest string) string {
+	last := strings.LastIndex(rest, "-")
+	if last <= 0 {
+		return rest
+	}
+	if branchTimestampPattern.MatchString(rest[last+1:]) {
+		return rest[:last]
+	}
+	var owners []string
+	for i := 1; i < len(rest); i++ {
+		if rest[i] == '-' && beadIDPattern.MatchString(rest[i+1:]) {
+			owners = append(owners, rest[:i])
+		}
+	}
+	switch len(owners) {
+	case 0:
+		return rest[:last]
+	case 1:
+		return owners[0]
+	default:
+		return ""
+	}
+}
+
+// preferKnownWorker returns caller when branch is exactly
+// polecat/<caller>-<issue>, the branch gt polecat checkout-branch creates for
+// that caller and issue, and parsed otherwise. Matching only the caller's name
+// as a prefix would let "bullet" claim a branch of "bullet-farmer".
+func preferKnownWorker(branch, parsed, caller, issue string) string {
+	if caller != "" && issue != "" && branch == constants.BranchPolecatPrefix+caller+"-"+issue {
+		return caller
 	}
 	return parsed
 }
@@ -171,7 +188,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	if issueID == "" {
 		issueID = info.Issue
 	}
-	worker := preferKnownWorker(branch, info.Worker, os.Getenv("GT_POLECAT"))
+	worker := preferKnownWorker(branch, info.Worker, os.Getenv("GT_POLECAT"), issueID)
 
 	if issueID == "" {
 		return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)

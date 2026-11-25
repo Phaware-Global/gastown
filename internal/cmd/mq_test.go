@@ -455,21 +455,26 @@ func TestParseBranchNameWorker(t *testing.T) {
 
 func TestPreferKnownWorker(t *testing.T) {
 	tests := []struct {
-		branch  string
-		polecat string
-		want    string
+		branch string
+		caller string
+		issue  string
+		want   string
 	}{
-		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "bullet-farmer"},
-		{"polecat/bullet-farmer-gt-wfs-abc12", "bullet-farmer", "bullet-farmer"},
-		// Another polecat's branch, or no known polecat: keep the parsed name.
-		{"polecat/keeper-gt-abc12", "nux", "keeper"},
-		{"polecat/keeper-gt-abc12", "", "keeper"},
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "gt-abc12", "bullet-farmer"},
+		{"polecat/keeper-gt-wfs-abc12", "keeper", "gt-wfs-abc12", "keeper"},
+		// A shorter prefix of the owner's name never matches.
+		{"polecat/bullet-farmer-gt-abc12", "bullet", "gt-abc12", ""},
+		{"polecat/bullet-farmer-mk0vro62", "bullet", "gt-abc12", "bullet-farmer"},
+		// No known caller or issue, or another issue's branch: keep the parse.
+		{"polecat/keeper-gt-abc12", "", "gt-abc12", "keeper"},
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "", ""},
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "gt-zzz99", ""},
 		// The slash form names the worker unambiguously.
-		{"polecat/dog-alpha/gt-abc12", "dog", "dog-alpha"},
+		{"polecat/dog-alpha/gt-abc12", "dog", "gt-abc12", "dog-alpha"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.branch+" as "+tt.polecat, func(t *testing.T) {
-			got := preferKnownWorker(tt.branch, parseBranchName(tt.branch).Worker, tt.polecat)
+		t.Run(tt.branch+" as "+tt.caller+" on "+tt.issue, func(t *testing.T) {
+			got := preferKnownWorker(tt.branch, parseBranchName(tt.branch).Worker, tt.caller, tt.issue)
 			if got != tt.want {
 				t.Errorf("worker = %q, want %q", got, tt.want)
 			}
