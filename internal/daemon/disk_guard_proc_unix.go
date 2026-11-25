@@ -128,6 +128,9 @@ func lateProcesses(procs map[int]procInfo, root int, known []procInfo) []procInf
 		}
 	}
 	for _, p := range known {
+		if cur, ok := procs[p.pid]; !ok || cur.started != p.started {
+			continue // exited, or the pid now names another process
+		}
 		for _, d := range processTree(procs, p.pid) {
 			add(d)
 		}
