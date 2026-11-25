@@ -11,6 +11,7 @@ import (
 
 // setEscalationSession has no session concept on Windows; it falls back to
 // the shared process-group helper.
-func setEscalationSession(cmd *exec.Cmd, grace time.Duration, _ func(string, ...interface{})) {
+func setEscalationSession(cmd *exec.Cmd, grace time.Duration, _ func(string, ...interface{})) (recordStart func()) {
 	util.SetGracefulProcessGroup(cmd, grace)
+	return func() {}
 }

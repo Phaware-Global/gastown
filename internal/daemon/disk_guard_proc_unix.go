@@ -19,22 +19,32 @@ import (
 // process tree at once, then SIGKILL to whatever survives after grace. logf
 // reports a failed process listing, which can leave descendants running.
 //
+// The caller must call recordStart after cmd.Start succeeds and before
+// cmd.Wait. Cancel can run after Wait has reaped gt, and by then gt's pid may
+// name another process; the start time recorded here tells the two apart.
+//
 // A process-group kill is not enough. gt starts each bd in its own process
 // group, so kill(-gtpid) misses it, and a hung bd would be orphaned on every
 // retry. The tree is found by walking parent pids from gt while gt is still
 // alive. A second look after SIGTERM catches anything started after that
 // snapshot: once gt dies its children reparent, so they are matched by session
 // ID as well as by ancestry.
-func setEscalationSession(cmd *exec.Cmd, grace time.Duration, logf func(string, ...interface{})) {
+func setEscalationSession(cmd *exec.Cmd, grace time.Duration, logf func(string, ...interface{})) (recordStart func()) {
+	var started string // gt's start time; empty if it could not be read
+	recorded := make(chan struct{})
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		root := cmd.Process.Pid
+		<-recorded
+		root := procInfo{pid: cmd.Process.Pid, started: started}
 		procs := listProcessesLogged(logf)
-		tree := processTree(procs, root)
-		_ = syscall.Kill(-root, syscall.SIGTERM) // same-group stragglers
+		var tree []procInfo
+		if !pidReused(procs, root) {
+			tree = processTree(procs, root.pid)
+			_ = syscall.Kill(-root.pid, syscall.SIGTERM) // same-group stragglers
+		}
 		for _, p := range tree {
 			_ = syscall.Kill(p.pid, syscall.SIGTERM)
 		}
@@ -43,8 +53,16 @@ func setEscalationSession(cmd *exec.Cmd, grace time.Duration, logf func(string, 
 			_ = syscall.Kill(p.pid, syscall.SIGTERM)
 		}
 		all := append(tree, late...)
-		time.AfterFunc(grace, func() { killSurvivors(root, all, logf) })
+		time.AfterFunc(grace, func() { killSurvivors(root.pid, all, logf) })
 		return nil
+	}
+	return func() {
+		defer close(recorded)
+		procs, err := listProcesses()
+		if err != nil {
+			logf("disk_guard: cannot read gt's start time, so reuse of its pid cannot be detected: %v", err)
+		}
+		started = procs[cmd.Process.Pid].started
 	}
 }
 
@@ -113,9 +131,17 @@ func processTree(procs map[int]procInfo, root int) []procInfo {
 	return tree
 }
 
+// pidReused reports whether p's pid names a different process in procs. A pid
+// missing from procs, or a p with no recorded start time, is not known to be
+// reused.
+func pidReused(procs map[int]procInfo, p procInfo) bool {
+	cur, ok := procs[p.pid]
+	return ok && p.started != "" && cur.started != p.started
+}
+
 // lateProcesses returns the members of procs that are not in known but belong
 // to root's session or descend from a process in known.
-func lateProcesses(procs map[int]procInfo, root int, known []procInfo) []procInfo {
+func lateProcesses(procs map[int]procInfo, root procInfo, known []procInfo) []procInfo {
 	seen := map[int]bool{}
 	for _, p := range known {
 		seen[p.pid] = true
@@ -135,8 +161,11 @@ func lateProcesses(procs map[int]procInfo, root int, known []procInfo) []procInf
 			add(d)
 		}
 	}
+	if pidReused(procs, root) {
+		return late // the session with this ID is no longer gt's
+	}
 	for pid, p := range procs {
-		if sid, err := unix.Getsid(pid); err == nil && sid == root {
+		if sid, err := unix.Getsid(pid); err == nil && sid == root.pid {
 			add(p)
 		}
 	}

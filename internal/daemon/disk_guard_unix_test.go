@@ -480,7 +480,7 @@ func TestLateProcesses(t *testing.T) {
 			root + 1:  {pid: root + 1, ppid: 1, started: tc.parent},
 			child.pid: child,
 		}
-		if got := lateProcesses(procs, root, known); !reflect.DeepEqual(got, tc.want) {
+		if got := lateProcesses(procs, procInfo{pid: root}, known); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: got %+v, want %+v", tc.name, got, tc.want)
 		}
 	}

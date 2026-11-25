@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -304,15 +305,21 @@ func runDiskGuardEscalationCtx(ctx context.Context, gt, dir string, args []strin
 		"GT_BD_TIMEOUT_SEC="+strconv.Itoa(diskGuardBdTimeoutSec(timeout)))
 	// gt starts each bd in its own process group, so a group kill of gt alone
 	// would orphan a hung bd: run gt in its own session and signal all of it.
-	setEscalationSession(cmd, diskGuardEscalateGrace, logf)
+	recordStart := setEscalationSession(cmd, diskGuardEscalateGrace, logf)
 	// WaitDelay is the backstop that closes the output pipes if a descendant
 	// outlives the signal.
 	cmd.WaitDelay = 5 * time.Second
-	output, err := cmd.CombinedOutput()
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	err := cmd.Start()
+	if err == nil {
+		recordStart() // before Wait, while gt's pid cannot be reused
+		err = cmd.Wait()
+	}
 	if err == nil {
 		return nil
 	}
-	out := strings.TrimSpace(string(output))
+	out := strings.TrimSpace(output.String())
 	if ctx.Err() == nil && strings.Contains(out, diskGuardCreatedMarker) {
 		logf("disk_guard: warning: escalation filed, but gt reported a notification failure: %v (%s)", err, out)
 		return nil
