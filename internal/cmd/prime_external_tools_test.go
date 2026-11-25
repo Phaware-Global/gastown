@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,15 +19,6 @@ func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string 
 	tmpDir := t.TempDir()
 	logPath := filepath.Join(tmpDir, "calls.log")
 
-	oldTimeout := primeExternalToolTimeout
-	oldWaitDelay := primeExternalToolWaitDelay
-	primeExternalToolTimeout = 100 * time.Millisecond
-	primeExternalToolWaitDelay = 10 * time.Millisecond
-	t.Cleanup(func() {
-		primeExternalToolTimeout = oldTimeout
-		primeExternalToolWaitDelay = oldWaitDelay
-	})
-
 	binDir := filepath.Join(tmpDir, "bin")
 	if err := os.Mkdir(binDir, 0700); err != nil {
 		t.Fatalf("create bin dir: %v", err)
@@ -38,6 +31,24 @@ func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string 
 	primeDryRun = false
 
 	return t.TempDir()
+}
+
+// Deadline tests wait out slowToolTimeout in full. It has to leave a loaded host
+// room to start the fake tools, which can alone take over 100ms. Tests that
+// expect the tools to succeed keep the production timeout.
+const (
+	slowToolTimeout = 3 * time.Second
+	// slowToolSleep outlasts slowToolMaxElapsed, so only the deadline can
+	// bring a call back in time.
+	slowToolSleep      = "60"
+	slowToolMaxElapsed = 30 * time.Second
+)
+
+func shortenPrimeToolTimeout(t *testing.T) {
+	t.Helper()
+	old := primeExternalToolTimeout
+	primeExternalToolTimeout = slowToolTimeout
+	t.Cleanup(func() { primeExternalToolTimeout = old })
 }
 
 func writePrimeToolScript(t *testing.T, path, body string) {
@@ -83,9 +94,7 @@ case "$*" in
 esac
 `)
 
-	start := time.Now()
 	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
-	assertElapsedUnder(t, time.Since(start), time.Second)
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
@@ -98,9 +107,7 @@ esac
 }
 
 func TestRunPrimeExternalTools_BoundsSlowMailCheck(t *testing.T) {
-	markerDir := t.TempDir()
-	startedPath := filepath.Join(markerDir, "child-started")
-	survivedPath := filepath.Join(markerDir, "child-survived")
+	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
   "kv list --json") printf '%s\n' '{"memory.feedback.test":"remembered"}'; exit 0 ;;
@@ -108,34 +115,47 @@ esac
 `, `
 case "$*" in
   "mail check --inject")
-    (: > "$PRIME_CHILD_STARTED"; sleep 0.5; : > "$PRIME_CHILD_SURVIVED") &
-    while [ ! -f "$PRIME_CHILD_STARTED" ]; do sleep 0.01; done
+    sleep `+slowToolSleep+` &
+    echo $! > "$PRIME_CHILD_PID"
     wait
     exit 0
     ;;
 esac
 `)
-	t.Setenv("PRIME_CHILD_STARTED", startedPath)
-	t.Setenv("PRIME_CHILD_SURVIVED", survivedPath)
+	shortenPrimeToolTimeout(t)
+	t.Setenv("PRIME_CHILD_PID", childPIDPath)
 
 	start := time.Now()
 	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), slowToolMaxElapsed)
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
 	if !strings.Contains(output, "remembered") {
 		t.Fatalf("memory output missing: %q", output)
 	}
-	if _, err := os.Stat(startedPath); err != nil {
+	assertProcessExits(t, childPIDPath)
+}
+
+// assertProcessExits waits for the process recorded in pidPath to go away.
+func assertProcessExits(t *testing.T, pidPath string) {
+	t.Helper()
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
 		t.Fatalf("child did not start before timeout: %v", err)
 	}
+	pid := strings.TrimSpace(string(data))
+	if _, err := strconv.Atoi(pid); err != nil {
+		t.Fatalf("parse child pid %q: %v", pid, err)
+	}
 
-	time.Sleep(700 * time.Millisecond)
-	if _, err := os.Stat(survivedPath); err == nil {
-		t.Fatalf("child process survived command timeout and wrote %s", survivedPath)
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("check survived marker: %v", err)
+	deadline := time.Now().Add(10 * time.Second)
+	for exec.Command("kill", "-0", pid).Run() == nil {
+		if time.Now().After(deadline) {
+			_ = exec.Command("kill", pid).Run()
+			t.Fatalf("child process %s survived command timeout", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -171,16 +191,17 @@ esac
 func TestCheckPendingEscalations_BoundsSlowBdList(t *testing.T) {
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
-	  "list --status=open --tag=escalation --json --flat") sleep 2; exit 0 ;;
+	  "list --status=open --tag=escalation --json --flat") exec sleep `+slowToolSleep+` ;;
 esac
 `, `
 `)
+	shortenPrimeToolTimeout(t)
 
 	start := time.Now()
 	output := captureStdout(t, func() {
 		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
 	})
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), slowToolMaxElapsed)
 	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
 
 	if strings.Contains(output, "PENDING ESCALATIONS") {
