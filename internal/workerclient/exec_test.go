@@ -992,3 +992,49 @@ func TestExecCommand_ContainerTTYDisablesDetachKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, strings.Join(noTTY.Args, " "), "--detach-keys")
 }
+
+// The agent's settings file lives on the orchestrator, and its path is baked
+// into the agent argv (claude --settings <host path>). session_open ships the
+// content; the worker stores it and points the argv at its own copy.
+func TestExecStream_AgentFilesAreDeliveredAndArgvRemapped(t *testing.T) {
+	const hostPath = "/Users/agent/gt/demo/polecats/.claude/settings.json"
+	proxyURL, ca, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	spec := polecatSpec()
+	spec.Files = map[string]string{hostPath: `{"hooks":{}}`}
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+
+	_, codec := attachStream(t, addr, "gt-demo-furiosa", []string{"cat", hostPath}, nil)
+	out, errOut, code := drainStream(t, codec)
+	require.Equal(t, 0, code, "stderr: %s", errOut)
+	assert.Equal(t, `{"hooks":{}}`, out)
+
+	// An argv token that merely contains the path is not a path argument.
+	_, codec = attachStream(t, addr, "gt-demo-furiosa", []string{"echo", "x" + hostPath}, nil)
+	out, _, _ = drainStream(t, codec)
+	assert.Equal(t, "x"+hostPath+"\n", out)
+
+	filesDir := filepath.Join(svc.cfg.StateDir, "identity", "gt-demo-furiosa", "agent-files")
+	entries, err := os.ReadDir(filesDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	info, err := entries[0].Info()
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+
+	require.NoError(t, b.Teardown(context.Background(), ep))
+	_, err = os.Stat(filesDir)
+	assert.True(t, os.IsNotExist(err), "delivered files must be removed on teardown")
+}
+
+func TestSessionOpen_RejectsOversizedAgentFiles(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	spec := polecatSpec()
+	spec.Files = map[string]string{"/host/settings.json": strings.Repeat("x", maxAgentFileBytes+1)}
+	_, err := b.Provision(context.Background(), spec)
+	require.Error(t, err)
+}

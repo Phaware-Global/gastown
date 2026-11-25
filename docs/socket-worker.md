@@ -20,8 +20,48 @@ launchd job only.
 | `git` | operator-provisioned | the worktree is cloned through the session relay |
 | Docker | only for `exec_mode: container` | Docker Desktop on macOS |
 
-The orchestrator additionally needs `gt-worker-attach`, which `make install`
-places next to `gt`. It is the process the tmux pane runs in place of the agent.
+The orchestrator additionally needs `gt-worker-attach` and `gt-proxy-server`,
+which `make install` places next to `gt`. `gt-worker-attach` is the process the
+tmux pane runs in place of the agent. `gt-proxy-server` is what a worker's `gt`
+and `bd` call (`docs/proxy-server.md`).
+
+## 0. Run the proxy on the orchestrator
+
+Before enrolling a worker, the proxy has to be running and reachable from it.
+First put the name or IP the worker will dial into the proxy's certificate —
+it is issued at startup — in `<town>/.runtime/proxy/config.json`:
+
+```json
+{ "extra_san_hosts": ["orchestrator.local"] }
+```
+
+Then, from inside the town:
+
+```bash
+gt proxy service install --listen 0.0.0.0:9876
+```
+
+`install` first has the server check the config file, and refuses one it
+would not start on. It then loads the job and confirms the server stayed up.
+Stop any `gt-proxy-server` started by hand before installing: it holds the
+same ports, and the job's server would exit at once.
+
+That installs a launchd job (`com.gastown.proxy`) which runs the installed
+`gt-proxy-server` in place, from the town root, and keeps it running across
+crashes and reboots. `gt proxy service status` shows its state; logs land in
+`<town>/.runtime/proxy/proxy-server.log`. After any change to the config file:
+
+```bash
+gt proxy service restart
+```
+
+The job's environment holds a `PATH` and nothing else. The `PATH` is captured
+from the shell that ran `install`, as the daemon's is, so the `gt` and `bd`
+commands the proxy runs for a remote polecat find the same `git`, `gh`, `bd`
+and toolchain shims the town's own sessions do; install from a shell where
+those resolve. No credentials are passed: proxied commands are started with
+`HOME` and `PATH` only, and use the operator account's own `git` and `gh`
+sign-in.
 
 ## 1. Enroll the machine
 
@@ -32,13 +72,20 @@ gt worker enroll mac-mini-1 --generate-token
 ```
 
 That prints the worker-side command with a single-use join token. Run it on the
-**worker**:
+**worker**; it generates the machine key and waits for the orchestrator:
 
 ```bash
 gt-worker-client enroll \
     -listen 0.0.0.0:9899 \
     -tls-dir ~/Library/Application\ Support/gt-worker/tls \
     -join-token-file /path/to/token
+```
+
+Then, back on the **orchestrator**, complete the enrollment by dialing the
+waiting worker. This is the step that signs its certificate:
+
+```bash
+GT_JOIN_TOKEN=<the token> gt worker enroll mac-mini-1 --address mac-mini-1.local:9899
 ```
 
 The worker generates its own key — only a CSR crosses the wire — and writes
@@ -78,7 +125,7 @@ gt worker service install \
 it** — not a loopback address, unless the worker and orchestrator are the same
 box. The proxy's certificate must carry that hostname or IP: set
 `extra_san_hosts` / `extra_san_ips` in `~/gt/.runtime/proxy/config.json` and
-restart the proxy, because the cert is issued at startup.
+restart the proxy (`gt proxy service restart`), because the cert is issued at startup.
 
 Then `gt worker service status`, and `gt worker service restart` after any
 config change. Logs land in `<state-dir>/worker.log`.
@@ -151,6 +198,53 @@ rather than pushed to — this orchestrator only has its own platform's binaries
 and installing one the worker cannot execute is worse than leaving it stale.
 Upgrade such a worker in place with `make install` there.
 
+### Code signing (macOS)
+
+On a worker, `gt-worker-client` is the long-lived process macOS attributes the
+agent's file access to — the agent, `git` and every build tool are its
+children. Privacy (TCC) grants are keyed to a binary's signature, and an
+unsigned build has a different code hash every time, so each new binary
+invalidates the grants and `tccd` re-evaluates it on every access. Give the
+worker a stable signature the same way `gt` gets one (`docs/INSTALLING.md`):
+
+1. Install on the worker with an identity. This signs `gt-worker-client`,
+   `gt-proxy-client`, `gt-worker-attach` and `gt-proxy-server` as
+   `com.gastown.<binary>`, and fails without replacing anything if signing
+   fails:
+
+   ```bash
+   make install GT_CODESIGN_IDENTITY=gt-local
+   ```
+
+   `gt worker service install` copies those binaries into `<state-dir>/bin`
+   byte for byte, so the copies keep the signature.
+
+2. Tell the service to keep it across pushes:
+
+   ```bash
+   gt worker service install … --codesign-identity gt-local
+   ```
+
+   A pushed binary is built on the orchestrator, so it arrives with the
+   orchestrator's signature (or none). With `--codesign-identity` the worker
+   re-signs it with its **own** identity, as `com.gastown.<binary>`, while it
+   is still staged. If that signing fails the push is refused and the
+   installed binary stays, which `gt worker push-binaries <rig>` reports.
+   Without the flag, pushed binaries are installed as received.
+
+The identity lives in the worker's login keychain and never leaves the machine.
+The service runs as a LaunchAgent in the GUI session, which is where the login
+keychain is available; allow `codesign` to use the key without a prompt, as
+described in `docs/INSTALLING.md`. Signing is given 60 seconds: a locked
+keychain or a permission prompt refuses the push instead of hanging it.
+
+A prompt-free key is not an access boundary. Any process running as this user
+can then sign a binary as `com.gastown.<binary>` that inherits the privacy
+grants of the one it replaces, and on a worker that includes a native-mode
+agent, which handles untrusted repository content. Grant Full Disk Access to
+`gt-worker-client` only on workers where that is acceptable, or run agents in
+container mode.
+
 ### Container mode
 
 A work container is a **Linux** container even when the worker is a Mac, so its
@@ -173,6 +267,68 @@ naming it, rather than shipping a binary that cannot execute there.
 
 The agent CLI is different in kind and stays operator-installed: its version,
 licensing and auth are the operator's decision.
+
+## Where a remote polecat's work goes
+
+The worker's clone is on the polecat's work branch, and the host keeps its own
+worktree for the polecat checked out on that same branch, at its start point.
+The host worktree never receives the agent's files. Instead:
+
+- The session's clone is configured so that `git push origin` sends the branch
+  to `refs/remote-work/<branch>` in the rig repo on the host. `gt done` on the
+  worker does this push first and refuses to continue if it fails, or if
+  tracked files have uncommitted changes.
+- A push aimed at `refs/heads/<branch>` is refused, because the host has that
+  branch checked out.
+- A session that is provisioned again (after a worker restart, say) starts from
+  its work ref, so pushed work is not lost with the clone.
+
+Commits in a work ref that origin does not hold count as the polecat's unpushed
+work everywhere the host asks that question, although its worktree is clean:
+
+- The witness's recovery, zombie and push-failure checks, `gt doctor`'s stalled
+  polecat check and the cleanup status all report them.
+- Removing the polecat publishes the work ref to origin as the branch (hooks
+  disabled, nothing checked out) after the same commit checks a local branch
+  gets, and then deletes the work ref. If that cannot be done it is refused.
+  This includes `gt polecat nuke`, which preserves work before it destroys
+  the polecat: it publishes a remote polecat's commits too, with hooks
+  disabled. `--discard-unpushed` applies only when publishing is not
+  possible, and then deletes the work ref unpublished. To keep a worker's
+  commits off origin altogether, delete the work ref by hand before removing
+  the polecat.
+- `gt polecat gc` prunes a work ref that no polecat owns once origin holds all
+  of its commits. One that is the only copy of its work is kept and named, for
+  an operator to inspect and publish or delete by hand.
+
+Host-side `gt done` completes a remote polecat from that work ref, without
+checking it out:
+
+- It is in remote mode when the rig's own execution settings name a remote
+  backend and the session is a polecat. Nothing in the request selects it.
+- It refuses if nothing has been pushed to the work ref.
+- It publishes the work ref to origin as the polecat branch, from the host,
+  with client-side hooks disabled, then verifies the branch tip, and creates or
+  updates the pull request or merge request exactly as for a local polecat.
+  With the direct merge strategy the push goes to the default branch and the
+  rig's own pre-push hook still runs, from the host worktree, which never
+  holds the worker's files.
+- Auto-rebase onto the target, overlay stripping and submodule pushes are
+  skipped: they rewrite a worktree, and the work is not in one on the host. A
+  branch that is behind its target is rebased on the worker and pushed again;
+  the staleness check and the merge-request guards read the work ref.
+- When the run succeeds (push and merge request both), the host deletes the
+  work ref together with the polecat's local branch, provided origin holds
+  every commit the ref points at. The branch on origin is then the record of
+  the work. If anything fails, or the worker pushed more in the meantime, the
+  work ref is kept.
+
+A polecat that keeps working on the same branch afterwards, for a review fix,
+must start from a newly provisioned session: that session takes the branch's
+current tip from the host and pushes a fresh work ref.
+
+The publish, the verification and the pull request run inside one proxied
+`gt done`, so they must fit in the proxy's `exec_timeout`.
 
 ## Restarts and orphans
 

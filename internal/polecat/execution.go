@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,30 @@ func rigExecutionConfig(rigPath string) *config.ExecutionConfig {
 		return nil
 	}
 	return settings.Execution
+}
+
+// hostGTCommand matches a hook command's absolute path to gt. Hook commands are
+// written with the host's gt binary path, which does not exist on a worker.
+var hostGTCommand = regexp.MustCompile(`(^|[\s"])/[^\s"'\\]*/gt(\s)`)
+
+// remoteAgentFiles returns the host files the agent argv names by path, for
+// delivery to a remote worker: today the --settings file that carries the
+// agent's hooks. Its hook commands are rewritten to a bare "gt", which a
+// worker resolves to its own proxy shim.
+func remoteAgentFiles(agentArgv []string) (map[string]string, error) {
+	files := map[string]string{}
+	for i := 0; i+1 < len(agentArgv); i++ {
+		if agentArgv[i] != "--settings" {
+			continue
+		}
+		path := agentArgv[i+1]
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("reading agent settings for remote delivery: %w", err)
+		}
+		files[path] = hostGTCommand.ReplaceAllString(string(data), "${1}gt${2}")
+	}
+	return files, nil
 }
 
 // remoteProvision is the result of provisioning a polecat's remote execution
@@ -96,4 +121,15 @@ func shellJoinArgv(argv []string) string {
 		quoted[i] = config.ShellQuote(tok)
 	}
 	return strings.Join(quoted, " ")
+}
+
+// remoteSessionBranch is the work branch to hand a remote worker. A detached
+// host worktree reports its branch as the literal "HEAD", which is not a
+// branch a worker can check out, so that case sends none and the worker stays
+// on the clone's default branch, as it did before branches were sent at all.
+func remoteSessionBranch(branch string) string {
+	if branch == "HEAD" {
+		return ""
+	}
+	return branch
 }

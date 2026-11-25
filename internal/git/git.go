@@ -1065,6 +1065,36 @@ func (g *Git) PushForceWithLease(remote, src, dst, expectedSHA string) error {
 	return err
 }
 
+// DeleteRef deletes a fully-qualified ref (refs/...), but only while it still
+// points at expected: git refuses the delete if the ref has moved, so a commit
+// that arrived after the caller looked is never dropped. Deleting a ref that
+// does not exist is an error.
+func (g *Git) DeleteRef(ref, expected string) error {
+	if !strings.HasPrefix(ref, "refs/") {
+		return fmt.Errorf("refusing to delete %q: not a fully-qualified ref", ref)
+	}
+	if expected == "" {
+		return fmt.Errorf("refusing to delete %s: no expected commit given", ref)
+	}
+	_, err := g.run("update-ref", "-d", ref, expected)
+	return err
+}
+
+// CommitsNotOnRemote returns how many commits reachable from rev are on none
+// of remote's remote-tracking refs, i.e. how many the remote is not known to
+// hold.
+func (g *Git) CommitsNotOnRemote(rev, remote string) (int, error) {
+	out, err := g.run("rev-list", "--count", rev, "--not", "--remotes="+remote)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	if _, err := fmt.Sscanf(out, "%d", &count); err != nil {
+		return 0, fmt.Errorf("parsing commit count: %w", err)
+	}
+	return count, nil
+}
+
 // CountCommitsBetween returns how many commits are reachable from `to` but not
 // from `from` (git rev-list --count from..to).
 func (g *Git) CountCommitsBetween(from, to string) (int, error) {
@@ -3955,7 +3985,8 @@ type BranchPreservationStatus struct {
 // branch, then explicit target branches, then upstream. It only falls back to the
 // remote default branch when no target/custody/upstream evidence exists.
 func (g *Git) BranchPreservationStatus(localBranch, remote string, targets []string) (BranchPreservationStatus, error) {
-	return g.branchPreservationStatus(localBranch, remote, targets, true)
+	status, err := g.branchPreservationStatus(localBranch, remote, targets, true)
+	return g.withRemoteWork(status, err, localBranch, remote)
 }
 
 // BranchTargetStatus checks whether HEAD is already represented on the branch's
@@ -3963,7 +3994,8 @@ func (g *Git) BranchPreservationStatus(localBranch, remote string, targets []str
 // branch is not enough evidence because pushed-but-unsubmitted work still needs
 // merge-queue recovery.
 func (g *Git) BranchTargetStatus(localBranch, remote string, targets []string) (BranchPreservationStatus, error) {
-	return g.branchPreservationStatus(localBranch, remote, targets, false)
+	status, err := g.branchPreservationStatus(localBranch, remote, targets, false)
+	return g.withRemoteWork(status, err, localBranch, remote)
 }
 
 func (g *Git) branchPreservationStatus(localBranch, remote string, targets []string, includeExactBranch bool) (BranchPreservationStatus, error) {

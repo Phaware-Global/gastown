@@ -187,3 +187,15 @@ func TestRigExecutionConfig(t *testing.T) {
 		t.Errorf("got %+v, want remote faketest", cfg)
 	}
 }
+
+// A detached host worktree reports "HEAD" as its branch. Sending that to a
+// worker would fail the checkout and the whole remote session with it.
+func TestRemoteSessionBranch(t *testing.T) {
+	if got := remoteSessionBranch("HEAD"); got != "" {
+		t.Errorf("remoteSessionBranch(HEAD) = %q, want no branch", got)
+	}
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	if got := remoteSessionBranch(branch); got != branch {
+		t.Errorf("remoteSessionBranch(%q) = %q, want it unchanged", branch, got)
+	}
+}

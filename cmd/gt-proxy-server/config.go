@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"time"
 )
 
 // ProxyConfig is the configuration file schema for gt-proxy-server.
@@ -56,6 +58,38 @@ type ProxyConfig struct {
 	//   - A split-horizon DNS entry that resolves to the proxy IP
 	//   - A mDNS name (e.g. "macbook.local")
 	ExtraSANHosts []string `json:"extra_san_hosts"`
+
+	// ExecTimeout is the longest a single proxied gt/bd command may run, as a
+	// Go duration ("4m"). Empty keeps the server default (60s). A remote
+	// polecat's gt done runs through the proxy and can need longer. It must be
+	// positive and below maxExecTimeout.
+	ExecTimeout string `json:"exec_timeout"`
+}
+
+// maxExecTimeout is the transport ceiling on one proxied command: the client
+// gives up on its request, and the server stops writing the response, after
+// five minutes, and either one cancels the command. A longer exec_timeout
+// would never take effect, only kill a command mid-run with no clear error.
+const maxExecTimeout = 5 * time.Minute
+
+// execTimeout parses ExecTimeout. Empty yields 0, the server default. A value
+// that is not positive would remove the deadline altogether, and one at or
+// above maxExecTimeout cannot be honored; both are errors.
+func (c ProxyConfig) execTimeout() (time.Duration, error) {
+	if c.ExecTimeout == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.ExecTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("exec_timeout %q: %w", c.ExecTimeout, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("exec_timeout %q: must be positive", c.ExecTimeout)
+	}
+	if d >= maxExecTimeout {
+		return 0, fmt.Errorf("exec_timeout %q: must be below %s, where the client and the server end the request", c.ExecTimeout, maxExecTimeout)
+	}
+	return d, nil
 }
 
 // loadConfig reads the config file at path and returns a ProxyConfig.
@@ -74,4 +108,17 @@ func loadConfig(path string) (ProxyConfig, error) {
 		return ProxyConfig{}, err
 	}
 	return cfg, nil
+}
+
+// checkConfigFile reports whether the server would start on the config at path:
+// it parses into ProxyConfig and its exec_timeout is in range. It backs
+// -check-config, so `gt proxy service install` can refuse a config that would
+// leave the supervised server exiting on every start.
+func checkConfigFile(path string) error {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	_, err = cfg.execTimeout()
+	return err
 }

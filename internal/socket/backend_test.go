@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,6 +46,12 @@ type fakeWorker struct {
 	openAttempts           int
 	containerPlatform      string
 	containerClient        string
+	noAgentFiles           bool // an older worker: hello_ack lacks the agent_files capability
+	// stageWorkerClient makes a pushed gt-worker-client "staged" rather than
+	// installed, as a running worker does. The upgrade takes effect for the
+	// next handshake: it then reports agent_files whatever noAgentFiles says.
+	stageWorkerClient bool
+	upgraded          bool
 
 	// knobs
 	refusePush   string // non-empty → answer a terminal push chunk with this error code
@@ -91,8 +98,15 @@ func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
 	}
 	w.pushes[key] = &pushedBinary{data: w.pushBuf[key], sha: m.SHA256}
 	delete(w.pushBuf, key)
+	applied := "installed"
+	if w.stageWorkerClient && m.Name == "gt-worker-client" {
+		applied = "staged"
+		// As on a real worker, a staged binary is applied only once no
+		// session is left.
+		w.upgraded = len(w.sessions) == 0
+	}
 	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID,
-		Name: m.Name, Platform: m.Platform, Applied: "installed"})
+		Name: m.Name, Platform: m.Platform, Applied: applied})
 }
 
 // sessionOpenAttempts reports how many session_opens arrived.
@@ -184,6 +198,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 			}
 			w.mu.Lock()
 			sess := append([]sockproto.SessionSummary(nil), w.sessions...)
+			agentFiles := !w.noAgentFiles || w.upgraded
 			w.mu.Unlock()
 			workerOS, workerArch := w.os, w.arch
 			if workerOS == "" {
@@ -198,7 +213,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				Arch:         workerArch,
 				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"},
 					MaxSessions: w.maxSessions, ContainerPlatform: w.containerPlatform,
-					ContainerClient: w.containerClient},
+					ContainerClient: w.containerClient, AgentFiles: agentFiles},
 				Sessions: sess,
 			})
 		case sockproto.TypePushBinary:
@@ -398,6 +413,139 @@ func TestProvision_SessionLimit(t *testing.T) {
 	_, err := b.Provision(context.Background(), spec())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session limit")
+}
+
+// A worker on a binary that predates agent files would drop them silently and
+// start the agent without its settings. The session must not be opened.
+func TestProvision_WorkerWithoutAgentFilesIsRefused(t *testing.T) {
+	w := newFakeWorker(t)
+	w.noAgentFiles = true
+	b, _ := testBackend(t, w)
+
+	withFiles := spec()
+	withFiles.Files = map[string]string{"/host/polecats/.claude/settings.json": "{}"}
+	_, err := b.Provision(context.Background(), withFiles)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "settings file")
+	assert.NotContains(t, w.got(), sockproto.TypeSessionOpen, "no session may be opened on that worker")
+
+	// Without files there is nothing to lose, so the same worker is still usable.
+	_, err = b.Provision(context.Background(), spec())
+	require.NoError(t, err)
+}
+
+// An idle worker on an older binary is refreshed by this very provision: the
+// new gt-worker-client is staged and applied when the connection closes. The
+// handshake this attempt holds still describes the old binary, so the gate
+// would refuse a session the upgraded worker accepts. It must retry instead.
+func TestProvision_RetriesWhenItsOwnPushStagedTheUpgrade(t *testing.T) {
+	prev := provisionRetryDelay
+	provisionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { provisionRetryDelay = prev })
+
+	w := newFakeWorker(t)
+	w.noAgentFiles = true
+	w.stageWorkerClient = true
+	w.gtVersion = "1.2.2"
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-worker-client"), []byte("payload"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	withFiles := spec()
+	withFiles.Files = map[string]string{"/host/polecats/.claude/settings.json": "{}"}
+	_, err := b.Provision(context.Background(), withFiles)
+	require.NoError(t, err, "the upgrade this provision staged must be retried onto, not reported")
+	assert.Equal(t, 1, w.sessionOpenAttempts(), "the session is opened once, on the upgraded worker")
+}
+
+// stagedUpgradeBackend is a backend whose worker runs an older binary without
+// agent_files, stages a pushed gt-worker-client, and has that binary on hand.
+func stagedUpgradeBackend(t *testing.T) (*SocketBackend, *fakeWorker, execution.PolecatSpec) {
+	t.Helper()
+	prev := provisionRetryDelay
+	provisionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { provisionRetryDelay = prev })
+
+	w := newFakeWorker(t)
+	w.noAgentFiles = true
+	w.stageWorkerClient = true
+	w.gtVersion = "1.2.2"
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-worker-client"), []byte("payload"), 0755))
+	t.Cleanup(SetBinarySourceForTest(root))
+
+	withFiles := spec()
+	withFiles.Files = map[string]string{"/host/polecats/.claude/settings.json": "{}"}
+	return b, w, withFiles
+}
+
+// A worker with live sessions stages the upgrade but does not apply it, so a
+// retry would only push the same binaries again at a worker that is serving
+// agents, and fail the same way. It must be refused once, with the remedy.
+func TestProvision_DoesNotRetryAStagedUpgradeOnABusyWorker(t *testing.T) {
+	b, w, withFiles := stagedUpgradeBackend(t)
+	w.maxSessions = 2
+	w.preload(sockproto.SessionSummary{Session: "gt-MyRig-nux", Rig: "MyRig", Polecat: "nux", State: "ready"})
+
+	dials := 0
+	b.dialFn = func(ctx context.Context, s *Settings, id, ver string) (*conn, error) {
+		dials++
+		return dial(ctx, s, id, ver)
+	}
+
+	_, err := b.Provision(context.Background(), withFiles)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, errWorkerRestarting)
+	assert.Contains(t, err.Error(), "upgrade the worker, or wait for it to go idle")
+	assert.Equal(t, 1, dials, "a busy worker must not be re-dialed and re-pushed")
+	assert.Equal(t, 0, w.sessionOpenAttempts())
+}
+
+// Closing the connection that staged the upgrade makes an idle worker exit so
+// its supervisor can start the new binary. Until it is listening again a dial
+// fails outright; that is the restart this provision caused, not a dead worker.
+func TestProvision_RetriesADialFailureAfterStagingTheUpgrade(t *testing.T) {
+	b, w, withFiles := stagedUpgradeBackend(t)
+
+	dials := 0
+	b.dialFn = func(ctx context.Context, s *Settings, id, ver string) (*conn, error) {
+		dials++
+		if dials == 2 || dials == 3 {
+			return nil, errors.New("dial unix: connect: connection refused")
+		}
+		return dial(ctx, s, id, ver)
+	}
+
+	_, err := b.Provision(context.Background(), withFiles)
+	require.NoError(t, err, "the worker being down right after the staged push is its restart")
+	assert.Equal(t, 4, dials)
+	assert.Equal(t, 1, w.sessionOpenAttempts())
+}
+
+// Without a staged upgrade behind it, a dial failure is a worker that is not
+// there: it is reported at once, as before.
+func TestProvision_DoesNotRetryAnUnrelatedDialFailure(t *testing.T) {
+	b, _, withFiles := stagedUpgradeBackend(t)
+
+	dials := 0
+	b.dialFn = func(context.Context, *Settings, string, string) (*conn, error) {
+		dials++
+		return nil, errors.New("dial unix: connect: connection refused")
+	}
+
+	_, err := b.Provision(context.Background(), withFiles)
+	require.Error(t, err)
+	assert.Equal(t, 1, dials)
 }
 
 func TestProvision_SessionError(t *testing.T) {

@@ -28,10 +28,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/sockproto"
 	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/worker"
@@ -67,6 +69,14 @@ type Config struct {
 	// worker-side; never transmitted over the socket.
 	AgentEnvFile string
 
+	// CodesignIdentity names a keychain code-signing identity (macOS). When
+	// set, a pushed binary for this machine is re-signed with it, under the
+	// identifier com.gastown.<name>, before it replaces the installed one — so
+	// the signature macOS privacy (TCC) grants are keyed to stays the same
+	// across pushes. A push whose signing fails is refused. Empty: pushed
+	// binaries are installed as received.
+	CodesignIdentity string
+
 	// RestartHook replaces the process exit that applies a pushed worker
 	// binary. nil means os.Exit(0) — the supervisor (launchd KeepAlive,
 	// systemd Restart) brings the new binary up. Tests set it so a test binary
@@ -88,6 +98,7 @@ type session struct {
 	relay       *worker.Relay
 	workEnv     *worker.WorkEnv // nil in native mode
 	worktree    string
+	argvPaths   map[string]string  // orchestrator path -> delivered local copy (agent files)
 	execCancel  context.CancelFunc // cancels an attached exec stream (nil when none)
 	certWanted  bool               // SignCSR is awaiting a cert
 	certTaken   bool               // a cert has been claimed for this session
@@ -146,6 +157,9 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.ProxyURL == "" {
 		return nil, fmt.Errorf("workerclient: proxy url is required")
+	}
+	if strings.HasPrefix(cfg.CodesignIdentity, "-") {
+		return nil, fmt.Errorf("workerclient: codesign identity must name a keychain identity; %q is ad-hoc signing and does not keep privacy grants", cfg.CodesignIdentity)
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0700); err != nil {
 		return nil, fmt.Errorf("workerclient: create state dir: %w", err)
@@ -351,6 +365,7 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 					// worker would otherwise never be sent any.
 					ContainerPlatform: containerPlatform,
 					ContainerClient:   s.containerClientDigest(containerPlatform),
+					AgentFiles:        true,
 				},
 				Sessions: s.summaries(),
 			})
@@ -389,6 +404,23 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	// filesystem or URL sink (the worker is a separate trust domain — HIGH).
 	if err := validateSessionFields(m.Session, m.Rig, m.Polecat); err != nil {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
+		return
+	}
+	if err := validateAgentFiles(m.Files); err != nil {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
+		return
+	}
+	// Agent files land beside the session identity, which a work container
+	// does not mount, and only a native session's argv is remapped to them.
+	// A container session would start its agent on a settings path that does
+	// not exist there, with no hooks and no error, so it is refused until the
+	// files are delivered somewhere the container can read.
+	if m.ExecMode == "container" && len(m.Files) > 0 {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: "agent files are not delivered to a container session yet: the agent would start without its settings and hooks. Use exec_mode native where the rig allows it (network.mode sandboxed requires container mode, so such a rig cannot run this agent on a remote worker yet)"})
+		return
+	}
+	if m.Branch != "" && !validBranch(m.Branch) {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: fmt.Sprintf("branch %q is not a safe branch name", m.Branch)})
 		return
 	}
 	modeOK := false
@@ -628,6 +660,53 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 	if out, err := exec.CommandContext(buCtx, "git", "clone", "--", cloneURL, worktree).CombinedOutput(); err != nil {
 		fail(replyID, "clone", fmt.Errorf("git clone via relay: %v: %s", err, strings.TrimSpace(string(out))))
 		return
+	}
+	// Land the worktree on the polecat's work branch. The host creates it in
+	// the rig repo before the session starts, so it is normally a remote
+	// branch to track; one the host repo does not have is created here. -B
+	// rather than -b: the clone has no work of its own, and the branch asked
+	// for can be the one the clone is already on (its default branch).
+	if open.Branch != "" {
+		args := []string{"-C", worktree, "checkout", "-B", open.Branch}
+		if exec.CommandContext(buCtx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+open.Branch).Run() == nil {
+			args = append(args, "--track", "origin/"+open.Branch)
+		}
+		if out, err := exec.CommandContext(buCtx, "git", args...).CombinedOutput(); err != nil {
+			fail(replyID, "checkout", fmt.Errorf("git checkout %s: %v: %s", open.Branch, err, strings.TrimSpace(string(out))))
+			return
+		}
+		if err := useRemoteWorkRef(buCtx, worktree, open.Branch); err != nil {
+			fail(replyID, "work ref", err)
+			return
+		}
+	}
+
+	// Agent files (the agent's settings): stored beside the session identity,
+	// so every path that drops the identity drops them too. The orchestrator's
+	// path is only ever a lookup key — the file name on disk is ours.
+	if len(open.Files) > 0 {
+		filesDir := filepath.Join(idDir, "agent-files")
+		if err := os.MkdirAll(filesDir, 0700); err != nil {
+			fail(replyID, "files", err)
+			return
+		}
+		argvPaths := make(map[string]string, len(open.Files))
+		keys := make([]string, 0, len(open.Files))
+		for k := range open.Files {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for i, k := range keys {
+			local := filepath.Join(filesDir, fmt.Sprintf("%d.json", i))
+			if err := os.WriteFile(local, []byte(open.Files[k]), 0600); err != nil {
+				fail(replyID, "files", err)
+				return
+			}
+			argvPaths[k] = local
+		}
+		s.mu.Lock()
+		sess.argvPaths = argvPaths
+		s.mu.Unlock()
 	}
 
 	// Container mode: prepare the idle work container (§6.1.2 via the shared
@@ -1063,4 +1142,40 @@ func (s *Service) loadPersisted() {
 		sum.State = "orphaned"
 		s.orphans[sum.Session] = sum
 	}
+}
+
+// useRemoteWorkRef points the clone's pushes for branch at the host's work ref
+// (constants.RemoteWorkRef) and resumes from it when it already exists.
+//
+// The host has branch checked out in the polecat's host worktree, so a push to
+// refs/heads/<branch> is refused there — and must be: a push that updated
+// that worktree would put this machine's files, hooks included, onto the host.
+// With the push refspec set, a plain `git push origin` sends the branch to
+// its work ref instead. The matching fetch refspec gives the work ref a
+// remote-tracking ref, which is what --force-with-lease checks against.
+//
+// A work ref that already exists holds what an earlier session of this
+// polecat pushed (the clone is replaced on every bringup), so the branch
+// starts from it rather than from the branch's start point.
+func useRemoteWorkRef(ctx context.Context, worktree, branch string) error {
+	workRef := constants.RemoteWorkRef(branch)
+	tracking := "refs/remotes/origin-work/" + branch
+	for _, args := range [][]string{
+		{"config", "remote.origin.push", "refs/heads/" + branch + ":" + workRef},
+		// A pattern, not the one ref: fetching a named ref that does not
+		// exist yet is an error, a pattern that matches nothing is not.
+		{"config", "--add", "remote.origin.fetch", "+" + constants.RemoteWorkRefPrefix + "*:refs/remotes/origin-work/*"},
+		{"fetch", "--quiet", "origin"},
+	} {
+		if out, err := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...).CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
+		}
+	}
+	if exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", tracking).Run() != nil {
+		return nil // nothing pushed yet
+	}
+	if out, err := exec.CommandContext(ctx, "git", "-C", worktree, "reset", "--hard", "--quiet", tracking).CombinedOutput(); err != nil {
+		return fmt.Errorf("resuming from %s: %v: %s", workRef, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
