@@ -132,3 +132,15 @@ func TestEmitToTown_RigScopedChannel(t *testing.T) {
 		}
 	}
 }
+
+func TestEmitToDir_RejectsInvalidChannel(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	if _, err := emitToDir(dir, "../escape", "TEST", nil); err == nil {
+		t.Error("expected error for invalid channel name")
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Errorf("entries = %v (err=%v), want none", entries, err)
+	}
+}
