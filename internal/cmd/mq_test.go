@@ -439,8 +439,10 @@ func TestParseBranchNameWorker(t *testing.T) {
 		// polecat/<worker>-<bead-id>, from gt polecat checkout-branch
 		{"polecat/keeper-gt-abc12", "keeper"},
 		{"polecat/keeper-gt-abc.1", "keeper"},
-		{"polecat/keeper-gt-wfs-abc12", "keeper"},
-		{"polecat/keeper-hq-wisp-ku6", "keeper"},
+		{"polecat/keeper-gt-wfs-abc12", ""},
+		{"polecat/keeper-hq-wisp-ku6", ""},
+		// More than one name/bead-id split: no guess.
+		{"polecat/bullet-farmer-gt-abc12", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.branch, func(t *testing.T) {
