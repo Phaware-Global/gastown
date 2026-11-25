@@ -4,27 +4,34 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 )
 
-// bd list hides type=agent records unless --include-infra is passed, and
-// returns at most 50 rows unless --limit=0 is passed.
-func TestListAgentBeadsJSONListsAllInfraRecords(t *testing.T) {
+// The listing finds agents by label and by type=agent. It must not pass
+// --include-infra, which makes bd scan every infrastructure record in a town
+// database that is dominated by wisps.
+func TestListAgentBeadsJSONUsesLabelAndTypeQueries(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses a shell bd stub")
 	}
-	// The wisp query returns nothing, so only the list call can find the beads.
+	// Each route has a record only it returns, plus one that both return. The
+	// label route is truncated unless --limit=0 is passed.
 	stub := `#!/bin/sh
-[ "$1" = mol ] && { echo '[]'; exit 0; }
-first='{"id":"gt-demo-polecat-one","issue_type":"agent","labels":["gt:agent"]}'
-second='{"id":"gt-demo-polecat-two","issue_type":"agent","labels":["gt:agent"]}'
+echo "$*" >> "$0.log"
+[ "$1" = mol ] && { echo '{"count":0,"wisps":[]}'; exit 0; }
+labeled='{"id":"gt-demo-polecat-labeled","issue_type":"task","labels":["gt:agent"]}'
+typed='{"id":"gt-demo-polecat-typed","issue_type":"agent"}'
+both='{"id":"gt-demo-polecat-both","issue_type":"agent","labels":["gt:agent"]}'
 case " $* " in
-  *" --include-infra "*) ;;
-  *) echo '[]'; exit 0 ;;
-esac
-case " $* " in
-  *" --limit=0 "*) echo "[$first,$second]" ;;
-  *) echo "[$first]" ;;
+  *" --type=agent "*) echo "[$typed,$both]" ;;
+  *" --label=gt:agent "*)
+    case " $* " in
+      *" --limit=0 "*) echo "[$both,$labeled]" ;;
+      *) echo "[$both]" ;;
+    esac ;;
+  *) echo '[]' ;;
 esac
 `
 	bdPath := filepath.Join(t.TempDir(), "bd")
@@ -40,7 +47,21 @@ esac
 	if err := d.listAgentBeadsJSON(&agents); err != nil {
 		t.Fatalf("listAgentBeadsJSON: %v", err)
 	}
-	if len(agents) != 2 {
-		t.Fatalf("agents = %+v, want both type=agent beads", agents)
+	var got []string
+	for _, a := range agents {
+		got = append(got, a.ID)
+	}
+	slices.Sort(got)
+	want := []string{"gt-demo-polecat-both", "gt-demo-polecat-labeled", "gt-demo-polecat-typed"}
+	if !slices.Equal(got, want) {
+		t.Errorf("agent IDs = %v, want %v", got, want)
+	}
+
+	calls, err := os.ReadFile(bdPath + ".log")
+	if err != nil {
+		t.Fatalf("read bd call log: %v", err)
+	}
+	if strings.Contains(string(calls), "--include-infra") {
+		t.Errorf("listing passed --include-infra:\n%s", calls)
 	}
 }
