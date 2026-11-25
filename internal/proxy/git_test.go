@@ -97,6 +97,25 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("slung branch (issue form) is allowed", func(t *testing.T) {
+		// A slung polecat's branch is polecat/<name>/<issue>@<ts>
+		// (polecat.Manager.buildBranchName), not the dash form.
+		body := receivePackBody("refs/heads/polecat/furiosa/gt-abc12@mv3cxv4t")
+		assert.NoError(t, validateReceivePackRefs(body, polecat))
+	})
+
+	t.Run("another polecat's slung branch is denied", func(t *testing.T) {
+		body := receivePackBody("refs/heads/polecat/nux/gt-abc12@mv3cxv4t")
+		err := validateReceivePackRefs(body, polecat)
+		require.Error(t, err)
+	})
+
+	t.Run("slash form with nothing after the name is denied", func(t *testing.T) {
+		body := receivePackBody("refs/heads/polecat/furiosa/")
+		err := validateReceivePackRefs(body, polecat)
+		require.Error(t, err)
+	})
+
 	t.Run("own checkpoint ref is allowed", func(t *testing.T) {
 		// remote-polecat-execution.md §9.2: the worker force-pushes
 		// refs/checkpoints/polecat/<name> through the proxy.
@@ -114,6 +133,14 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		body := receivePackBody("refs/checkpoints/polecat/furiosa-extra")
 		err := validateReceivePackRefs(body, polecat)
 		require.Error(t, err)
+	})
+
+	t.Run("slung form with a nested segment is denied", func(t *testing.T) {
+		// buildBranchName produces exactly one segment after the name. A
+		// deeper ref would reach into the namespace of a polecat whose own
+		// name contains a slash.
+		body := receivePackBody("refs/heads/polecat/furiosa/x/gt-1@ts")
+		require.Error(t, validateReceivePackRefs(body, polecat))
 	})
 
 	t.Run("mixed valid and invalid returns error on first invalid", func(t *testing.T) {
@@ -210,6 +237,19 @@ func TestAuthorizeReceivePack(t *testing.T) {
 		ok, _ := srv.authorizeReceivePack(rec, req, "gt--furiosa")
 		assert.False(t, ok)
 		assert.Equal(t, http.StatusForbidden, rec.Code)
+	})
+
+	// A cert issued before names were restricted can carry a '/' in its name.
+	// Polecat "a" may push polecat/a/<segment>, which is also where a legacy
+	// "a/b" cert's own refs live, so such a cert must not push at all.
+	t.Run("CN whose name is outside the safe charset returns 403", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/git/rig/git-receive-pack",
+			bytes.NewReader(receivePackBody("refs/heads/polecat/a/b-123")))
+		ok, _ := srv.authorizeReceivePack(rec, req, "gt-rig-a/b")
+		assert.False(t, ok)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "safe charset")
 	})
 
 	t.Run("valid CN and valid refs — body is rewound correctly", func(t *testing.T) {
@@ -575,9 +615,11 @@ func TestHandleGitAuditLog(t *testing.T) {
 		assert.Equal(t, "push", e.attrs["op"])
 	})
 
-	t.Run("push denied emits WARN with identity rig and refs", func(t *testing.T) {
+	t.Run("push with a cert for another rig is refused before any ref is read", func(t *testing.T) {
+		// Polecat names repeat across rigs (every rig draws on the same name
+		// pool), so the name alone must not authorize a push to another rig.
 		srv, _, lc := newGitServerWithLog(t)
-		body := receivePackBody("refs/heads/main") // not allowed
+		body := receivePackBody("refs/heads/polecat/furiosa/gt-x@ts") // own namespace, wrong rig
 		req := fakeGitRequest("POST", "/v1/git/testrip/git-receive-pack",
 			body, "gt-gastown-furiosa")
 		rec := httptest.NewRecorder()
@@ -587,6 +629,21 @@ func TestHandleGitAuditLog(t *testing.T) {
 		e, ok := lc.findEntry(slog.LevelWarn, "git push denied")
 		require.True(t, ok, "expected WARN 'git push denied' log record")
 		assert.Equal(t, "gastown/furiosa", e.attrs["identity"])
+		assert.Equal(t, "testrip", e.attrs["rig"])
+	})
+
+	t.Run("push denied emits WARN with identity rig and refs", func(t *testing.T) {
+		srv, _, lc := newGitServerWithLog(t)
+		body := receivePackBody("refs/heads/main") // not allowed
+		req := fakeGitRequest("POST", "/v1/git/testrip/git-receive-pack",
+			body, "gt-testrip-furiosa")
+		rec := httptest.NewRecorder()
+		srv.handleGit(rec, req)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		e, ok := lc.findEntry(slog.LevelWarn, "git push denied")
+		require.True(t, ok, "expected WARN 'git push denied' log record")
+		assert.Equal(t, "testrip/furiosa", e.attrs["identity"])
 		assert.Equal(t, "testrip", e.attrs["rig"])
 		assert.Contains(t, e.attrs["refs"], "refs/heads/main")
 	})
@@ -630,7 +687,7 @@ func TestHandleGitAuditLogIntegration(t *testing.T) {
 // TestHandleReceivePackIntegration performs a full end-to-end mTLS git push
 // through a live proxy server, verifying branch authorization with a real git binary.
 //
-// The test issues a polecat cert (CN "gt-gastown-raider" → polecat name "raider"),
+// The test issues a polecat cert (CN "gt-testrip-raider" → polecat name "raider"),
 // starts the proxy with mTLS enabled, creates a local repo with a commit, then:
 //   - Asserts that a push to refs/heads/polecat/raider-* (allowed) succeeds.
 //   - Asserts that a push to refs/heads/main (disallowed) is rejected.
@@ -641,9 +698,10 @@ func TestHandleReceivePackIntegration(t *testing.T) {
 	ca, err := GenerateCA(t.TempDir())
 	require.NoError(t, err)
 
-	// "raider" is the polecat name extracted from "gt-gastown-raider" by polecatName().
-	// Allowed refs are refs/heads/polecat/raider-*.
-	const polecatCN = "gt-gastown-raider"
+	// "raider" is the polecat name extracted from "gt-testrip-raider" by polecatName().
+	// Allowed refs are refs/heads/polecat/raider-*. The cert's rig matches the
+	// repo makeBareRepo creates; a cert for another rig is refused outright.
+	const polecatCN = "gt-testrip-raider"
 	clientCertPEM, clientKeyPEM, err := ca.IssuePolecat(polecatCN, time.Hour)
 	require.NoError(t, err)
 

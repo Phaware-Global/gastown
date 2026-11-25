@@ -435,6 +435,20 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: name is required", http.StatusBadRequest)
 		return
 	}
+	// Same charset as the CSR path (handleSignCSR): a '/' inside rig or name
+	// lets two distinct pairs collide on one authz identity, and the push ref
+	// rules treat '/' as the boundary of a polecat's namespace.
+	if !validIdentityComponent(req.Rig) || !validIdentityComponent(req.Name) {
+		http.Error(w, "bad request: rig and name must match [A-Za-z0-9_.-]+", http.StatusBadRequest)
+		return
+	}
+	// And the same round-trip check: every authz consumer parses the CN by
+	// splitting on the last hyphen, so a hyphen in the name yields a cert
+	// whose parsed identity is a different rig/name pair.
+	if cnToIdentity("gt-"+req.Rig+"-"+req.Name) != req.Rig+"/"+req.Name {
+		http.Error(w, "bad request: rig/name do not round-trip through the gt-<rig>-<name> identity format (hyphenated names are ambiguous)", http.StatusBadRequest)
+		return
+	}
 
 	ttl := 720 * time.Hour // 30 days
 	if req.TTL != "" {
