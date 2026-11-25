@@ -367,6 +367,35 @@ func TestSessionOpen_RejectsUnsafeIdentity(t *testing.T) {
 	assert.Equal(t, "bad_request", resp.Code)
 }
 
+// Agent files are written beside the session identity, which a work container
+// does not mount, and the argv is only remapped for native sessions. A
+// container session that carried them would start its agent with a settings
+// path that is not there: no hooks, no guards, and no error. Refuse it.
+func TestSessionOpenRefusesAgentFilesInContainerMode(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	ack, err := codec.Recv()
+	require.NoError(t, err)
+	require.Equal(t, sockproto.TypeHelloAck, ack.Type)
+
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeSessionOpen, ID: "s1",
+		Session: "gt-demo-furiosa", Rig: "demo", Polecat: "furiosa", ExecMode: "container",
+		Files: map[string]string{"/host/polecats/.claude/settings.json": "{}"},
+	}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeSessionError, resp.Type)
+	assert.Equal(t, "bad_request", resp.Code)
+	assert.Contains(t, resp.Msg, "container")
+	assert.Contains(t, resp.Msg, "agent files")
+}
+
 func TestDroppedConnFreesSessionSlot(t *testing.T) {
 	proxyURL, _, _ := startProxy(t)
 	addr, svc := startService(t, proxyURL, func(c *Config) { c.MaxSessions = 1 })

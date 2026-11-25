@@ -81,6 +81,17 @@ type Capabilities struct {
 	// the ones the worker runs — the orchestrator needs this to pick the right
 	// artifacts (§4.1).
 	ContainerPlatform string `json:"container_platform,omitempty"`
+	// AgentFiles reports that the worker understands session_open's files
+	// field. A worker on an older binary decodes the message without it and
+	// would start the agent with a settings path that does not exist there, so
+	// the orchestrator refuses to open a session that carries files on a
+	// worker that does not say this.
+	AgentFiles bool `json:"agent_files,omitempty"`
+}
+
+// GetAgentFiles reads AgentFiles from a possibly-nil capability block.
+func (c *Capabilities) GetAgentFiles() bool {
+	return c != nil && c.AgentFiles
 }
 
 // GetContainerPlatform reads the container platform from a possibly-nil
@@ -145,6 +156,10 @@ type Message struct {
 	// Branch is the polecat's work branch; the worker checks the cloned
 	// worktree out on it. Empty keeps the clone's default branch.
 	Branch string `json:"branch,omitempty"`
+	// Files are non-secret host files the agent argv names by path, keyed by
+	// that host path. The worker stores each and rewrites an argv token equal
+	// to the key to its own copy.
+	Files map[string]string `json:"files,omitempty"`
 
 	// push_binaries (§4.1). Chunks carry Data; the final chunk sets EOF and the
 	// whole-file SHA256, which the worker verifies before anything is installed.

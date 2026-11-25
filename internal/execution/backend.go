@@ -43,6 +43,10 @@ type PolecatSpec struct {
 	// worktree is checked out on it so the agent's commits land where gt done
 	// looks for them. Empty leaves the worktree on the clone's default branch.
 	Branch string
+	// Files are host files the agent argv names by path (the agent's settings
+	// file), keyed by that host path. A remote backend delivers the content
+	// and points the argv at its copy. Never secrets: this crosses the wire.
+	Files  map[string]string
 	Config *config.ExecutionConfig // shared fields + opaque provider extension
 }
 

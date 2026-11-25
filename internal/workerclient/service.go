@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +90,7 @@ type session struct {
 	relay       *worker.Relay
 	workEnv     *worker.WorkEnv // nil in native mode
 	worktree    string
+	argvPaths   map[string]string  // orchestrator path -> delivered local copy (agent files)
 	execCancel  context.CancelFunc // cancels an attached exec stream (nil when none)
 	certWanted  bool               // SignCSR is awaiting a cert
 	certTaken   bool               // a cert has been claimed for this session
@@ -352,6 +354,7 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 					// worker would otherwise never be sent any.
 					ContainerPlatform: containerPlatform,
 					ContainerClient:   s.containerClientDigest(containerPlatform),
+					AgentFiles:        true,
 				},
 				Sessions: s.summaries(),
 			})
@@ -390,6 +393,19 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	// filesystem or URL sink (the worker is a separate trust domain — HIGH).
 	if err := validateSessionFields(m.Session, m.Rig, m.Polecat); err != nil {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
+		return
+	}
+	if err := validateAgentFiles(m.Files); err != nil {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
+		return
+	}
+	// Agent files land beside the session identity, which a work container
+	// does not mount, and only a native session's argv is remapped to them.
+	// A container session would start its agent on a settings path that does
+	// not exist there, with no hooks and no error, so it is refused until the
+	// files are delivered somewhere the container can read.
+	if m.ExecMode == "container" && len(m.Files) > 0 {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: "agent files are not delivered to a container session yet: the agent would start without its settings and hooks. Use exec_mode native where the rig allows it (network.mode sandboxed requires container mode, so such a rig cannot run this agent on a remote worker yet)"})
 		return
 	}
 	if m.Branch != "" && !validBranch(m.Branch) {
@@ -652,6 +668,34 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 			fail(replyID, "work ref", err)
 			return
 		}
+	}
+
+	// Agent files (the agent's settings): stored beside the session identity,
+	// so every path that drops the identity drops them too. The orchestrator's
+	// path is only ever a lookup key — the file name on disk is ours.
+	if len(open.Files) > 0 {
+		filesDir := filepath.Join(idDir, "agent-files")
+		if err := os.MkdirAll(filesDir, 0700); err != nil {
+			fail(replyID, "files", err)
+			return
+		}
+		argvPaths := make(map[string]string, len(open.Files))
+		keys := make([]string, 0, len(open.Files))
+		for k := range open.Files {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for i, k := range keys {
+			local := filepath.Join(filesDir, fmt.Sprintf("%d.json", i))
+			if err := os.WriteFile(local, []byte(open.Files[k]), 0600); err != nil {
+				fail(replyID, "files", err)
+				return
+			}
+			argvPaths[k] = local
+		}
+		s.mu.Lock()
+		sess.argvPaths = argvPaths
+		s.mu.Unlock()
 	}
 
 	// Container mode: prepare the idle work container (§6.1.2 via the shared
