@@ -92,6 +92,9 @@ func zombieOrGone(pid int) bool {
 
 const helperEnv = "GT_DISKGUARD_TEST_HELPER"
 
+// orphanEnv makes the helper's late child lose its parent as soon as it starts.
+const orphanEnv = "GT_DISKGUARD_TEST_ORPHAN"
+
 func init() { helperProcessHook = runDiskGuardHelper }
 
 // runDiskGuardHelper is the body of the fake gt's helper process. The fake gt
@@ -135,6 +138,10 @@ func spawnLateChild(dir string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if os.Getenv(orphanEnv) != "" {
+		spawnOrphan(dir)
+		return
+	}
 	late := exec.Command("sleep", "300")
 	late.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := late.Start(); err != nil {
@@ -147,6 +154,99 @@ func spawnLateChild(dir string) {
 	if err := os.Rename(tmp, filepath.Join(dir, "latepid")); err != nil {
 		os.Exit(7)
 	}
+}
+
+// spawnOrphan starts a shell, in its own process group, that backgrounds a
+// sleep and exits. "latepid" appears only after the shell is reaped, so by then
+// the sleep has been reparented: neither ancestry nor gt's process group leads
+// to it, only its session.
+func spawnOrphan(dir string) {
+	tmp := filepath.Join(dir, "latepid.tmp")
+	sh := exec.Command("sh", "-c", "sleep 300 >/dev/null 2>&1 & echo $! > \"$1\"", "sh", tmp)
+	sh.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := sh.Run(); err != nil {
+		os.Exit(5)
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, "latepid")); err != nil {
+		os.Exit(7)
+	}
+}
+
+// writeFakePs puts a ps on PATH that behaves like the real one, except that
+// once the "armed" file exists, its next call takes the real listing, has the
+// helper spawn its late child, and only then returns that stale listing.
+func writeFakePs(t *testing.T, dir string) {
+	t.Helper()
+	realPs, err := exec.LookPath("ps")
+	if err != nil {
+		t.Skipf("no ps: %v", err)
+	}
+	q := func(name string) string { return "'" + filepath.Join(dir, name) + "'" }
+	script := "#!/bin/sh\n" +
+		"if [ ! -e " + q("armed") + " ] || [ -e " + q("first") + " ]; then exec " + realPs + " \"$@\"; fi\n" +
+		": > " + q("first") + "\n" +
+		"out=$(" + realPs + " \"$@\")\n" +
+		": > " + q("spawn") + "\n" +
+		"while [ ! -e " + q("latepid") + " ]; do sleep 0.01; done\n" +
+		"printf '%s\\n' \"$out\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// cancelHelperEscalation runs an escalation against the helper gt, cancels it
+// once the helper has recorded its topology, and waits for it to return. It
+// creates the "armed" file just before canceling.
+func cancelHelperEscalation(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv(helperEnv, dir)
+	gt := writeHelperGt(t, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDiskGuardEscalationCtx(ctx, gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {})
+	}()
+	ready := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "parentpgid")); err == nil {
+			break
+		}
+		if time.Now().After(ready) {
+			t.Fatal("helper never recorded its topology")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Earlier escalations list processes once more, a grace period after they
+	// were canceled. Let those calls happen first, or one of them would use up
+	// the fake ps's single stale listing.
+	time.Sleep(diskGuardEscalateGrace + time.Second)
+	if err := os.WriteFile(filepath.Join(dir, "armed"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("a cancelled escalation must report an error")
+	}
+}
+
+// requireKilled fails unless the process recorded in dir/name stops running.
+func requireKilled(t *testing.T, dir, name string) {
+	t.Helper()
+	pid, err := strconv.Atoi(readTrimmed(t, filepath.Join(dir, name)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if zombieOrGone(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("%s: process %d survived the escalation timeout", name, pid)
 }
 
 // writeHelperGt writes a fake gt that re-execs this test binary into the
@@ -311,63 +411,20 @@ func TestDiskGuardEscalation_ProcessListFailureIsLogged(t *testing.T) {
 }
 
 // A child gt starts after the process tree was snapshotted must still be taken
-// down. The fake ps makes the window deterministic: its first call takes the
-// real listing, has gt spawn a child, and only then returns the stale listing.
+// down. The fake ps makes the window deterministic.
 func TestDiskGuardEscalation_TimeoutKillsChildSpawnedAfterSnapshot(t *testing.T) {
-	realPs, err := exec.LookPath("ps")
-	if err != nil {
-		t.Skipf("no ps: %v", err)
-	}
 	dir := t.TempDir()
-	q := func(name string) string { return "'" + filepath.Join(dir, name) + "'" }
-	script := "#!/bin/sh\n" +
-		"if [ -e " + q("first") + " ]; then exec " + realPs + " \"$@\"; fi\n" +
-		": > " + q("first") + "\n" +
-		"out=$(" + realPs + " \"$@\")\n" +
-		": > " + q("spawn") + "\n" +
-		"while [ ! -e " + q("latepid") + " ]; do sleep 0.01; done\n" +
-		"printf '%s\\n' \"$out\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv(helperEnv, dir)
-	gt := writeHelperGt(t, dir)
+	writeFakePs(t, dir)
+	cancelHelperEscalation(t, dir)
+	requireKilled(t, dir, "latepid")
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- runDiskGuardEscalationCtx(ctx, gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {})
-	}()
-	ready := time.Now().Add(30 * time.Second)
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "parentpgid")); err == nil {
-			break
-		}
-		if time.Now().After(ready) {
-			cancel()
-			t.Fatal("helper never recorded its topology")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	if err := <-done; err == nil {
-		t.Fatal("a cancelled escalation must report an error")
-	}
-
-	late, err := strconv.Atoi(readTrimmed(t, filepath.Join(dir, "latepid")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = syscall.Kill(late, syscall.SIGKILL) })
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if zombieOrGone(late) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("child pid %d spawned after the snapshot survived the escalation timeout", late)
+// Such a child may also have lost its parent by the second listing, as a bd
+// does once gt dies. Only its session ID still ties it to gt.
+func TestDiskGuardEscalation_TimeoutKillsReparentedLateChildBySession(t *testing.T) {
+	dir := t.TempDir()
+	writeFakePs(t, dir)
+	t.Setenv(orphanEnv, "1")
+	cancelHelperEscalation(t, dir)
+	requireKilled(t, dir, "latepid")
 }
