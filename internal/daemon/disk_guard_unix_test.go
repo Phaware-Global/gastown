@@ -4,11 +4,13 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -119,8 +121,32 @@ func runDiskGuardHelper() {
 			os.Exit(4)
 		}
 	}
+	go spawnLateChild(dir)
 	_ = child.Wait()
 	os.Exit(0)
+}
+
+// spawnLateChild starts a second child, in its own process group, once the
+// "spawn" file appears, and records its pid in "latepid".
+func spawnLateChild(dir string) {
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "spawn")); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	late := exec.Command("sleep", "300")
+	late.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := late.Start(); err != nil {
+		os.Exit(5)
+	}
+	tmp := filepath.Join(dir, "latepid.tmp")
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(late.Process.Pid)), 0o644); err != nil {
+		os.Exit(6)
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, "latepid")); err != nil {
+		os.Exit(7)
+	}
 }
 
 // writeHelperGt writes a fake gt that re-execs this test binary into the
@@ -202,4 +228,146 @@ func TestDiskGuardEscalation_BdTimeoutIsBelowOuterTimeout(t *testing.T) {
 	if err != nil || n <= 0 || n >= 20 {
 		t.Fatalf("GT_BD_TIMEOUT_SEC = %q, want a positive integer below the 20s outer timeout", readTrimmed(t, out))
 	}
+}
+
+// gt escalate prints the created line after it has written the bead and sent
+// mail, and can still exit non-zero (a configured notification has no contact).
+// The alert was delivered: retrying would file it again.
+func TestDiskGuardEscalation_CreatedThenNonZeroExitIsFiledOnce(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	gt := writeFakeGt(t, dir, "echo filed >> "+calls+"\n"+
+		"echo '🟠 Escalation created: hq-fake'\n"+
+		"echo 'Error: 1 configured notification(s) were skipped' >&2\n"+
+		"exit 1\n")
+
+	var logged []string
+	logf := func(format string, args ...interface{}) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	free := 20 * gib
+	g, _ := newTestDiskGuard(&free, nil, nil)
+	g.logf = logf
+	g.escalate = func(severity, message string) error {
+		return runDiskGuardEscalation(gt, dir, []string{"escalate"}, 20*time.Second, logf)
+	}
+	now := time.Now()
+	for i := 0; i < 8; i++ {
+		g.check("/data", now.Add(time.Duration(i)*3*time.Minute))
+	}
+	if n := countLines(t, calls); n != 1 {
+		t.Fatalf("a filed escalation must not be filed again, gt called %d times", n)
+	}
+	all := strings.Join(logged, "\n")
+	if strings.Contains(all, "giving up") {
+		t.Fatalf("a delivered alert must not log a give-up error:\n%s", all)
+	}
+	if !strings.Contains(all, "notification") || !strings.Contains(all, "were skipped") {
+		t.Fatalf("the notification failure must be logged:\n%s", all)
+	}
+}
+
+func TestDiskGuardEscalation_FailureBeforeWriteIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	gt := writeFakeGt(t, dir, "echo 'Error: creating escalation bead: refused' >&2\nexit 1\n")
+	if err := runDiskGuardEscalation(gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {}); err == nil {
+		t.Fatal("a failure before the escalation was written must be retried")
+	}
+}
+
+// A timeout is retried even after the created line: gt did not finish, and a
+// bounded duplicate is better than a lost alert.
+func TestDiskGuardEscalation_TimeoutAfterCreatedLineIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	gt := writeFakeGt(t, dir, "echo '🟠 Escalation created: hq-fake'\nexec sleep 300\n")
+	if err := runDiskGuardEscalation(gt, dir, []string{"escalate"}, 500*time.Millisecond, func(string, ...interface{}) {}); err == nil {
+		t.Fatal("a timed-out escalation must report an error")
+	}
+}
+
+// Without a process listing, descendants outside gt's process group cannot be
+// found and may be orphaned, so the failure has to show up in the log.
+func TestDiskGuardEscalation_ProcessListFailureIsLogged(t *testing.T) {
+	dir := t.TempDir()
+	gt := writeFakeGt(t, dir, "exec /bin/sleep 300\n")
+	t.Setenv("PATH", dir) // no ps here
+
+	var mu sync.Mutex
+	var logged []string
+	logf := func(format string, args ...interface{}) {
+		mu.Lock()
+		defer mu.Unlock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	if err := runDiskGuardEscalation(gt, dir, []string{"escalate"}, 300*time.Millisecond, logf); err == nil {
+		t.Fatal("a timed-out escalation must report an error")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, l := range logged {
+		if strings.Contains(l, "cannot list processes") {
+			return
+		}
+	}
+	t.Fatalf("a failing ps must be logged, got %v", logged)
+}
+
+// A child gt starts after the process tree was snapshotted must still be taken
+// down. The fake ps makes the window deterministic: its first call takes the
+// real listing, has gt spawn a child, and only then returns the stale listing.
+func TestDiskGuardEscalation_TimeoutKillsChildSpawnedAfterSnapshot(t *testing.T) {
+	realPs, err := exec.LookPath("ps")
+	if err != nil {
+		t.Skipf("no ps: %v", err)
+	}
+	dir := t.TempDir()
+	q := func(name string) string { return "'" + filepath.Join(dir, name) + "'" }
+	script := "#!/bin/sh\n" +
+		"if [ -e " + q("first") + " ]; then exec " + realPs + " \"$@\"; fi\n" +
+		": > " + q("first") + "\n" +
+		"out=$(" + realPs + " \"$@\")\n" +
+		": > " + q("spawn") + "\n" +
+		"while [ ! -e " + q("latepid") + " ]; do sleep 0.01; done\n" +
+		"printf '%s\\n' \"$out\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(helperEnv, dir)
+	gt := writeHelperGt(t, dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDiskGuardEscalationCtx(ctx, gt, dir, []string{"escalate"}, 20*time.Second, func(string, ...interface{}) {})
+	}()
+	ready := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "parentpgid")); err == nil {
+			break
+		}
+		if time.Now().After(ready) {
+			cancel()
+			t.Fatal("helper never recorded its topology")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("a cancelled escalation must report an error")
+	}
+
+	late, err := strconv.Atoi(readTrimmed(t, filepath.Join(dir, "latepid")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(late, syscall.SIGKILL) })
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if zombieOrGone(late) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("child pid %d spawned after the snapshot survived the escalation timeout", late)
 }
