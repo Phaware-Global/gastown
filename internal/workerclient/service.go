@@ -69,6 +69,14 @@ type Config struct {
 	// worker-side; never transmitted over the socket.
 	AgentEnvFile string
 
+	// CodesignIdentity names a keychain code-signing identity (macOS). When
+	// set, a pushed binary for this machine is re-signed with it, under the
+	// identifier com.gastown.<name>, before it replaces the installed one — so
+	// the signature macOS privacy (TCC) grants are keyed to stays the same
+	// across pushes. A push whose signing fails is refused. Empty: pushed
+	// binaries are installed as received.
+	CodesignIdentity string
+
 	// RestartHook replaces the process exit that applies a pushed worker
 	// binary. nil means os.Exit(0) — the supervisor (launchd KeepAlive,
 	// systemd Restart) brings the new binary up. Tests set it so a test binary
@@ -149,6 +157,9 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.ProxyURL == "" {
 		return nil, fmt.Errorf("workerclient: proxy url is required")
+	}
+	if strings.HasPrefix(cfg.CodesignIdentity, "-") {
+		return nil, fmt.Errorf("workerclient: codesign identity must name a keychain identity; %q is ad-hoc signing and does not keep privacy grants", cfg.CodesignIdentity)
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0700); err != nil {
 		return nil, fmt.Errorf("workerclient: create state dir: %w", err)

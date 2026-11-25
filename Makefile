@@ -4,16 +4,19 @@ BINARY := gt
 BINARY_DESKTOP := gt-desktop
 BUILD_DIR := .
 INSTALL_DIR := $(HOME)/.local/bin
-# Optional: sign the installed gt with a stable keychain identity (macOS).
+# Optional: sign the installed binaries with a stable keychain identity (macOS).
 # An ad-hoc signature hashes differently on every build, so macOS TCC grants
 # (Full Disk Access, Removable Volumes) stop matching after each rebuild and
 # tccd re-hashes the binary on every gt call until an operator re-grants them.
 # A self-signed Code Signing certificate keeps the designated requirement
 # stable across rebuilds. Opt in with: make install GT_CODESIGN_IDENTITY=gt-local
+# It covers gt and the remote-execution binaries: on a worker, gt-worker-client
+# is the long-lived process TCC attributes the agent's file access to.
 # Pass it per invocation rather than exporting it globally: any process that
 # can use the key can mint a gt that inherits gt's privacy grants.
-# The macro signs the staged copy ($(1), always a .new file) before it is moved
-# into place, so a failed signature leaves the existing install untouched.
+# The macro signs the staged copy ($(1), always a .new file) under the
+# identifier com.gastown.$(2) before it is moved into place, so a failed
+# signature leaves the existing install untouched.
 GT_CODESIGN_IDENTITY ?=
 # Never export it: the install recipe restarts the daemon, and anything the
 # daemon spawns would otherwise inherit the identity.
@@ -26,7 +29,7 @@ define codesign-binary
 		esac; \
 		if ! command -v codesign >/dev/null 2>&1; then \
 			echo "Warning: GT_CODESIGN_IDENTITY is set but codesign is not available; installing unsigned"; \
-		elif codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(BINARY) "$(1)"; then \
+		elif codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(2) "$(1)"; then \
 			echo "Signed $(1) with identity $(GT_CODESIGN_IDENTITY)"; \
 		else \
 			echo "Error: codesign with identity $(GT_CODESIGN_IDENTITY) failed; existing install left untouched"; \
@@ -180,7 +183,7 @@ install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	@# Stage, sign, then move: a failed signature must not leave a half-done install.
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
-	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new)
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new,$(BINARY))
 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
@@ -217,7 +220,7 @@ safe-install: check-up-to-date check-forward-only build
 	@mkdir -p $(INSTALL_DIR)
 	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
-	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new)
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new,$(BINARY))
 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
@@ -240,13 +243,25 @@ safe-install: check-up-to-date check-forward-only build
 # that acts as both orchestrator and worker (the single-box setup) is complete
 # after one `make install`. gt-proxy-client comes too: on a worker it IS `gt` and
 # `bd` (the shims `gt worker service install` creates point at it), so a worker
-# without it has an agent that cannot reach the control plane at all. All are
-# replaced atomically, like gt itself.
+# without it has an agent that cannot reach the control plane at all.
+# gt-proxy-server is the orchestrator end of that: without it a worker's gt and
+# bd have nothing to call.
+#
+# All are staged and signed first (see codesign-binary) and only then moved into
+# place, so a failed signature replaces none of them.
+REMOTE_EXECUTION_BINARIES := $(BINARY)-worker-attach $(BINARY)-worker-client $(BINARY)-proxy-client $(BINARY)-proxy-server
 install-remote-execution-binaries:
-	@for b in $(BINARY)-worker-attach $(BINARY)-worker-client $(BINARY)-proxy-client; do \
+	@mkdir -p $(INSTALL_DIR)
+	@for b in $(REMOTE_EXECUTION_BINARIES); do \
 		cp $(BUILD_DIR)/$$b $(INSTALL_DIR)/$$b.new && \
+		( $(call codesign-binary,$(INSTALL_DIR)/$$b.new,$$b) ) || { \
+			for s in $(REMOTE_EXECUTION_BINARIES); do rm -f $(INSTALL_DIR)/$$s.new; done; \
+			exit 1; \
+		}; \
+	done
+	@for b in $(REMOTE_EXECUTION_BINARIES); do \
 		mv $(INSTALL_DIR)/$$b.new $(INSTALL_DIR)/$$b && \
-		echo "Installed $$b to $(INSTALL_DIR)/$$b"; \
+		echo "Installed $$b to $(INSTALL_DIR)/$$b" || exit 1; \
 	done
 	@$(MAKE) --no-print-directory install-artifacts
 
@@ -275,12 +290,14 @@ dist:
 
 # install-artifacts: place THIS platform's pushable binaries in the artifact
 # tree, so a same-platform worker can be refreshed after a plain `make install`
-# without anyone remembering to run `make dist`.
+# without anyone remembering to run `make dist`. They are copied from the
+# install dir, not the build dir, so what is pushed carries the same signature
+# as what was installed.
 install-artifacts:
 	@outdir="$(ARTIFACT_DIR)/$$(go env GOOS)-$$(go env GOARCH)"; \
 	mkdir -p "$$outdir"; \
 	for b in $(PUSHABLE); do \
-		cp $(BUILD_DIR)/$$b "$$outdir/$$b.new" && mv "$$outdir/$$b.new" "$$outdir/$$b"; \
+		cp $(INSTALL_DIR)/$$b "$$outdir/$$b.new" && mv "$$outdir/$$b.new" "$$outdir/$$b"; \
 	done; \
 	echo "Installed this platform's pushable binaries to $$outdir"
 
@@ -322,6 +339,7 @@ test: test-makefile
 
 test-makefile:
 	bash scripts/check-install-path_test.sh
+	bash scripts/check-codesign_test.sh
 	bash scripts/check-icu_test.sh
 
 # Run e2e tests in isolated container (the only supported way to run them)

@@ -20,8 +20,15 @@ launchd job only.
 | `git` | operator-provisioned | the worktree is cloned through the session relay |
 | Docker | only for `exec_mode: container` | Docker Desktop on macOS |
 
-The orchestrator additionally needs `gt-worker-attach`, which `make install`
-places next to `gt`. It is the process the tmux pane runs in place of the agent.
+The orchestrator additionally needs `gt-worker-attach` and `gt-proxy-server`,
+which `make install` places next to `gt`. `gt-worker-attach` is the process the
+tmux pane runs in place of the agent. `gt-proxy-server` is what a worker's `gt`
+and `bd` call (`docs/proxy-server.md`); nothing starts it for you, so run it
+under your own supervisor on the orchestrator before enrolling a worker:
+
+```bash
+gt-proxy-server --listen 0.0.0.0:9876
+```
 
 ## 1. Enroll the machine
 
@@ -32,13 +39,20 @@ gt worker enroll mac-mini-1 --generate-token
 ```
 
 That prints the worker-side command with a single-use join token. Run it on the
-**worker**:
+**worker**; it generates the machine key and waits for the orchestrator:
 
 ```bash
 gt-worker-client enroll \
     -listen 0.0.0.0:9899 \
     -tls-dir ~/Library/Application\ Support/gt-worker/tls \
     -join-token-file /path/to/token
+```
+
+Then, back on the **orchestrator**, complete the enrollment by dialing the
+waiting worker. This is the step that signs its certificate:
+
+```bash
+GT_JOIN_TOKEN=<the token> gt worker enroll mac-mini-1 --address mac-mini-1.local:9899
 ```
 
 The worker generates its own key — only a CSR crosses the wire — and writes
@@ -150,6 +164,53 @@ A worker on a different OS/architecture than the orchestrator is **refused**
 rather than pushed to — this orchestrator only has its own platform's binaries,
 and installing one the worker cannot execute is worse than leaving it stale.
 Upgrade such a worker in place with `make install` there.
+
+### Code signing (macOS)
+
+On a worker, `gt-worker-client` is the long-lived process macOS attributes the
+agent's file access to — the agent, `git` and every build tool are its
+children. Privacy (TCC) grants are keyed to a binary's signature, and an
+unsigned build has a different code hash every time, so each new binary
+invalidates the grants and `tccd` re-evaluates it on every access. Give the
+worker a stable signature the same way `gt` gets one (`docs/INSTALLING.md`):
+
+1. Install on the worker with an identity. This signs `gt-worker-client`,
+   `gt-proxy-client`, `gt-worker-attach` and `gt-proxy-server` as
+   `com.gastown.<binary>`, and fails without replacing anything if signing
+   fails:
+
+   ```bash
+   make install GT_CODESIGN_IDENTITY=gt-local
+   ```
+
+   `gt worker service install` copies those binaries into `<state-dir>/bin`
+   byte for byte, so the copies keep the signature.
+
+2. Tell the service to keep it across pushes:
+
+   ```bash
+   gt worker service install … --codesign-identity gt-local
+   ```
+
+   A pushed binary is built on the orchestrator, so it arrives with the
+   orchestrator's signature (or none). With `--codesign-identity` the worker
+   re-signs it with its **own** identity, as `com.gastown.<binary>`, while it
+   is still staged. If that signing fails the push is refused and the
+   installed binary stays, which `gt worker push-binaries <rig>` reports.
+   Without the flag, pushed binaries are installed as received.
+
+The identity lives in the worker's login keychain and never leaves the machine.
+The service runs as a LaunchAgent in the GUI session, which is where the login
+keychain is available; allow `codesign` to use the key without a prompt, as
+described in `docs/INSTALLING.md`. Signing is given 60 seconds: a locked
+keychain or a permission prompt refuses the push instead of hanging it.
+
+A prompt-free key is not an access boundary. Any process running as this user
+can then sign a binary as `com.gastown.<binary>` that inherits the privacy
+grants of the one it replaces, and on a worker that includes a native-mode
+agent, which handles untrusted repository content. Grant Full Disk Access to
+`gt-worker-client` only on workers where that is acceptable, or run agents in
+container mode.
 
 ### Container mode
 
