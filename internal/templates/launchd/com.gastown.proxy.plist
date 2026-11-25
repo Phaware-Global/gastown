@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gastown.proxy</string>
+
+    <!-- Arguments are passed as an array, with no shell in between: the proxy
+         needs no secrets file sourced, so there is nothing to quote for a
+         shell, only for XML. -->
+    <key>ProgramArguments</key>
+    <array>
+{{- range .Args}}
+        <string>{{xml .}}</string>
+{{- end}}
+    </array>
+
+    <!-- The proxy runs gt and bd for remote polecats with no working directory
+         of its own choosing, so they inherit this one: the town root, where gt
+         finds the workspace. -->
+    <key>WorkingDirectory</key>
+    <string>{{xml .TownRoot}}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- A remote polecat cannot reach the control plane while the proxy is
+         down: every gt and bd call it makes fails. Always come back. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{xml .LogPath}}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{xml .LogPath}}</string>
+
+    <!-- PATH only. Proxied commands are started with HOME and PATH and
+         nothing else, so no credential belongs in this job's environment. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{xml .Path}}</string>
+    </dict>
+
+    <!-- It serves agents' interactive calls; Background would throttle it. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

@@ -109,3 +109,16 @@ func loadConfig(path string) (ProxyConfig, error) {
 	}
 	return cfg, nil
 }
+
+// checkConfigFile reports whether the server would start on the config at path:
+// it parses into ProxyConfig and its exec_timeout is in range. It backs
+// -check-config, so `gt proxy service install` can refuse a config that would
+// leave the supervised server exiting on every start.
+func checkConfigFile(path string) error {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	_, err = cfg.execTimeout()
+	return err
+}
