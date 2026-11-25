@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -427,4 +428,29 @@ func TestDiskGuardEscalation_TimeoutKillsReparentedLateChildBySession(t *testing
 	t.Setenv(orphanEnv, "1")
 	cancelHelperEscalation(t, dir)
 	requireKilled(t, dir, "latepid")
+}
+
+// A pid that exited between the two listings may name an unrelated process by
+// the second one. Neither it nor its children are gt's to signal.
+func TestLateProcesses(t *testing.T) {
+	// No real process leads a session with this ID, so only ancestry matches.
+	const root = 1 << 30
+	known := []procInfo{{pid: root + 1, ppid: root, started: "then"}}
+	child := procInfo{pid: root + 2, ppid: root + 1, started: "later"}
+	for _, tc := range []struct {
+		name   string
+		parent string // start time of the known pid at the second listing
+		want   []procInfo
+	}{
+		{"same process", "then", []procInfo{child}},
+		{"reused pid", "later", nil},
+	} {
+		procs := map[int]procInfo{
+			root + 1:  {pid: root + 1, ppid: 1, started: tc.parent},
+			child.pid: child,
+		}
+		if got := lateProcesses(procs, root, known); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: got %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
 }
