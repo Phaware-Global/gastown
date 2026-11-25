@@ -989,7 +989,7 @@ const GUPPViolationTimeout = constants.GUPPViolationTimeout
 // The wisps query is best-effort (gracefully ignored if table doesn't exist).
 func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	// Query issues table (backward compat during migration)
-	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
+	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--include-infra", "--json", "--flat", "--limit=0") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
