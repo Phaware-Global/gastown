@@ -984,17 +984,27 @@ func identityToBDActor(identity string) string {
 // Defined in constants package — this alias avoids updating all call sites.
 const GUPPViolationTimeout = constants.GUPPViolationTimeout
 
-// listAgentBeadsJSON queries both the issues and wisps tables for agent beads
-// and unmarshals the combined results into the provided slice pointer.
-// The wisps query is best-effort (gracefully ignored if table doesn't exist).
+// listAgentBeadsJSON queries the town database for agent beads, by label, by
+// type=agent and from the wisp list, and unmarshals the combined results into
+// the provided slice pointer. The type and wisp queries are best-effort.
 func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	// Query issues table (backward compat during migration)
-	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--include-infra", "--json", "--flat", "--limit=0") //nolint:gosec // G204: bd is a trusted internal tool
+	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat", "--limit=0") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
 	issuesOutput, issuesErr := cmd.Output()
+
+	// The label query hides type=agent records. Ask for them by type:
+	// --include-infra on the label query would reveal them too, but makes bd
+	// scan every infrastructure record in the wisp-heavy town database.
+	typeCmd := exec.Command(d.bdPath, "list", "--type=agent", "--json", "--flat", "--limit=0") //nolint:gosec // G204: bd is a trusted internal tool
+	typeCmd.Dir = d.config.TownRoot
+	typeCmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
+	util.SetDetachedProcessGroup(typeCmd)
+
+	typeOutput, _ := typeCmd.Output()
 
 	// Query wisps table (primary source after agent bead migration)
 	wispCmd := exec.Command(d.bdPath, "mol", "wisp", "list", "--json") //nolint:gosec // G204: bd is a trusted internal tool
@@ -1005,7 +1015,8 @@ func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 	wispOutput, _ := wispCmd.Output() // Best-effort: wisps table may not exist
 
 	// Merge results: parse wisps first, then issues (wisps take precedence)
-	combined := mergeAgentBeadJSON(wispOutput, issuesOutput)
+	// The inner merge de-duplicates the type and label results.
+	combined := mergeAgentBeadJSON(wispOutput, mergeAgentBeadJSON(typeOutput, issuesOutput))
 	if combined == nil {
 		if issuesErr != nil {
 			return fmt.Errorf("bd list failed: %w", issuesErr)
