@@ -3985,7 +3985,8 @@ type BranchPreservationStatus struct {
 // branch, then explicit target branches, then upstream. It only falls back to the
 // remote default branch when no target/custody/upstream evidence exists.
 func (g *Git) BranchPreservationStatus(localBranch, remote string, targets []string) (BranchPreservationStatus, error) {
-	return g.branchPreservationStatus(localBranch, remote, targets, true)
+	status, err := g.branchPreservationStatus(localBranch, remote, targets, true)
+	return g.withRemoteWork(status, err, localBranch, remote)
 }
 
 // BranchTargetStatus checks whether HEAD is already represented on the branch's
@@ -3993,7 +3994,8 @@ func (g *Git) BranchPreservationStatus(localBranch, remote string, targets []str
 // branch is not enough evidence because pushed-but-unsubmitted work still needs
 // merge-queue recovery.
 func (g *Git) BranchTargetStatus(localBranch, remote string, targets []string) (BranchPreservationStatus, error) {
-	return g.branchPreservationStatus(localBranch, remote, targets, false)
+	status, err := g.branchPreservationStatus(localBranch, remote, targets, false)
+	return g.withRemoteWork(status, err, localBranch, remote)
 }
 
 func (g *Git) branchPreservationStatus(localBranch, remote string, targets []string, includeExactBranch bool) (BranchPreservationStatus, error) {

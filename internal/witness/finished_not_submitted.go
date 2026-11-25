@@ -104,11 +104,23 @@ func detectFinishedNotSubmitted(bd *BdCli, workDir, townRoot, rigName, polecatNa
 	if err != nil {
 		return ZombieResult{}, false
 	}
-	in.Clean = ws.CleanExcludingRuntime() && ws.UnpushedCommits == 0 && ws.StashCount == 0
+	// A remote polecat's finished work is in its work ref: the worker pushed
+	// it there and gt done has not published it. That is this check's
+	// "pushed, clean and ahead" for such a polecat, so the ref's commits count
+	// as the work ahead of base and not as a dirty worktree.
+	work, err := g.UnpublishedRemoteWork(branch, "origin")
+	if err != nil {
+		return ZombieResult{}, false
+	}
+	in.Clean = ws.CleanExcludingRuntime() && ws.UnpushedCommits-work.Unpublished == 0 && ws.StashCount == 0
 	if _, err := g.Rev("origin/HEAD"); err != nil {
 		return ZombieResult{}, false
 	}
-	ahead, err := g.CommitsAhead("origin/HEAD", "HEAD")
+	workRev := "HEAD"
+	if work.Unpublished > 0 {
+		workRev = work.Ref
+	}
+	ahead, err := g.CommitsAhead("origin/HEAD", workRev)
 	if err != nil {
 		return ZombieResult{}, false
 	}

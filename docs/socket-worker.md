@@ -283,6 +283,24 @@ The host worktree never receives the agent's files. Instead:
 - A session that is provisioned again (after a worker restart, say) starts from
   its work ref, so pushed work is not lost with the clone.
 
+Commits in a work ref that origin does not hold count as the polecat's unpushed
+work everywhere the host asks that question, although its worktree is clean:
+
+- The witness's recovery, zombie and push-failure checks, `gt doctor`'s stalled
+  polecat check and the cleanup status all report them.
+- Removing the polecat publishes the work ref to origin as the branch (hooks
+  disabled, nothing checked out) after the same commit checks a local branch
+  gets, and then deletes the work ref. If that cannot be done it is refused.
+  This includes `gt polecat nuke`, which preserves work before it destroys
+  the polecat: it publishes a remote polecat's commits too, with hooks
+  disabled. `--discard-unpushed` applies only when publishing is not
+  possible, and then deletes the work ref unpublished. To keep a worker's
+  commits off origin altogether, delete the work ref by hand before removing
+  the polecat.
+- `gt polecat gc` prunes a work ref that no polecat owns once origin holds all
+  of its commits. One that is the only copy of its work is kept and named, for
+  an operator to inspect and publish or delete by hand.
+
 Host-side `gt done` completes a remote polecat from that work ref, without
 checking it out:
 

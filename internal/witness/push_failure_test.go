@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 const (
@@ -494,5 +495,22 @@ func TestPushFailureAssessment_DeliveredBranchNeverHEAD(t *testing.T) {
 		if got := (pushFailureAssessment{Branch: tc.in}).deliveredBranch(); got != tc.want {
 			t.Errorf("deliveredBranch(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// A remote polecat's host worktree is clean and its HEAD is on origin, which
+// used to read as "nothing at risk" while its commits sat only in the work ref.
+func TestAssessPushFailure_RemoteWorkOnlyInWorkRefIsAtRisk(t *testing.T) {
+	f := newPushFixture(t)
+	branch := "polecat/nux/al-1@mvx"
+	f.polecatBranch(branch)
+	sha := f.commit(f.clone, "remote-work.txt")
+	gitIn(t, f.clone, "update-ref", constants.RemoteWorkRef(branch), sha)
+	gitIn(t, f.clone, "reset", "-q", "--hard", "HEAD~1")
+
+	a := f.assess(branch)
+	expectAtRisk(t, a)
+	if !strings.Contains(a.Reason, constants.RemoteWorkRef(branch)) {
+		t.Errorf("reason %q does not name the work ref", a.Reason)
 	}
 }
