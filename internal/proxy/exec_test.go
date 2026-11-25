@@ -783,3 +783,35 @@ func TestBinaryResolution(t *testing.T) {
 		"non-existent binary should be removed from allowlist")
 	assert.True(t, lc.hasLevel(slog.LevelError), "expected error log for missing binary")
 }
+
+// A hook handler such as `gt tap guard` reads the tool input from stdin, so a
+// proxied call must be able to carry it.
+func TestHandleExec_ForwardsStdin(t *testing.T) {
+	srv := newExecTestServer(t, Config{AllowedCommands: []string{"cat"}})
+
+	req := makeFakeRequest("POST", "/v1/exec", `{"argv":["cat"],"stdin":"{\"tool_input\":{\"command\":\"ls\"}}"}`, "gt-demo-furiosa")
+	rec := httptest.NewRecorder()
+	srv.handleExec(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp execResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, 0, resp.ExitCode)
+	assert.Equal(t, `{"tool_input":{"command":"ls"}}`, resp.Stdout)
+}
+
+// With no stdin in the request the subprocess reads an empty stdin, never the
+// server's own.
+func TestHandleExec_NoStdinIsEmpty(t *testing.T) {
+	srv := newExecTestServer(t, Config{AllowedCommands: []string{"cat"}})
+
+	req := makeFakeRequest("POST", "/v1/exec", `{"argv":["cat"]}`, "gt-demo-furiosa")
+	rec := httptest.NewRecorder()
+	srv.handleExec(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp execResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	assert.Equal(t, 0, resp.ExitCode)
+	assert.Empty(t, resp.Stdout)
+}

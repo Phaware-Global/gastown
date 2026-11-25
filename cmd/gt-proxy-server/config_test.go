@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -198,4 +199,62 @@ func TestParseAllowedSubcmdsRoundTrip(t *testing.T) {
 		reparsed := parseAllowedSubcmds(built)
 		assert.Empty(t, reparsed, "empty sub-list is lost on round-trip")
 	})
+}
+
+// gt done runs through the proxy for a remote polecat and pushes, opens a PR
+// and updates beads: the 60s default can be too short, so it is configurable.
+func TestLoadConfig_ExecTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"exec_timeout":"4m"}`), 0600))
+	cfg, err := loadConfig(path)
+	require.NoError(t, err)
+
+	d, err := cfg.execTimeout()
+	require.NoError(t, err)
+	assert.Equal(t, 4*time.Minute, d)
+
+	d, err = ProxyConfig{}.execTimeout()
+	require.NoError(t, err)
+	assert.Zero(t, d, "unset keeps the server default")
+
+	_, err = ProxyConfig{ExecTimeout: "soon"}.execTimeout()
+	require.Error(t, err)
+
+	// Not positive: it would remove the per-command deadline altogether.
+	for _, v := range []string{"-1s", "0s"} {
+		_, err = ProxyConfig{ExecTimeout: v}.execTimeout()
+		require.Error(t, err, v)
+	}
+	// At or above the five-minute transport ceiling: it could never take effect.
+	for _, v := range []string{"5m", "10m"} {
+		_, err = ProxyConfig{ExecTimeout: v}.execTimeout()
+		require.Error(t, err, v)
+	}
+}
+
+// checkConfigFile is what `-check-config` runs: everything the server would refuse
+// to start on, without starting it. A value of the wrong JSON type parses as
+// JSON but not as this config, and exec_timeout has bounds of its own.
+func TestCheckConfig(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
+		return path
+	}
+
+	require.NoError(t, checkConfigFile(filepath.Join(t.TempDir(), "absent.json")), "a missing file is an empty config")
+	require.NoError(t, checkConfigFile(write(t, `{"extra_san_hosts":["orchestrator.local"],"exec_timeout":"4m"}`)))
+
+	for name, body := range map[string]string{
+		"string where a list is expected":   `{"extra_san_hosts": "orchestrator.local"}`,
+		"number where a string is expected": `{"listen_addr": 9876}`,
+		"top-level array":                   `[]`,
+		"exec_timeout over the ceiling":     `{"exec_timeout": "10m"}`,
+		"not JSON":                          `{"extra_san_hosts": [`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, checkConfigFile(write(t, body)))
+		})
+	}
 }

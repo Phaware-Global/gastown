@@ -336,7 +336,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if rigName == "" {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
-
 	// Get configured default branch for this rig. Resolved here (before the
 	// gt-pvx auto-save below) rather than at first use, because it is also
 	// the unverified-commit guard's ONLY protected branch (gt-35un/gt-xitk
@@ -435,6 +434,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 	}
+
+	// Where the work being completed lives: this worktree's HEAD for a local
+	// polecat, the pushed work ref for a remote one (see doneWork).
+	work := resolveDoneWork(filepath.Join(townRoot, rigName), branch, isPolecatSession(cwd, townRoot))
 
 	// Auto-detect cleanup status if not explicitly provided
 	// This prevents premature polecat cleanup by ensuring witness knows git state
@@ -797,13 +800,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot complete: uncommitted changes would be lost\nCommit your changes first, or use --status DEFERRED to exit without completing\nUncommitted: %s", workStatus.String())
 		}
 
+		// A remote polecat's commits are in its work ref, never in this
+		// worktree. Refuse before anything is published or recorded if the
+		// worker has not pushed them.
+		if err := work.requireRemoteWork(g, branch); err != nil {
+			clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
+			return err
+		}
+		if work.remote {
+			fmt.Printf("→ Remote polecat: completing from %s without checking it out. Auto-rebase, overlay strip and submodule push do not apply and are skipped.\n", work.srcRef)
+		}
+
 		// Check if branch has commits ahead of origin/default
 		// If not, work may have been pushed directly to main - that's fine, just skip MR
 		originDefault := "origin/" + defaultBranch
-		aheadCount, err := g.CommitsAhead(originDefault, "HEAD")
+		aheadCount, err := g.CommitsAhead(originDefault, work.rev)
 		if err != nil {
 			// Fallback to local branch comparison if origin not available
-			aheadCount, err = g.CommitsAhead(defaultBranch, branch)
+			aheadCount, err = g.CommitsAhead(defaultBranch, work.localRev(branch))
 			if err != nil {
 				// Can't determine - assume work exists and continue
 				style.PrintWarning("could not check commits ahead of %s: %v", defaultBranch, err)
@@ -917,7 +931,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 				if !skipClose {
 					closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
-					noMRCommitSHA, _ := g.Rev("HEAD")
+					noMRCommitSHA, _ := g.Rev(work.rev)
 					baseSHA, _ := g.Rev(originDefault)
 
 					// Worktree-reset guard (hga-y3jm false-completion): a real code
@@ -1009,7 +1023,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if fetchErr := g.Fetch("origin"); fetchErr != nil {
 			style.PrintWarning("could not fetch origin before contamination check: %v (proceeding with local refs)", fetchErr)
 		}
-		contam, err := g.CheckBranchContamination(contaminationBase)
+		contam, err := work.contamination(g, contaminationBase)
 		if err == nil && contam.Behind > 0 {
 			const warnThreshold = 50
 			const blockThreshold = 200
@@ -1025,8 +1039,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// gh#3400: Auto-rebase the polecat branch onto the latest target before
 			// push, so the resulting MR/PR has a current base.
 			alreadyPushed := checkpoints[CheckpointPushed] == branch
-			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, branch, contaminationBase, contam.Behind, donePreVerified, alreadyPushed,
-				convoyInfo != nil && convoyInfo.MergeStrategy == "direct")
+			var rebased bool
+			var skipReason string
+			var rebaseErr error
+			if work.remote {
+				// A rebase rewrites the branch in a worktree. The work is not in
+				// one on this host; the worker rebases and pushes again.
+				skipReason = "the work is on a remote worker"
+			} else {
+				rebased, skipReason, rebaseErr = autoRebaseOnTarget(g, branch, contaminationBase, contam.Behind, donePreVerified, alreadyPushed,
+					convoyInfo != nil && convoyInfo.MergeStrategy == "direct")
+			}
 			if rebaseErr != nil {
 				return rebaseErr
 			}
@@ -1042,7 +1065,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Strip Gas Town overlay from CLAUDE.md / CLAUDE.local.md (gt-p35).
 		// Polecats commit the overlay (polecat lifecycle boilerplate) into repos,
 		// overwriting project-specific CLAUDE.md content. Detect and revert before push.
-		if stripped := stripOverlayCLAUDEmd(g, defaultBranch); stripped {
+		if stripped := !work.remote && stripOverlayCLAUDEmd(g, defaultBranch); stripped {
 			// Recalculate commits ahead since we added a cleanup commit
 			aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
 		}
@@ -1081,22 +1104,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseUnverifiedPushRef(g, work.srcRef, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
 				goto notifyWitness
 			}
-			if reason := refuseWIPCommitPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseWIPCommitPushRef(g, work.srcRef, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
 				goto notifyWitness
 			}
 			// Push submodule changes before direct push (gt-dzs)
-			pushSubmoduleChanges(g, defaultBranch)
-			directRefspec := branch + ":" + defaultBranch
-			directPushErr := g.Push("origin", directRefspec, false)
+			if !work.remote {
+				pushSubmoduleChanges(g, defaultBranch)
+			}
+			directRefspec := work.refspec(branch, defaultBranch)
+			directPushErr := work.pushDirect(g, directRefspec)
 			if directPushErr != nil {
 				pushFailed = true
 				errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
@@ -1104,7 +1129,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				style.PrintWarning("%s", errMsg)
 				goto notifyWitness
 			}
-			directCommitSHA, _ := g.Rev("HEAD")
+			directCommitSHA, _ := g.Rev(work.rev)
 			if doneSkipVerify {
 				noteVerifiedPushSkipped(cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
 			} else if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, directCommitSHA); verifyErr != nil {
@@ -1153,13 +1178,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Validate checkpoint branch matches current branch (ge-sbo: stale checkpoint
 		// on polecat reassignment causes new work to skip push for old branch).
 		if checkpoints[CheckpointPushed] != "" {
-			if checkpoints[CheckpointPushed] == branch {
+			switch {
+			case checkpoints[CheckpointPushed] != branch:
+				// Stale checkpoint from a previous assignment — discard and push normally.
+				fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
+					checkpoints[CheckpointPushed], branch)
+			case !work.pushCheckpointHolds(g, branch):
+				// A remote worker pushed more after the checkpointed push.
+				fmt.Printf("→ Discarding push checkpoint: %s has moved since it was published\n", work.srcRef)
+			default:
 				fmt.Printf("%s Branch already pushed (resumed from checkpoint)\n", style.Bold.Render("✓"))
 				goto afterPush
 			}
-			// Stale checkpoint from a previous assignment — discard and push normally.
-			fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
-				checkpoints[CheckpointPushed], branch)
 		}
 
 		// Never publish a commit made with commit hooks bypassed (durable
@@ -1167,13 +1197,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// when the tree was dirty, but an earlier auto-save/checkpoint
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
-		if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+		if reason := refuseUnverifiedPushRef(g, work.srcRef, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
 			goto notifyWitness
 		}
-		if reason := refuseWIPCommitPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+		if reason := refuseWIPCommitPushRef(g, work.srcRef, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1189,16 +1219,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// If the parent repo's submodule pointer references commits that don't
 		// exist on the submodule's remote, the Refinery MR will be broken.
 		// Detect modified submodules and push each one first.
-		pushSubmoduleChanges(g, defaultBranch)
+		if !work.remote {
+			pushSubmoduleChanges(g, defaultBranch)
+		}
 
 		// Use explicit refspec (branch:branch) to create the remote branch.
 		// Without refspec, git push follows the tracking config — polecat branches
 		// track origin/main, so a bare push sends commits to main directly,
 		// bypassing the MR/refinery flow (G20 root cause).
 		fmt.Printf("Pushing branch to remote...\n")
-		refspec = branch + ":" + branch
-		pushedCommitSHA, _ = g.Rev("HEAD")
-		pushErr = g.Push("origin", refspec, false)
+		refspec = work.refspec(branch, branch)
+		pushedCommitSHA, _ = g.Rev(work.rev)
+		pushErr = work.push(g, refspec)
 		if pushErr != nil {
 			// Primary push failed — try fallback from the bare repo (GH #1348).
 			// When polecat sessions are reused or worktrees are stale, the worktree's
@@ -1209,7 +1241,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			bareRepoPath := filepath.Join(rigPath, ".repo.git")
 			if _, statErr := os.Stat(bareRepoPath); statErr == nil {
 				bareGit := git.NewGitWithDir(bareRepoPath, "")
-				pushErr = bareGit.Push("origin", refspec, false)
+				pushErr = work.push(bareGit, refspec)
 				if pushErr != nil {
 					style.PrintWarning("bare repo push also failed: %v", pushErr)
 				} else {
@@ -1220,7 +1252,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				mayorPath := filepath.Join(rigPath, "mayor", "rig")
 				if _, statErr := os.Stat(mayorPath); statErr == nil {
 					mayorGit := git.NewGit(mayorPath)
-					pushErr = mayorGit.Push("origin", refspec, false)
+					pushErr = work.push(mayorGit, refspec)
 					if pushErr != nil {
 						style.PrintWarning("mayor/rig push also failed: %v", pushErr)
 					} else {
@@ -1243,7 +1275,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// any MR bead. Branch-exists checks are insufficient: a stale remote
 		// branch can exist while the new commit never reached origin.
 		if pushedCommitSHA == "" {
-			pushedCommitSHA, _ = g.Rev("HEAD")
+			pushedCommitSHA, _ = g.Rev(work.rev)
 		}
 		if doneSkipVerify {
 			noteVerifiedPushSkipped(cwd, issueID, branch, pushedCommitSHA, "--skip-verify on branch push")
@@ -1334,7 +1366,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			var headSHA string
 			if completion.reusePR > 0 {
-				headSHA, _ = g.Rev("HEAD")
+				headSHA, _ = g.Rev(work.rev)
 				// The reuse path force-closes the bead as "completed against
 				// PR #N" without pushing anything to that PR itself — verify
 				// the work is on PR #N's head first, or a review-fix polecat
@@ -1380,7 +1412,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					}
 				}
 				// Add diff stat for quick review context
-				if diffStat, diffErr := g.DiffStat(defaultBranch + "..." + branch); diffErr == nil && diffStat != "" {
+				if diffStat, diffErr := g.DiffStat(defaultBranch + "..." + work.localRev(branch)); diffErr == nil && diffStat != "" {
 					prBodyBuilder.WriteString("## Changes\n\n```\n")
 					prBodyBuilder.WriteString(diffStat)
 					prBodyBuilder.WriteString("```\n\n")
@@ -1666,13 +1698,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseUnverifiedPushRef(g, work.srcRef, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
 				goto notifyWitness
 			}
-			if reason := refuseWIPCommitPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseWIPCommitPushRef(g, work.srcRef, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -1680,13 +1712,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 
 			// Push branch directly to main (the earlier push went to origin/<branch>)
-			directRefspec := branch + ":" + defaultBranch
-			directPushErr := g.Push("origin", directRefspec, false)
+			directRefspec := work.refspec(branch, defaultBranch)
+			directPushErr := work.pushDirect(g, directRefspec)
 			if directPushErr != nil {
 				// Direct push failed — fall through to normal MR creation
 				style.PrintWarning("late direct push to %s failed: %v — falling through to MR", defaultBranch, directPushErr)
 			} else {
-				lateDirectCommitSHA, _ := g.Rev("HEAD")
+				lateDirectCommitSHA, _ := g.Rev(work.rev)
 				if doneSkipVerify {
 					noteVerifiedPushSkipped(cwd, issueID, defaultBranch, lateDirectCommitSHA, "--skip-verify on late direct merge")
 				} else if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, lateDirectCommitSHA); verifyErr != nil {
@@ -1773,7 +1805,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// gt-beuz: refuse an MR that is self-referential, targets the wrong base,
 		// or carries commits already on another open PR (e.g. a copy of a draft PR's branch).
-		if guardWarnings, guardErr := checkMRSubmitGuards(realMRGuardEnv(g), branch, target); guardErr != nil {
+		if guardWarnings, guardErr := checkMRSubmitGuards(work.mrGuardEnv(g), branch, target); guardErr != nil {
 			clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 			return guardErr
 		} else {
@@ -1803,7 +1835,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Branch name alone is not a valid dedup key — a polecat may push new
 		// commits to the same branch after a gate failure. The commit SHA
 		// distinguishes genuinely new submissions from idempotent retries.
-		commitSHA, _ = g.Rev("HEAD")
+		commitSHA, _ = g.Rev(work.rev)
 
 		// Resume: skip MR creation if already completed in a previous run (gt-aufru).
 		// Mirrors the push checkpoint pattern above. Without this, every retry
@@ -2158,6 +2190,12 @@ notifyWitness:
 				} else {
 					fmt.Printf("%s Deleted old branch %s\n", style.Bold.Render("✓"), oldBranch)
 				}
+			}
+
+			// The published branch on origin is now the record of a remote
+			// polecat's work; drop the host's copy of it (see releaseRemoteWork).
+			if err := work.releaseRemoteWork(g); err != nil {
+				style.PrintWarning("kept %s: %v", work.srcRef, err)
 			}
 		}
 
@@ -2888,15 +2926,16 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 
 // parseCleanupStatus converts a string flag value to a CleanupStatus.
 // ZFC: Agent observes git state and passes the appropriate status.
-// refuseUnverifiedPush returns a non-empty, operator-facing reason when the
-// current branch must not be pushed to origin: it carries a commit made with
+// refuseUnverifiedPushRef returns a non-empty, operator-facing reason when
+// ref (the fully-qualified local ref about to be published: the polecat branch,
+// or a remote polecat's work ref) must not be pushed to origin: it carries a commit made with
 // commit hooks bypassed (the durable Gastown-Unverified trailer — typically
 // a secret scanner rejected it), or that state could not be checked. Every
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git, branch string, protectedBranches []string) string {
-	badSHA, err := git.HasUnverifiedCommitAt(g, "origin", "refs/heads/"+branch, protectedBranches)
+func refuseUnverifiedPushRef(g *git.Git, ref string, protectedBranches []string) string {
+	badSHA, err := git.HasUnverifiedCommitAt(g, "origin", ref, protectedBranches)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
@@ -2914,7 +2953,13 @@ func refuseUnverifiedPush(g *git.Git, branch string, protectedBranches []string)
 // branch): this catches one that got there anyway, e.g. from a worktree that
 // predates the Ephemeral fix.
 func refuseWIPCommitPush(g *git.Git, branch string, protectedBranches []string) string {
-	badSHA, err := git.HasWIPCommit(g, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, protectedBranches)
+	return refuseWIPCommitPushRef(g, "refs/heads/"+branch, protectedBranches)
+}
+
+// refuseWIPCommitPushRef is refuseWIPCommitPush for a fully-qualified ref, so
+// the guard also covers a remote polecat's work ref.
+func refuseWIPCommitPushRef(g *git.Git, ref string, protectedBranches []string) string {
+	badSHA, err := git.HasWIPCommit(g, "origin", ref, checkpoint.WIPCommitPrefix, protectedBranches)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for checkpoint auto-save commits — refusing to push until it can be verified: %v", err)
 	}

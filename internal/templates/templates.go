@@ -168,6 +168,52 @@ func RenderWorkerLaunchd(data WorkerSupervisorData) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// ProxySupervisorData renders the orchestrator's gt-proxy-server launchd job.
+type ProxySupervisorData struct {
+	// Args is the complete argv, binary first. launchd runs it directly, with
+	// no shell, so each element only needs XML escaping.
+	Args     []string
+	TownRoot string // working directory: proxied gt/bd inherit it
+	LogPath  string // stdout/stderr destination
+	Path     string // PATH for the proxy and the gt/bd/git it runs
+}
+
+// ProxyLaunchdPlistPath is where the proxy's launchd job is installed.
+func ProxyLaunchdPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("finding home directory: %w", err)
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", "com.gastown.proxy.plist"), nil
+}
+
+// ProxyServicePath is the PATH for the supervised proxy. It is built the same
+// way as the daemon's (supervisorPath): the proxy runs the same gt and bd
+// commands on a remote polecat's behalf that the daemon's sessions run
+// locally, so they must resolve the same tools.
+func ProxyServicePath(binary string) string {
+	return supervisorPath(binary)
+}
+
+// RenderProxyLaunchd renders the proxy plist for data.
+func RenderProxyLaunchd(data ProxySupervisorData) ([]byte, error) {
+	content, err := supervisorFS.ReadFile("launchd/com.gastown.proxy.plist")
+	if err != nil {
+		return nil, fmt.Errorf("reading proxy launchd template: %w", err)
+	}
+	tmpl, err := template.New("proxy-launchd").Funcs(template.FuncMap{
+		"xml": xmlEscape,
+	}).Parse(string(content))
+	if err != nil {
+		return nil, fmt.Errorf("parsing proxy launchd template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("rendering proxy launchd template: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
 // xmlEscape escapes a value for an XML text node.
 func xmlEscape(s string) string {
 	var buf bytes.Buffer

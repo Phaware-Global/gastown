@@ -57,6 +57,7 @@ Example (TCP, mTLS, enrolled as this machine's name):
 		o.StateDir, _ = cmd.Flags().GetString("state-dir")
 		o.WorkerName, _ = cmd.Flags().GetString("worker-name")
 		o.AgentEnvFile, _ = cmd.Flags().GetString("agent-env-file")
+		o.CodesignIdentity, _ = cmd.Flags().GetString("codesign-identity")
 		o.TLSDir, _ = cmd.Flags().GetString("tls-dir")
 		o.ExecModes, _ = cmd.Flags().GetString("exec-modes")
 		o.GTDir, _ = cmd.Flags().GetString("gt-dir")
@@ -91,6 +92,9 @@ type workerServiceOpts struct {
 	ExecModes    string
 	GTDir        string
 	MaxSessions  int
+	// CodesignIdentity makes the worker re-sign pushed binaries (see
+	// workerclient.Config.CodesignIdentity).
+	CodesignIdentity string
 }
 
 // workerServicePlan is a validated, fully-resolved job description: every path
@@ -149,6 +153,18 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	args := []string{"-listen", o.Listen, "-proxy-url", o.ProxyURL, "-state-dir", stateDir}
 	if o.WorkerName != "" {
 		args = append(args, "-worker-id", o.WorkerName)
+	}
+	if o.CodesignIdentity != "" {
+		if strings.HasPrefix(o.CodesignIdentity, "-") {
+			return nil, fmt.Errorf("--codesign-identity must name a keychain identity; %q is ad-hoc signing and does not keep privacy grants", o.CodesignIdentity)
+		}
+		// Install time is the one interactive moment to catch a mistyped
+		// identity. Later it only shows as every binary push being refused,
+		// which is logged and otherwise silent.
+		if found, checked := codesignIdentityInKeychain(o.CodesignIdentity); checked && !found {
+			return nil, fmt.Errorf("--codesign-identity %q is not a code-signing identity in this user's keychains (see: security find-identity -p codesigning)", o.CodesignIdentity)
+		}
+		args = append(args, "-codesign-identity", o.CodesignIdentity)
 	}
 	if o.AgentEnvFile != "" {
 		abs, err := filepath.Abs(o.AgentEnvFile)
@@ -474,6 +490,7 @@ func init() {
 	f.String("state-dir", "", "session state dir (default ~/Library/Application Support/gt-worker)")
 	f.String("worker-name", "", "this machine's enrolled name, reported in the handshake")
 	f.String("agent-env-file", "", "KEY=VALUE file supplying agent credentials worker-side (§8)")
+	f.String("codesign-identity", "", "keychain code-signing identity (macOS): re-sign pushed binaries so privacy grants survive a push")
 	f.String("tls-dir", "", "enrollment output dir holding worker.crt/worker.key + the worker CA (TCP mTLS)")
 	f.String("exec-modes", "native", "comma-separated exec modes to advertise (native,container)")
 	f.Int("max-sessions", 1, "concurrent session cap")
@@ -482,4 +499,41 @@ func init() {
 	workerServiceCmd.AddCommand(workerServiceInstallCmd, workerServiceUninstallCmd,
 		workerServiceRestartCmd, workerServiceStatusCmd)
 	workerCmd.AddCommand(workerServiceCmd)
+}
+
+// codesignIdentityInKeychain reports whether name is a code-signing identity
+// in the user's keychains. checked is false when that could not be determined
+// (not macOS, or the lookup failed), in which case the caller must not refuse.
+// It lists without -v on purpose: a self-signed identity is untrusted, so the
+// "valid only" listing hides it although codesign signs with it. A variable so
+// tests need no keychain.
+var codesignIdentityInKeychain = func(name string) (found, checked bool) {
+	if runtime.GOOS != "darwin" {
+		return false, false
+	}
+	out, err := exec.Command("security", "find-identity", "-p", "codesigning").Output()
+	if err != nil {
+		return false, false
+	}
+	return identityListed(string(out), name), true
+}
+
+// identityListed reports whether a `security find-identity` listing contains
+// the identity. Each identity is a line holding an index, the certificate's
+// 40-hex SHA-1 and the quoted name. codesign -s accepts either the name or the
+// SHA-1, which is the only way to pick one of several identities that share a
+// name.
+func identityListed(listing, identity string) bool {
+	if strings.Contains(listing, `"`+identity+`"`) {
+		return true
+	}
+	if len(identity) != 40 {
+		return false
+	}
+	for _, line := range strings.Split(listing, "\n") {
+		if fields := strings.Fields(line); len(fields) >= 2 && strings.EqualFold(fields[1], identity) {
+			return true
+		}
+	}
+	return false
 }

@@ -21,10 +21,11 @@ var (
 )
 
 var escalateCmd = &cobra.Command{
-	Use:     "escalate [description]",
-	GroupID: GroupComm,
-	Short:   "Escalation system for critical issues",
-	RunE:    runEscalate,
+	Use:         "escalate [description]",
+	GroupID:     GroupComm,
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Escalation system for critical issues",
+	RunE:        runEscalate,
 	Long: `Create and manage escalations for critical issues.
 
 The escalation system provides severity-based routing for issues that need

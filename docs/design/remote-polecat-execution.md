@@ -806,6 +806,16 @@ durable artifact is the polecat branch in `~/gt/<rig>/.repo.git`. This diverges
 from the reuse-the-worktree pool model and is carved out explicitly for
 `backend != local`.
 
+> **As built (socket provider, native mode):** the host still creates a
+> worktree for a remote polecat, because role detection, beads resolution and
+> agent state key off that directory. It stays checked out on the work branch
+> at its start point and never receives the agent's files. The durable
+> artifact is `refs/remote-work/<branch>` in the rig repo, not the branch
+> itself: a push to the checked-out branch is refused, and nothing a worker
+> pushes is ever checked out on the host. `gt done` completes from that ref:
+> it publishes it to origin as the polecat branch with hooks disabled, and
+> deletes it once the push and the merge request have both succeeded.
+
 ### 9.2 Recovery — git push via proxy (no storage snapshots)
 
 There is no provider storage-snapshot lifecycle; durability is host-side git.

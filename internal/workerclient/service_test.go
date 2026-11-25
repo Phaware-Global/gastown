@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/proxy"
 	"github.com/steveyegge/gastown/internal/socket"
@@ -366,6 +367,35 @@ func TestSessionOpen_RejectsUnsafeIdentity(t *testing.T) {
 	assert.Equal(t, "bad_request", resp.Code)
 }
 
+// Agent files are written beside the session identity, which a work container
+// does not mount, and the argv is only remapped for native sessions. A
+// container session that carried them would start its agent with a settings
+// path that is not there: no hooks, no guards, and no error. Refuse it.
+func TestSessionOpenRefusesAgentFilesInContainerMode(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	ack, err := codec.Recv()
+	require.NoError(t, err)
+	require.Equal(t, sockproto.TypeHelloAck, ack.Type)
+
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeSessionOpen, ID: "s1",
+		Session: "gt-demo-furiosa", Rig: "demo", Polecat: "furiosa", ExecMode: "container",
+		Files: map[string]string{"/host/polecats/.claude/settings.json": "{}"},
+	}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeSessionError, resp.Type)
+	assert.Equal(t, "bad_request", resp.Code)
+	assert.Contains(t, resp.Msg, "container")
+	assert.Contains(t, resp.Msg, "agent files")
+}
+
 func TestDroppedConnFreesSessionSlot(t *testing.T) {
 	proxyURL, _, _ := startProxy(t)
 	addr, svc := startService(t, proxyURL, func(c *Config) { c.MaxSessions = 1 })
@@ -629,4 +659,220 @@ func TestOrphanTearingDownBranch_Concurrent(t *testing.T) {
 	assert.True(t, os.IsNotExist(wErr), "worktree must be removed")
 	_, iErr := os.Stat(filepath.Join(svc.cfg.StateDir, "identity", "gt-demo-furiosa"))
 	assert.True(t, os.IsNotExist(iErr), "identity must be shredded")
+}
+
+// TestSessionOpen_ChecksOutPolecatBranch: a slung polecat's work belongs on
+// its own branch, which the host creates in the rig repo before the session
+// starts. The worker must land the worktree on that branch — a plain clone
+// leaves it on the default branch, so the agent's commits would have no
+// polecat branch to be pushed to.
+func TestSessionOpen_ChecksOutPolecatBranch(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	git(t, rigRepo, "branch", branch, "HEAD")
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+	assert.Equal(t, "origin/"+branch, git(t, worktree, "rev-parse", "--abbrev-ref", "@{upstream}"),
+		"the branch must track the host's, so a bare `git push` targets it")
+}
+
+// A branch the host repo does not have yet is created locally from the clone's
+// HEAD rather than failing the session.
+func TestSessionOpen_CreatesMissingPolecatBranch(t *testing.T) {
+	const branch = "polecat/furiosa-mv3cxv4t"
+	proxyURL, ca, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+}
+
+// The host can ask for the branch the fresh clone is already on (its worktree
+// was sitting on the default branch). That must land on the branch, not fail
+// because a branch of that name already exists.
+func TestSessionOpen_BranchTheCloneIsAlreadyOn(t *testing.T) {
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	branch := git(t, rigRepo, "symbolic-ref", "--short", "HEAD")
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+}
+
+func TestValidBranch(t *testing.T) {
+	for _, ok := range []string{"polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa-mv3cxv4t", "main"} {
+		assert.True(t, validBranch(ok), "%q must be accepted", ok)
+	}
+	// "HEAD" is what a detached worktree reports as its branch; git refuses to
+	// create a branch of that name.
+	for _, bad := range []string{"", "-f", "--upload-pack=x", "a..b", "/abs", "a//b", "a/", "a b", "a;b", "a.lock", "refs/heads/@{-1}", "HEAD"} {
+		assert.False(t, validBranch(bad), "%q must be rejected", bad)
+	}
+}
+
+func TestSessionOpen_RejectsUnsafeBranch(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = "--upload-pack=evil"
+	_, err := b.Provision(context.Background(), spec)
+	// The session_open guard's own message: git would also reject this name
+	// later, at checkout, so a bare "some error" would pass without the guard.
+	require.ErrorContains(t, err, "not a safe branch name")
+}
+
+// plantedHook is a pre-push hook a worker could commit under the rig's hooks
+// path. If the host ever runs it, it leaves the marker file behind.
+func plantedHook(marker string) string {
+	return "#!/bin/sh\ntouch '" + marker + "'\n"
+}
+
+// remoteHost sets up the host side of a remote polecat as polecat.Manager
+// does: the rig repo resolves hooks from the worktree, and the polecat's
+// worktree is checked out on its work branch.
+func remoteHost(t *testing.T, townRoot, branch string) (rigRepo, hostWT string) {
+	t.Helper()
+	rigRepo = filepath.Join(townRoot, "demo", ".repo.git")
+	hostWT = filepath.Join(townRoot, "demo", "polecats", "furiosa", "demo")
+	require.NoError(t, os.MkdirAll(filepath.Dir(hostWT), 0755))
+	git(t, rigRepo, "config", "core.hooksPath", ".githooks") // as the refinery configures every rig repo
+	git(t, rigRepo, "worktree", "add", "-b", branch, hostWT, "HEAD")
+	return rigRepo, hostWT
+}
+
+// provisionOn provisions a session for branch and returns the worker's worktree.
+func provisionOn(t *testing.T, proxyURL string, ca *proxy.CA, branch string) string {
+	t.Helper()
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+	return filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+}
+
+// commitWorkWithPlantedHook commits a change plus a .githooks/pre-push on the
+// worker and returns the new HEAD.
+func commitWorkWithPlantedHook(t *testing.T, worktree, marker string) string {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, "main.go"), []byte("v2-remote-work\n"), 0644))
+	require.NoError(t, os.MkdirAll(filepath.Join(worktree, ".githooks"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, ".githooks", "pre-push"), []byte(plantedHook(marker)), 0755))
+	git(t, worktree, "add", "-A")
+	git(t, worktree, "commit", "-m", "remote work")
+	return git(t, worktree, "rev-parse", "HEAD")
+}
+
+// gitFails runs git and reports whether it failed.
+func gitFails(dir string, args ...string) bool {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	return cmd.Run() != nil
+}
+
+// TestRemotePolecatPushLandsOnTheWorkRefOnly is the remote work loop up to gt
+// done. The agent commits on the worker and pushes through the relay. The
+// commits must land in refs/remote-work/<branch> in the rig repo, and nothing
+// the worker authored may reach the host worktree: the rig resolves git hooks
+// from the worktree, so a pushed tree checked out there would hand the worker
+// code execution on the host.
+func TestRemotePolecatPushLandsOnTheWorkRefOnly(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo, hostWT := remoteHost(t, townRoot, branch)
+	before := git(t, hostWT, "rev-parse", "HEAD")
+
+	worktree := provisionOn(t, proxyURL, ca, branch)
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	head := commitWorkWithPlantedHook(t, worktree, marker)
+	// A plain push: the session is configured to send the branch to its work ref.
+	git(t, worktree, "push", "origin")
+
+	assert.Equal(t, head, git(t, rigRepo, "rev-parse", constants.RemoteWorkRef(branch)), "the work ref must hold the pushed commit")
+	assert.Equal(t, before, git(t, rigRepo, "rev-parse", "refs/heads/"+branch), "the host's branch must not move")
+	assert.Equal(t, before, git(t, hostWT, "rev-parse", "HEAD"), "the host worktree's HEAD must not move")
+	assert.Empty(t, git(t, hostWT, "status", "--porcelain"), "the host worktree must stay clean")
+	assert.NoFileExists(t, filepath.Join(hostWT, ".githooks", "pre-push"), "a pushed hook must never be checked out on the host")
+	data, err := os.ReadFile(filepath.Join(hostWT, "main.go"))
+	require.NoError(t, err)
+	assert.NotEqual(t, "v2-remote-work\n", string(data), "pushed file content must never be checked out on the host")
+
+	// What the host does with the work next: push the work ref on, from the
+	// polecat's worktree. The worker's hook is in the pushed commits but not
+	// in this tree, so it must not run.
+	upstream := filepath.Join(t.TempDir(), "upstream.git")
+	git(t, townRoot, "init", "--bare", upstream)
+	git(t, hostWT, "push", upstream, constants.RemoteWorkRef(branch)+":refs/heads/"+branch)
+	assert.NoFileExists(t, marker, "host-side git must not run a hook the worker pushed")
+}
+
+// TestRelayPushNeverWritesIntoAHostWorktree: a worker that ignores the work
+// ref and pushes straight at the branch the host has checked out is refused,
+// and the host worktree is left exactly as it was.
+func TestRelayPushNeverWritesIntoAHostWorktree(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo, hostWT := remoteHost(t, townRoot, branch)
+	before := git(t, hostWT, "rev-parse", "HEAD")
+
+	worktree := provisionOn(t, proxyURL, ca, branch)
+	commitWorkWithPlantedHook(t, worktree, filepath.Join(t.TempDir(), "hook-ran"))
+
+	assert.True(t, gitFails(worktree, "push", "origin", "HEAD:refs/heads/"+branch), "a push to the checked-out branch must be refused")
+	assert.Equal(t, before, git(t, rigRepo, "rev-parse", "refs/heads/"+branch))
+	assert.Equal(t, before, git(t, hostWT, "rev-parse", "HEAD"), "the host worktree's HEAD must not move")
+	assert.Empty(t, git(t, hostWT, "status", "--porcelain"))
+	assert.NoFileExists(t, filepath.Join(hostWT, ".githooks", "pre-push"), "a pushed hook must never be checked out on the host")
+}
+
+// TestRemoteSessionResumesFromItsWorkRef: a session that is provisioned again
+// (a worker restart replaces the clone) starts from the work it already
+// pushed, not from the branch's start point.
+func TestRemoteSessionResumesFromItsWorkRef(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	remoteHost(t, townRoot, branch)
+
+	first := provisionOn(t, proxyURL, ca, branch)
+	require.NoError(t, os.WriteFile(filepath.Join(first, "main.go"), []byte("v2-remote-work\n"), 0644))
+	git(t, first, "commit", "-am", "remote work")
+	head := git(t, first, "rev-parse", "HEAD")
+	git(t, first, "push", "origin")
+
+	second := provisionOn(t, proxyURL, ca, branch)
+	assert.Equal(t, head, git(t, second, "rev-parse", "HEAD"), "the new clone must start from the pushed work")
+	assert.Equal(t, branch, git(t, second, "rev-parse", "--abbrev-ref", "HEAD"))
+	// And it can keep pushing: a rewritten history replaces its own work ref.
+	git(t, second, "commit", "--amend", "-m", "remote work, reworded")
+	git(t, second, "push", "--force-with-lease", "origin")
 }

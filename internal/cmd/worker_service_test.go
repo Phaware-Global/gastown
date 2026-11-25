@@ -86,6 +86,7 @@ func TestPlanWorkerService_TCPJob(t *testing.T) {
 		t.Skip("launchd job planning is macOS-only")
 	}
 	fakeWorkerClient(t)
+	stubCodesignIdentities(t, "gt-local")
 	tlsDir := enrolledTLSDir(t)
 	envFile := filepath.Join(t.TempDir(), "agent.env")
 	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_API_KEY=sk-x\n"), 0600))
@@ -95,10 +96,12 @@ func TestPlanWorkerService_TCPJob(t *testing.T) {
 		Listen: "0.0.0.0:9878", ProxyURL: "https://orch.local:9876",
 		StateDir: stateDir, WorkerName: "mac-mini-1", AgentEnvFile: envFile,
 		TLSDir: tlsDir, ExecModes: "native,container", MaxSessions: 2,
+		CodesignIdentity: "gt-local",
 	})
 	require.NoError(t, err)
 
 	argv := strings.Join(plan.Args, " ")
+	assert.Contains(t, argv, "-codesign-identity gt-local")
 	assert.Contains(t, argv, "-worker-id mac-mini-1")
 	assert.Contains(t, argv, "-tls-cert "+filepath.Join(tlsDir, workerclient.MachineCertFile))
 	assert.Contains(t, argv, "-tls-client-ca "+filepath.Join(tlsDir, workerclient.ClientCAFile))
@@ -316,4 +319,85 @@ func TestDefaultWorkerStateDir(t *testing.T) {
 	// cannot create.
 	assert.NotEqual(t, "/var/lib/gt-worker", d)
 	assert.True(t, strings.HasSuffix(d, filepath.Join("Library", "Application Support", "gt-worker")), d)
+}
+
+// An ad-hoc identity re-signs with a new code hash every time, which is the
+// instability the option exists to remove.
+// stubCodesignIdentities makes the keychain lookup answer from a fixed list.
+func stubCodesignIdentities(t *testing.T, names ...string) {
+	t.Helper()
+	old := codesignIdentityInKeychain
+	codesignIdentityInKeychain = func(name string) (bool, bool) {
+		for _, n := range names {
+			if n == name {
+				return true, true
+			}
+		}
+		return false, true
+	}
+	t.Cleanup(func() { codesignIdentityInKeychain = old })
+}
+
+// A mistyped identity is caught at install, the one interactive moment. Later
+// it only shows as every binary push being refused.
+func TestPlanWorkerService_RefusesUnknownCodesignIdentity(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	stubCodesignIdentities(t, "gt-local")
+	_, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/w.sock", ProxyURL: "https://orch.local:9876",
+		StateDir: t.TempDir(), CodesignIdentity: "gt-locl",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gt-locl")
+}
+
+func TestPlanWorkerService_RefusesAdHocCodesignIdentity(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	_, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/w.sock", ProxyURL: "https://orch.local:9876",
+		StateDir: t.TempDir(), CodesignIdentity: "-",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "codesign-identity")
+}
+
+// identityListed is fed a captured `security find-identity -p codesigning`
+// listing: the hash is unquoted, the name quoted, and a self-signed identity
+// is flagged untrusted but still listed.
+func TestIdentityListed(t *testing.T) {
+	const listing = `
+Policy: Code Signing
+  Matching identities
+  1) 1111111111111111111111111111111111111111 "Apple Development: Someone (ABCDE12345)"
+  2) AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12 "gt-local" (CSSMERR_TP_NOT_TRUSTED)
+     2 identities found
+
+  Valid identities only
+  1) 1111111111111111111111111111111111111111 "Apple Development: Someone (ABCDE12345)"
+     1 valid identities found
+`
+	for _, name := range []string{
+		"gt-local",
+		"Apple Development: Someone (ABCDE12345)",
+		// codesign -s also takes the certificate's SHA-1, the only way to pick
+		// one of several identities that share a name. Either case.
+		"AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12",
+		"ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12",
+	} {
+		assert.True(t, identityListed(listing, name), "%q is in the listing", name)
+	}
+	for _, name := range []string{
+		"gt-loca", // a prefix of a name is not that name
+		"0000000000000000000000000000000000000000", // a hash that is not listed
+		"AB12CD34EF56AB12CD34EF56AB12CD34EF56AB1",  // 39 digits: not a hash, and not a name
+		"Matching identities",                      // text in the listing that is not an identity
+	} {
+		assert.False(t, identityListed(listing, name), "%q is not an identity in the listing", name)
+	}
 }

@@ -61,6 +61,18 @@ func assessPushFailure(workDir, rigName, polecatName, recordedBranch string) pus
 	// polecat and one stuck remote must not stall the rest.
 	_ = g.FetchBounded("origin")
 
+	// A remote polecat's commits are in its work ref, not this worktree: HEAD
+	// being on origin says nothing about them.
+	work, err := g.UnpublishedRemoteWork(a.Branch, "origin")
+	if err != nil {
+		a.Reason = fmt.Sprintf("remote work unreadable: %v", err)
+		return a
+	}
+	if work.Unpublished > 0 {
+		a.Reason = fmt.Sprintf("%d commit(s) pushed by the remote worker are only in %s", work.Unpublished, work.Ref)
+		return a
+	}
+
 	if a.Branch != "" && a.Branch != "HEAD" {
 		if tip, err := g.PushRemoteBranchTip("origin", a.Branch); err == nil && tip != "" {
 			if held, err := g.IsAncestor("HEAD", tip); err == nil && held {
