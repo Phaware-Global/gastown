@@ -1,9 +1,10 @@
 // Package channelevents provides file-based event emission for named channels.
 //
 // Channel events are JSON files written to ~/gt/events/<channel>/*.event
-// (~/gt/events/<channel>/<rig>/*.event for rig-scoped channels) and consumed by await-event subscribers (e.g., the refinery watching for
-// MERGE_READY events). This is distinct from the activity feed events in
-// the events package (~/gt/.events.jsonl).
+// (~/gt/events/<channel>/<rig>/*.event for rig-scoped channels) and consumed
+// by await-event subscribers (e.g., the refinery watching for MERGE_READY
+// events). This is distinct from the activity feed events in the events
+// package (~/gt/.events.jsonl).
 package channelevents
 
 import (
