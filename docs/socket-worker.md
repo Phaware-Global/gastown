@@ -283,9 +283,34 @@ The host worktree never receives the agent's files. Instead:
 - A session that is provisioned again (after a worker restart, say) starts from
   its work ref, so pushed work is not lost with the clone.
 
-Host-side `gt done` for a rig on a remote backend is refused for now: it reads
-the host worktree, which holds no work. Completing from the work ref is a
-follow-up change.
+Host-side `gt done` completes a remote polecat from that work ref, without
+checking it out:
+
+- It is in remote mode when the rig's own execution settings name a remote
+  backend and the session is a polecat. Nothing in the request selects it.
+- It refuses if nothing has been pushed to the work ref.
+- It publishes the work ref to origin as the polecat branch, from the host,
+  with client-side hooks disabled, then verifies the branch tip, and creates or
+  updates the pull request or merge request exactly as for a local polecat.
+  With the direct merge strategy the push goes to the default branch and the
+  rig's own pre-push hook still runs, from the host worktree, which never
+  holds the worker's files.
+- Auto-rebase onto the target, overlay stripping and submodule pushes are
+  skipped: they rewrite a worktree, and the work is not in one on the host. A
+  branch that is behind its target is rebased on the worker and pushed again;
+  the staleness check and the merge-request guards read the work ref.
+- When the run succeeds (push and merge request both), the host deletes the
+  work ref together with the polecat's local branch, provided origin holds
+  every commit the ref points at. The branch on origin is then the record of
+  the work. If anything fails, or the worker pushed more in the meantime, the
+  work ref is kept.
+
+A polecat that keeps working on the same branch afterwards, for a review fix,
+must start from a newly provisioned session: that session takes the branch's
+current tip from the host and pushes a fresh work ref.
+
+The publish, the verification and the pull request run inside one proxied
+`gt done`, so they must fit in the proxy's `exec_timeout`.
 
 ## Restarts and orphans
 
