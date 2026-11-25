@@ -630,3 +630,90 @@ func TestOrphanTearingDownBranch_Concurrent(t *testing.T) {
 	_, iErr := os.Stat(filepath.Join(svc.cfg.StateDir, "identity", "gt-demo-furiosa"))
 	assert.True(t, os.IsNotExist(iErr), "identity must be shredded")
 }
+
+// TestSessionOpen_ChecksOutPolecatBranch: a slung polecat's work belongs on
+// its own branch, which the host creates in the rig repo before the session
+// starts. The worker must land the worktree on that branch — a plain clone
+// leaves it on the default branch, so the agent's commits would have no
+// polecat branch to be pushed to.
+func TestSessionOpen_ChecksOutPolecatBranch(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	git(t, rigRepo, "branch", branch, "HEAD")
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+	assert.Equal(t, "origin/"+branch, git(t, worktree, "rev-parse", "--abbrev-ref", "@{upstream}"),
+		"the branch must track the host's, so a bare `git push` targets it")
+}
+
+// A branch the host repo does not have yet is created locally from the clone's
+// HEAD rather than failing the session.
+func TestSessionOpen_CreatesMissingPolecatBranch(t *testing.T) {
+	const branch = "polecat/furiosa-mv3cxv4t"
+	proxyURL, ca, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+}
+
+// The host can ask for the branch the fresh clone is already on (its worktree
+// was sitting on the default branch). That must land on the branch, not fail
+// because a branch of that name already exists.
+func TestSessionOpen_BranchTheCloneIsAlreadyOn(t *testing.T) {
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	branch := git(t, rigRepo, "symbolic-ref", "--short", "HEAD")
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = branch
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+}
+
+func TestValidBranch(t *testing.T) {
+	for _, ok := range []string{"polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa-mv3cxv4t", "main"} {
+		assert.True(t, validBranch(ok), "%q must be accepted", ok)
+	}
+	// "HEAD" is what a detached worktree reports as its branch; git refuses to
+	// create a branch of that name.
+	for _, bad := range []string{"", "-f", "--upload-pack=x", "a..b", "/abs", "a//b", "a/", "a b", "a;b", "a.lock", "refs/heads/@{-1}", "HEAD"} {
+		assert.False(t, validBranch(bad), "%q must be rejected", bad)
+	}
+}
+
+func TestSessionOpen_RejectsUnsafeBranch(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	spec := polecatSpec()
+	spec.Branch = "--upload-pack=evil"
+	_, err := b.Provision(context.Background(), spec)
+	// The session_open guard's own message: git would also reject this name
+	// later, at checkout, so a bare "some error" would pass without the guard.
+	require.ErrorContains(t, err, "not a safe branch name")
+}

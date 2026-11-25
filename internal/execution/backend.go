@@ -39,7 +39,11 @@ type PolecatSpec struct {
 	Rig     string
 	Polecat string
 	Session string
-	Config  *config.ExecutionConfig // shared fields + opaque provider extension
+	// Branch is the polecat's work branch in the host rig repo. The remote
+	// worktree is checked out on it so the agent's commits land where gt done
+	// looks for them. Empty leaves the worktree on the clone's default branch.
+	Branch string
+	Config *config.ExecutionConfig // shared fields + opaque provider extension
 }
 
 // Identity returns the spec's identity as tags for provider-side recording.

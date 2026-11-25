@@ -97,3 +97,14 @@ func shellJoinArgv(argv []string) string {
 	}
 	return strings.Join(quoted, " ")
 }
+
+// remoteSessionBranch is the work branch to hand a remote worker. A detached
+// host worktree reports its branch as the literal "HEAD", which is not a
+// branch a worker can check out, so that case sends none and the worker stays
+// on the clone's default branch, as it did before branches were sent at all.
+func remoteSessionBranch(branch string) string {
+	if branch == "HEAD" {
+		return ""
+	}
+	return branch
+}
