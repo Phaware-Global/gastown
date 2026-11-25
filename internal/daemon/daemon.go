@@ -99,6 +99,10 @@ type Daemon struct {
 	deathsMu     sync.Mutex
 	recentDeaths []sessionDeath
 
+	// workAlerts records when each stuck or orphaned work alert was last sent.
+	// Only the heartbeat goroutine touches it.
+	workAlerts map[string]time.Time
+
 	// reviewerLastNudge rate-limits reviewer stuck-nudges to one per rig per
 	// cooldown. Guarded because reapStuckReviewers fans out over rigs
 	// concurrently via rigPool.runPerRig. In-memory only — losing it on restart
