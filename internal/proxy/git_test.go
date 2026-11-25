@@ -116,6 +116,46 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("remote work ref for own branch allowed", func(t *testing.T) {
+		// A remote polecat pushes its work branch to refs/remote-work/<branch>,
+		// which no host worktree has checked out.
+		for _, ref := range []string{
+			"refs/remote-work/polecat/furiosa/gt-abc12@mv3cxv4t",
+			"refs/remote-work/polecat/furiosa-abc123",
+		} {
+			assert.NoError(t, validateReceivePackRefs(receivePackBody(ref), "furiosa"), ref)
+		}
+	})
+
+	t.Run("remote work ref outside own namespace denied", func(t *testing.T) {
+		for _, ref := range []string{
+			"refs/remote-work/polecat/nux/gt-abc12@mv3cxv4t", // another polecat
+			"refs/remote-work/polecat/furiosa",               // bare name
+			"refs/remote-work/polecat/furiosa/",              // empty segment
+			"refs/remote-work/polecat/furiosa/x/gt-1@ts",     // more than one segment
+			"refs/remote-work/main",                          // not a polecat ref
+		} {
+			assert.Error(t, validateReceivePackRefs(receivePackBody(ref), "furiosa"), ref)
+		}
+	})
+
+	t.Run("remote work ref of a hyphen-extended name denied", func(t *testing.T) {
+		// Names may contain "-", and a pool can hold both "bullet" and
+		// "bullet-farmer". The dash form must not let the shorter name reach
+		// the longer one's work ref, which is what its next session resumes
+		// from and what completion publishes.
+		for _, ref := range []string{
+			"refs/remote-work/polecat/bullet-farmer-mv3cxv4t",
+			"refs/remote-work/polecat/bullet-farmer/gt-abc12@mv3cxv4t",
+			"refs/remote-work/polecat/bullet-",
+			"refs/remote-work/polecat/bullet-MV3CXV4T",
+		} {
+			assert.Error(t, validateReceivePackRefs(receivePackBody(ref), "bullet"), ref)
+		}
+		assert.NoError(t, validateReceivePackRefs(receivePackBody("refs/remote-work/polecat/bullet-mv3cxv4t"), "bullet"))
+		assert.NoError(t, validateReceivePackRefs(receivePackBody("refs/remote-work/polecat/bullet-farmer-mv3cxv4t"), "bullet-farmer"))
+	})
+
 	t.Run("own checkpoint ref is allowed", func(t *testing.T) {
 		// remote-polecat-execution.md §9.2: the worker force-pushes
 		// refs/checkpoints/polecat/<name> through the proxy.

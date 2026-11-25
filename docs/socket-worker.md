@@ -174,6 +174,25 @@ naming it, rather than shipping a binary that cannot execute there.
 The agent CLI is different in kind and stays operator-installed: its version,
 licensing and auth are the operator's decision.
 
+## Where a remote polecat's work goes
+
+The worker's clone is on the polecat's work branch, and the host keeps its own
+worktree for the polecat checked out on that same branch, at its start point.
+The host worktree never receives the agent's files. Instead:
+
+- The session's clone is configured so that `git push origin` sends the branch
+  to `refs/remote-work/<branch>` in the rig repo on the host. `gt done` on the
+  worker does this push first and refuses to continue if it fails, or if
+  tracked files have uncommitted changes.
+- A push aimed at `refs/heads/<branch>` is refused, because the host has that
+  branch checked out.
+- A session that is provisioned again (after a worker restart, say) starts from
+  its work ref, so pushed work is not lost with the clone.
+
+Host-side `gt done` for a rig on a remote backend is refused for now: it reads
+the host worktree, which holds no work. Completing from the work ref is a
+follow-up change.
+
 ## Restarts and orphans
 
 A worker restart does not preserve running sessions. The orchestrator reports

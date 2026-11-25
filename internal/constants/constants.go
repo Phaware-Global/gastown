@@ -458,3 +458,18 @@ var DefaultNearLimitPatterns = []string{
 	`almost\s+(at|hit|reached)\s+(your\s+)?(rate\s+)?limit`,       // "almost reached your rate limit"
 	`\d+\s*(messages?|requests?)\s*(left|remaining)`,              // "10 messages remaining"
 }
+
+// RemoteWorkRefPrefix is where a remote polecat's work branch is pushed on the
+// host: refs/remote-work/<branch>. It is outside refs/heads on purpose. The
+// host worktree keeps <branch> checked out (at its start point), so every
+// host-side reader still sees the polecat on its branch, while the pushed
+// commits sit in a ref that no worktree has checked out. A push therefore
+// never writes into a host worktree, and branch cleanup, which lists
+// refs/heads/polecat/*, never deletes it.
+const RemoteWorkRefPrefix = "refs/remote-work/"
+
+// RemoteWorkRef returns the host ref holding a remote polecat's pushed work
+// for branch.
+func RemoteWorkRef(branch string) string {
+	return RemoteWorkRefPrefix + branch
+}
