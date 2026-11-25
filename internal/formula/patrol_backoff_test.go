@@ -383,6 +383,50 @@ func TestPatrolFormulasUseDynamicBeadResolution(t *testing.T) {
 	}
 }
 
+// TestPatrolAgentBeadLookupsIncludeInfra verifies every agent-bead lookup in
+// the patrol formulas passes --include-infra. bd list hides infrastructure
+// records (type=agent) without it, so the lookup returns zero IDs and the
+// patrol stops before subscribing for its next wake-up.
+func TestPatrolAgentBeadLookupsIncludeInfra(t *testing.T) {
+	patrols := map[string]int{
+		"mol-deacon-patrol.formula.toml":   0,
+		"mol-refinery-patrol.formula.toml": 1,
+		"mol-witness-patrol.formula.toml":  1,
+	}
+
+	for name, wantLookups := range patrols {
+		t.Run(name, func(t *testing.T) {
+			content, err := formulasFS.ReadFile("formulas/" + name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", name, err)
+			}
+
+			f, err := Parse(content)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", name, err)
+			}
+
+			lookups := 0
+			for _, step := range f.Steps {
+				for _, line := range strings.Split(step.Description, "\n") {
+					if !strings.Contains(line, "bd list --label=gt:agent") {
+						continue
+					}
+					lookups++
+					// Check the bd invocation only, not the jq filter it pipes into.
+					bdCmd, _, _ := strings.Cut(line, "|")
+					if !strings.Contains(bdCmd, "--include-infra") {
+						t.Errorf("%s step %q: agent-bead lookup missing --include-infra: %s", name, step.ID, line)
+					}
+				}
+			}
+			if lookups != wantLookups {
+				t.Errorf("%s: found %d agent-bead lookups, want %d", name, lookups, wantLookups)
+			}
+		})
+	}
+}
+
 // TestDeaconPatrolHasHeartbeatSteps verifies the deacon patrol formula
 // includes heartbeat refresh steps to prevent the daemon from killing a
 // healthy Deacon mid-cycle.
