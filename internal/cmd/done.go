@@ -699,6 +699,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if parts := strings.Split(sender, "/"); len(parts) >= 2 {
 		polecatName = parts[len(parts)-1]
 	}
+	worker = preferKnownWorker(branch, worker, polecatName)
 
 	var assignedIssueIDs []string
 	loadAssignedIssueIDs := func() []string {

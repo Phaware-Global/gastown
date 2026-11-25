@@ -424,3 +424,53 @@ func TestMRFilteringByLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestParseBranchNameWorker(t *testing.T) {
+	tests := []struct {
+		branch     string
+		wantWorker string
+	}{
+		// polecat/<worker>/<issue>[@<timestamp>]
+		{"polecat/keeper/gt-abc@mk123456", "keeper"},
+		{"polecat/bullet-farmer/gt-abc", "bullet-farmer"},
+		// polecat/<worker>-<timestamp>
+		{"polecat/keeper-mk0vro62", "keeper"},
+		{"polecat/bullet-farmer-mk0vro62", "bullet-farmer"},
+		// polecat/<worker>-<bead-id>, from gt polecat checkout-branch
+		{"polecat/keeper-gt-abc12", "keeper"},
+		{"polecat/keeper-gt-abc.1", "keeper"},
+		{"polecat/keeper-gt-wfs-abc12", "keeper"},
+		{"polecat/keeper-hq-wisp-ku6", "keeper"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.branch, func(t *testing.T) {
+			if got := parseBranchName(tt.branch).Worker; got != tt.wantWorker {
+				t.Errorf("parseBranchName(%q).Worker = %q, want %q", tt.branch, got, tt.wantWorker)
+			}
+		})
+	}
+}
+
+func TestPreferKnownWorker(t *testing.T) {
+	tests := []struct {
+		branch  string
+		polecat string
+		want    string
+	}{
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "bullet-farmer"},
+		{"polecat/bullet-farmer-gt-wfs-abc12", "bullet-farmer", "bullet-farmer"},
+		// Another polecat's branch, or no known polecat: keep the parsed name.
+		{"polecat/keeper-gt-abc12", "nux", "keeper"},
+		{"polecat/keeper-gt-abc12", "", "keeper"},
+		// The slash form names the worker unambiguously.
+		{"polecat/dog-alpha/gt-abc12", "dog", "dog-alpha"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.branch+" as "+tt.polecat, func(t *testing.T) {
+			got := preferKnownWorker(tt.branch, parseBranchName(tt.branch).Worker, tt.polecat)
+			if got != tt.want {
+				t.Errorf("worker = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

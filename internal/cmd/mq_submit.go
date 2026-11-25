@@ -29,10 +29,15 @@ type branchInfo struct {
 // issuePattern matches issue IDs in branch names (e.g., "gt-xyz" or "gt-abc.1")
 var issuePattern = regexp.MustCompile(`([a-z]+-[a-z0-9]+(?:\.[0-9]+)?)`)
 
+// branchTimestampPattern matches the base36 UnixMilli suffix of a
+// polecat/<worker>-<timestamp> branch, which is 8 characters until 2059.
+var branchTimestampPattern = regexp.MustCompile(`^[0-9a-z]{8}$`)
+
 // parseBranchName extracts issue ID and worker from a branch name.
 // Supports formats:
 //   - polecat/<worker>/<issue>  → issue=<issue>, worker=<worker>
 //   - polecat/<worker>-<timestamp>  → issue="", worker=<worker> (modern polecat branches)
+//   - polecat/<worker>-<bead-id>  → issue="", worker=<worker> (gt polecat checkout-branch)
 //   - <issue>                   → issue=<issue>, worker=""
 func parseBranchName(branch string) branchInfo {
 	info := branchInfo{Branch: branch}
@@ -50,18 +55,21 @@ func parseBranchName(branch string) branchInfo {
 			info.Issue = issue
 			return info
 		}
-		// Modern polecat branch format: polecat/<worker>-<timestamp>
-		// The second part is "worker-timestamp", not an issue ID.
-		// Don't try to extract an issue ID - gt done will use hook_bead fallback.
+		// polecat/<worker>-<timestamp> or polecat/<worker>-<bead-id>. Neither
+		// yields an issue here: gt done uses the hook_bead fallback.
 		if len(parts) == 2 {
-			// Extract worker name from "worker-timestamp" format
-			workerPart := parts[1]
-			if dashIdx := strings.LastIndex(workerPart, "-"); dashIdx > 0 {
-				info.Worker = workerPart[:dashIdx]
-			} else {
-				info.Worker = workerPart
+			// A timestamp has no hyphen, so everything before it is the
+			// worker. A bead ID does, so the worker ends at the first hyphen;
+			// that truncates hyphenated names, which preferKnownWorker covers.
+			rest := parts[1]
+			info.Worker = rest
+			if last := strings.LastIndex(rest, "-"); last > 0 {
+				end := last
+				if !branchTimestampPattern.MatchString(rest[last+1:]) {
+					end = strings.Index(rest, "-")
+				}
+				info.Worker = rest[:end]
 			}
-			// Explicitly don't set info.Issue - let hook_bead fallback handle it
 			return info
 		}
 	}
@@ -73,6 +81,17 @@ func parseBranchName(branch string) branchInfo {
 	}
 
 	return info
+}
+
+// preferKnownWorker returns polecat when branch is one of that polecat's
+// polecat/<worker>-<suffix> branches, and parsed otherwise. A branch name alone
+// cannot say where a hyphenated worker name ends and a bead ID begins.
+func preferKnownWorker(branch, parsed, polecat string) string {
+	rest, ok := strings.CutPrefix(branch, constants.BranchPolecatPrefix)
+	if ok && polecat != "" && !strings.Contains(rest, "/") && strings.HasPrefix(rest, polecat+"-") {
+		return polecat
+	}
+	return parsed
 }
 
 func runMqSubmit(cmd *cobra.Command, args []string) error {
@@ -152,7 +171,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	if issueID == "" {
 		issueID = info.Issue
 	}
-	worker := info.Worker
+	worker := preferKnownWorker(branch, info.Worker, os.Getenv("GT_POLECAT"))
 
 	if issueID == "" {
 		return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
