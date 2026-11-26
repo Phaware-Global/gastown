@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -562,6 +563,48 @@ func TestAgentEnv_ContainerIgnoresHostPathsFromTheEnvFile(t *testing.T) {
 	native, err := s.agentEnv(nil, "", false)
 	require.NoError(t, err)
 	assert.Contains(t, native, "PATH=/opt/operator/bin")
+}
+
+// TestAgentEnv_NativeAgentIsToldItsUser pins that a native agent gets USER and
+// LOGNAME even when the worker's own environment has neither, as under a
+// service manager. Without USER, Claude Code on macOS cannot find its login in
+// the keychain and reports that it is not logged in.
+func TestAgentEnv_NativeAgentIsToldItsUser(t *testing.T) {
+	me, err := user.Current()
+	require.NoError(t, err)
+	t.Setenv("USER", "")
+	t.Setenv("LOGNAME", "")
+
+	s := &Service{cfg: Config{}}
+	native, err := s.agentEnv(nil, "", false)
+	require.NoError(t, err)
+	assert.Contains(t, native, "USER="+me.Username)
+	assert.Contains(t, native, "LOGNAME="+me.Username)
+
+	// A container's user is the image's, not the worker account's.
+	inContainer, err := s.agentEnv(nil, "", true)
+	require.NoError(t, err)
+	for _, key := range []string{"USER", "LOGNAME"} {
+		assert.False(t, hasEnvKey(inContainer, key), "%s must not reach a container", key)
+	}
+}
+
+// TestAgentEnv_EnvFileOverridesUser pins that the operator's file still has the
+// last word: os/exec keeps the last value of a repeated key.
+func TestAgentEnv_EnvFileOverridesUser(t *testing.T) {
+	envFile := filepath.Join(t.TempDir(), "agent.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("USER=operator\n"), 0600))
+	s := &Service{cfg: Config{AgentEnvFile: envFile}, log: slog.Default()}
+
+	env, err := s.agentEnv(nil, "", false)
+	require.NoError(t, err)
+	last := ""
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "USER="); ok {
+			last = v
+		}
+	}
+	assert.Equal(t, "operator", last)
 }
 
 func hasEnvKey(env []string, key string) bool {
