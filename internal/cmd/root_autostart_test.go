@@ -41,14 +41,8 @@ func TestExecute_PinsBdNoAutoStartForChildren(t *testing.T) {
 			} else {
 				t.Setenv("BEADS_DOLT_AUTO_START", initial)
 			}
-			// persistentPreRun exits on an unsigned dev build; a test binary is one.
-			prevBuilt := BuiltProperly
-			BuiltProperly = "1"
 			rootCmd.SetArgs([]string{"version"})
-			t.Cleanup(func() {
-				BuiltProperly = prevBuilt
-				rootCmd.SetArgs(nil)
-			})
+			t.Cleanup(func() { rootCmd.SetArgs(nil) })
 
 			if code := Execute(); code != 0 {
 				t.Fatalf("Execute() = %d, want 0", code)
