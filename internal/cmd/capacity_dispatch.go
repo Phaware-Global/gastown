@@ -727,14 +727,22 @@ func listAllSlingContexts(townRoot string) []*beads.Issue {
 }
 
 func listAllSlingContextRecords(townRoot string) []slingContextRecord {
-	var records []slingContextRecord
+	records, _ := listAllSlingContextRecordsWithFailures(townRoot)
+	return records
+}
+
+// listAllSlingContextRecordsWithFailures also returns the search dirs whose
+// sling contexts could not be read, for callers that must not mistake an
+// unreadable dir for one with no contexts.
+func listAllSlingContextRecordsWithFailures(townRoot string) (records []slingContextRecord, failedDirs []string) {
 	seen := make(map[string]bool)
 	for _, dir := range beadsSearchDirs(townRoot) {
 		beadsDir := beads.ResolveBeadsDir(dir)
 		b := beads.NewWithBeadsDir(dir, beadsDir)
 		contexts, err := b.ListOpenSlingContexts()
 		if err != nil {
-			continue // Partial failure is acceptable — skip unavailable dirs
+			failedDirs = append(failedDirs, dir) // Partial failure is acceptable — skip unavailable dirs
+			continue
 		}
 		for _, ctx := range contexts {
 			key := beadsDir + "\x00" + ctx.ID
@@ -745,7 +753,7 @@ func listAllSlingContextRecords(townRoot string) []slingContextRecord {
 			records = append(records, slingContextRecord{issue: ctx, workDir: dir, beadsDir: beadsDir})
 		}
 	}
-	return records
+	return records, failedDirs
 }
 
 // listBlockedWorkBeadIDsWithError returns a set of work bead IDs that have active blockers.
