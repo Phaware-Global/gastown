@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -104,15 +105,59 @@ func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
 	}
 }
 
-// TestNudgeRefineryNoOpWithoutLog verifies that nudgeRefinery doesn't panic
-// or error when called without the test log env var and without a real tmux session.
-// The tmux NudgeSession call should fail silently.
-func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
-	// Ensure test log is NOT set so we exercise the real tmux path
+// isolatedNudgeTown makes a temp town the working directory and points tmux at
+// an empty socket directory, so nudgeRefinery can run with its test-log hook
+// unset without reaching a live town's event channels or sessions.
+func isolatedNudgeTown(t *testing.T) string {
+	t.Helper()
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(town, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(town)
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
+	t.Setenv("TMUX", "")
+	t.Setenv("GT_TOWN_SOCKET", "")
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	return town
+}
 
-	// Should not panic even though no tmux session exists
-	nudgeRefinery("nonexistent-rig", "test message")
+func TestNudgeRefineryEmitsIntoRigPartition(t *testing.T) {
+	town := isolatedNudgeTown(t)
+
+	nudgeRefinery("alpha", "test message", "mrID=gt-mr-1", "rig=beta")
+
+	files, err := filepath.Glob(filepath.Join(town, "events", "refinery", "alpha", "*.event"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("events in alpha's partition = %v (err=%v), want 1", files, err)
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event struct {
+		Type    string            `json:"type"`
+		Payload map[string]string `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "MQ_SUBMIT" || event.Payload["rig"] != "alpha" || event.Payload["mrID"] != "gt-mr-1" {
+		t.Errorf("event = %+v, want MQ_SUBMIT with rig=alpha and mrID=gt-mr-1", event)
+	}
+}
+
+func TestNudgeRefineryReportsEmitFailure(t *testing.T) {
+	isolatedNudgeTown(t)
+
+	stderr := captureStderr(t, func() { nudgeRefinery("bad.rig", "test message") })
+
+	if !strings.Contains(stderr, "failed to emit MQ_SUBMIT") {
+		t.Errorf("stderr = %q, want an MQ_SUBMIT emit warning", stderr)
+	}
 }
 
 // TestRefineryNudgePayloadIsPurelyAdditive verifies that extra fields (e.g.
