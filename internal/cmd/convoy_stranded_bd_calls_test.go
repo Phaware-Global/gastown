@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -159,7 +160,23 @@ exit 0
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Chdir(townRoot)
 
+	// Capture stderr: the hold must name the unreadable rig and the cause.
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
 	got := areScheduled([]string{"r1-a", "r2-b", "hq-c"})
+	os.Stderr = origStderr
+	w.Close()
+	warn, _ := io.ReadAll(r)
+	if !strings.Contains(string(warn), "rig rig2") || !strings.Contains(string(warn), "held as scheduled") {
+		t.Errorf("no warning naming the unreadable rig on stderr, got: %q", warn)
+	}
+	if strings.Contains(string(warn), "rig rig1") || strings.Contains(string(warn), "town beads") {
+		t.Errorf("warning names a readable beads dir: %q", warn)
+	}
 	if !got["r2-b"] {
 		t.Errorf("r2-b not treated as scheduled although rig2's sling contexts were unreadable: %v", got)
 	}

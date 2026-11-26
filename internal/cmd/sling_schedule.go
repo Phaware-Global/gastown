@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -359,10 +360,22 @@ func loadScheduledSnapshot() *scheduledSnapshot {
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
-	records, failedDirs := listAllSlingContextRecordsWithFailures(townRoot)
-	unreadRigs := make(map[string]bool, len(failedDirs))
-	for _, dir := range failedDirs {
-		unreadRigs[rigNameForBeadsSearchDir(townRoot, dir)] = true
+	records, failed := listAllSlingContextRecordsWithFailures(townRoot)
+	unreadRigs := make(map[string]bool, len(failed))
+	for _, f := range failed {
+		rigName := rigNameForBeadsSearchDir(townRoot, f.dir)
+		if unreadRigs[rigName] {
+			continue // a rig can have two beads dirs; warn once
+		}
+		unreadRigs[rigName] = true
+		// Say why these beads are held: callers report them as "already
+		// scheduled" or "not ready", which would otherwise hide the outage.
+		// stderr, because stdout may be JSON read by the daemon.
+		label := "rig " + rigName
+		if rigName == "" {
+			label = "town beads"
+		}
+		fmt.Fprintf(os.Stderr, "⚠ Warning: sling contexts for %s unreadable (%v); its beads are held as scheduled\n", label, f.err)
 	}
 
 	// Build lookup of work bead IDs from open contexts, skipping stale ones.

@@ -731,17 +731,23 @@ func listAllSlingContextRecords(townRoot string) []slingContextRecord {
 	return records
 }
 
+// slingContextReadFailure is a search dir whose sling contexts could not be read.
+type slingContextReadFailure struct {
+	dir string
+	err error
+}
+
 // listAllSlingContextRecordsWithFailures also returns the search dirs whose
 // sling contexts could not be read, for callers that must not mistake an
 // unreadable dir for one with no contexts.
-func listAllSlingContextRecordsWithFailures(townRoot string) (records []slingContextRecord, failedDirs []string) {
+func listAllSlingContextRecordsWithFailures(townRoot string) (records []slingContextRecord, failed []slingContextReadFailure) {
 	seen := make(map[string]bool)
 	for _, dir := range beadsSearchDirs(townRoot) {
 		beadsDir := beads.ResolveBeadsDir(dir)
 		b := beads.NewWithBeadsDir(dir, beadsDir)
 		contexts, err := b.ListOpenSlingContexts()
 		if err != nil {
-			failedDirs = append(failedDirs, dir) // Partial failure is acceptable — skip unavailable dirs
+			failed = append(failed, slingContextReadFailure{dir: dir, err: err}) // Partial failure is acceptable — skip unavailable dirs
 			continue
 		}
 		for _, ctx := range contexts {
@@ -753,7 +759,7 @@ func listAllSlingContextRecordsWithFailures(townRoot string) (records []slingCon
 			records = append(records, slingContextRecord{issue: ctx, workDir: dir, beadsDir: beadsDir})
 		}
 	}
-	return records, failedDirs
+	return records, failed
 }
 
 // listBlockedWorkBeadIDsWithError returns a set of work bead IDs that have active blockers.
