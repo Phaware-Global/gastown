@@ -186,6 +186,9 @@ func FindStrandedConvoys(townRoot string) ([]StrandedConvoy, error) {
 	cmd.Dir = townRoot
 	cmd.Env = deaconReadOnlyRoutingEnv(townRoot)
 	util.SetDetachedProcessGroup(cmd)
+	// A successful scan can still warn on stderr (a skipped convoy, a rig whose
+	// sling contexts are unreadable). Pass it through so the deacon sees it.
+	cmd.Stderr = os.Stderr
 
 	output, err := cmd.Output()
 	if err != nil {
