@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -104,13 +106,23 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A polecat's commands run in its own worktree on this host, as they would
+	// for a local polecat. Never the server's own directory: that is the town
+	// root, where gt reads the wrong branch and bd the wrong database.
+	workDir, err := s.polecatWorkDir(identity)
+	if err != nil {
+		s.log.Warn("exec refused: no polecat worktree", "identity", identity, "err", err)
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+
 	execCtx := r.Context()
 	if s.execTimeout > 0 {
 		var cancel context.CancelFunc
 		execCtx, cancel = context.WithTimeout(execCtx, s.execTimeout)
 		defer cancel()
 	}
-	out, errOut, exitCode := runCommandStdin(execCtx, argv, identity, s.sessionIdentityEnv(identity), req.Stdin, envOverride)
+	out, errOut, exitCode := runCommandStdin(execCtx, argv, identity, s.sessionIdentityEnv(identity), req.Stdin, workDir, envOverride)
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
 	if exitCode == 0 {
@@ -192,6 +204,36 @@ func cnToIdentity(cn string) string {
 	return rig + "/" + name
 }
 
+// polecatWorkDir returns the host worktree of the polecat that identity
+// ("<rig>/<name>", from the client certificate) names. The request has no say
+// in it. The layouts are the ones polecat.Manager.clonePath knows:
+// polecats/<name>/<rig>/, or the older polecats/<name>/ when that holds a .git.
+//
+// A polecat with no worktree is an error rather than a fall back to the
+// server's directory: every relayed command reads its branch or its beads
+// from where it runs. An empty identity (no client certificate, which mTLS
+// rules out) returns "" and leaves the directory alone.
+func (s *Server) polecatWorkDir(identity string) (string, error) {
+	if identity == "" {
+		return "", nil
+	}
+	rig, name, _ := strings.Cut(identity, "/")
+	// validIdentityComponent admits dots, so "." and ".." are ruled out here.
+	for _, c := range []string{rig, name} {
+		if !validIdentityComponent(c) || c == "." || c == ".." {
+			return "", fmt.Errorf("no polecat worktree for %q: not a usable rig/polecat name", identity)
+		}
+	}
+	polecatDir := filepath.Join(s.cfg.TownRoot, rig, "polecats", name)
+	if info, err := os.Stat(filepath.Join(polecatDir, rig)); err == nil && info.IsDir() {
+		return filepath.Join(polecatDir, rig), nil
+	}
+	if _, err := os.Stat(filepath.Join(polecatDir, ".git")); err == nil {
+		return polecatDir, nil
+	}
+	return "", fmt.Errorf("no polecat worktree for %q on this host (looked in %s)", identity, polecatDir)
+}
+
 // isAllowed reports whether cmd is in the allowlist.
 func (s *Server) isAllowed(cmd string) bool {
 	return s.allowed[cmd]
@@ -214,13 +256,15 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 }
 
 func runCommand(ctx context.Context, argv []string, identity string, sessionEnv []string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
-	return runCommandStdin(ctx, argv, identity, sessionEnv, "", envOverride...)
+	return runCommandStdin(ctx, argv, identity, sessionEnv, "", "", envOverride...)
 }
 
-// runCommandStdin is runCommand with the subprocess's stdin set to stdin. An
-// empty stdin is an empty stream, never the server's own stdin.
-func runCommandStdin(ctx context.Context, argv []string, identity string, sessionEnv []string, stdin string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
+// runCommandStdin is runCommand with the subprocess's stdin set to stdin and
+// its working directory to dir. An empty stdin is an empty stream, never the
+// server's own stdin; an empty dir is the server's own directory.
+func runCommandStdin(ctx context.Context, argv []string, identity string, sessionEnv []string, stdin, dir string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(stdin)
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf

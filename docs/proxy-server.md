@@ -98,6 +98,15 @@ gt-proxy-server: listening  addr=0.0.0.0:9876  tls=mTLS
 |----------|-------------|
 | `GT_TOWN` | Overrides the town root directory (same as `--town-root`) |
 
+### Where a command runs
+
+A command runs in the calling polecat's own worktree on the host
+(`<town>/<rig>/polecats/<name>/<rig>`), the directory a local polecat would run
+it from, so `gt` reads that polecat's branch and `bd` its rig's beads. The
+worktree is derived from the client certificate; the request cannot name a
+directory. A polecat with no worktree on the host gets HTTP 409 and its command
+does not run.
+
 ### Allowed commands and subcommands
 
 Only the binary names listed in `--allowed-cmds` can be called via `/v1/exec`.
@@ -393,6 +402,7 @@ curl -s https://api.ipify.org
 | **Client identity** | Server verifies every request comes from a known polecat | Client cert signed by the same CA; CN format `gt-<rig>-<name>` required |
 | **Exec allowlist** | Containers can only call `gt` and `bd` (or the configured set) | `--allowed-cmds` checked on every `/v1/exec` request |
 | **Subcommand allowlist** | Polecats may only invoke permitted subcommands of `gt`/`bd` | `--allowed-subcmds` checked on every `/v1/exec` request; missing or disallowed subcommands → 403 |
+| **Working directory** | A command runs in the calling polecat's own host worktree, never in the server's directory | Derived from the client certificate; a polecat with no worktree → 409 |
 | **Subcommand injection** | Polecat identity is injected as `--identity <rig>/<name>` and cannot be overridden | Server derives identity from the client certificate, not from the request body |
 | **Branch scope** | A polecat can only push to `refs/heads/polecat/<name>-*` or `refs/heads/polecat/<name>/<one segment>`, the same two forms under `refs/remote-work/`, and its checkpoint ref | pkt-line stream parsed and validated before `git-receive-pack` is invoked |
 | **Rig scope** | A polecat can only push to its own rig's repo | The rig in the cert CN must equal the rig in the URL; checked before any ref is read |

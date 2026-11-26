@@ -67,6 +67,7 @@ func TestE2EEchoThroughProxy(t *testing.T) {
 	certDir := t.TempDir()
 	certPEM, keyPEM, err := ca.IssuePolecat("gt-gastown-e2etest", time.Hour)
 	require.NoError(t, err)
+	addPolecatWorktree(t, srv, "gt-gastown-e2etest")
 
 	certFile := filepath.Join(certDir, "client.crt")
 	keyFile := filepath.Join(certDir, "client.key")

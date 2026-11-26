@@ -38,6 +38,9 @@ func printGTEnvServer(t *testing.T, townRoot string) *Server {
 
 func execPrintGTEnv(t *testing.T, srv *Server, cn string) string {
 	t.Helper()
+	if cn != "" {
+		addPolecatWorktree(t, srv, cn)
+	}
 	req := makeFakeRequest("POST", "/v1/exec", `{"argv":["printgtenv"]}`, cn)
 	rec := httptest.NewRecorder()
 	srv.handleExec(rec, req)
