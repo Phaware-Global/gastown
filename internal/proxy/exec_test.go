@@ -943,9 +943,12 @@ func TestHandleExec_RefusesPolecatWithoutWorktree(t *testing.T) {
 
 			assert.Equal(t, http.StatusConflict, rec.Code)
 			assert.Contains(t, rec.Body.String(), "no polecat worktree")
+			// The host's layout stays in the server log.
+			assert.NotContains(t, rec.Body.String(), filepath.Dir(srv.cfg.TownRoot))
 			assert.NoFileExists(t, marker, "the command must not run")
-			_, logged := lc.findEntry(slog.LevelWarn, "exec refused: no polecat worktree")
+			entry, logged := lc.findEntry(slog.LevelWarn, "exec refused: no polecat worktree")
 			assert.True(t, logged)
+			assert.NotEmpty(t, entry.attrs["err"])
 		})
 	}
 }

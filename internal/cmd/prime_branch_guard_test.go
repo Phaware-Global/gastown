@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -195,6 +196,49 @@ func TestEnsurePolecatOffMain_RestoresFromMain(t *testing.T) {
 	}
 	if got := currentBranch(t, clone); got != "polecat/nux-gt-tk5" {
 		t.Errorf("worktree left on %q; want polecat/nux-gt-tk5", got)
+	}
+}
+
+// TestEnsurePolecatOffMain_RelayedNeverMovesHostWorktree: a relayed gt prime
+// (GT_PROXY_IDENTITY set by the proxy) runs in a remote polecat's worktree on
+// the host. Its work branch can be one the worker pushed, so checking it out
+// would put the worker's tree and hooks on the host. The guard refuses and
+// leaves HEAD and the tree alone, whether the branch exists or not.
+func TestEnsurePolecatOffMain_RelayedNeverMovesHostWorktree(t *testing.T) {
+	for name, pushed := range map[string]bool{"branch exists": true, "branch absent": false} {
+		t.Run(name, func(t *testing.T) {
+			clone := newOriginAndClone(t)
+			if pushed {
+				// Stands in for a worker's push: a commit carrying a hook that
+				// would run on checkout if the guard moved the worktree.
+				gitRun(t, clone, "checkout", "-q", "-b", "polecat/nux-gt-tk5")
+				hooks := filepath.Join(clone, ".githooks")
+				if err := os.MkdirAll(hooks, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(hooks, "post-checkout"), []byte("#!/bin/sh\n: > planted-hook-ran\n"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, clone, "add", ".githooks")
+				gitRun(t, clone, "commit", "-q", "-m", "worker commit")
+				gitRun(t, clone, "checkout", "-q", "main")
+				gitRun(t, clone, "config", "core.hooksPath", ".githooks")
+			}
+			t.Setenv("GT_PROXY_IDENTITY", "myrig/nux")
+
+			ctx := RoleContext{Role: RolePolecat, Polecat: "nux", WorkDir: clone}
+			if err := ensurePolecatOffMain(ctx, &beads.Issue{ID: "gt-tk5"}); err == nil {
+				t.Fatal("expected a relayed prime on main to be refused, got nil")
+			}
+			if got := currentBranch(t, clone); got != "main" {
+				t.Errorf("relayed prime moved the host worktree to %q", got)
+			}
+			for _, f := range []string{".githooks", "planted-hook-ran"} {
+				if _, err := os.Stat(filepath.Join(clone, f)); err == nil {
+					t.Errorf("%s is in the host worktree after a relayed prime", f)
+				}
+			}
+		})
 	}
 }
 

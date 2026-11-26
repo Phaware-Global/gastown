@@ -107,6 +107,11 @@ worktree is derived from the client certificate; the request cannot name a
 directory. A polecat with no worktree on the host gets HTTP 409 and its command
 does not run.
 
+A relayed command does not move that worktree. `gt prime` restores a local
+polecat found on a protected branch to its work branch; for a relayed call it
+refuses instead, because that branch can be one the worker pushed and a
+checkout would put the worker's files and hooks on the host.
+
 ### Allowed commands and subcommands
 
 Only the binary names listed in `--allowed-cmds` can be called via `/v1/exec`.
