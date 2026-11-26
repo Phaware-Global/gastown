@@ -1,8 +1,11 @@
 package deacon
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,5 +220,44 @@ func TestSaveFeedStrandedState_CreatesDirectory(t *testing.T) {
 	stateFile := FeedStrandedStateFile(tmpDir)
 	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		t.Fatal("state file not created")
+	}
+}
+
+// A successful stranded scan's stderr warnings are passed through, not dropped.
+func TestFindStrandedConvoys_PassesThroughStderrWarnings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	binDir := t.TempDir()
+	gtScript := `#!/bin/sh
+echo "Warning: sling contexts for rig rig2 unreadable" >&2
+echo '[]'
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write mock gt: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	stranded, findErr := FindStrandedConvoys(t.TempDir())
+	os.Stderr = origStderr
+	w.Close()
+	got, _ := io.ReadAll(r)
+
+	if findErr != nil {
+		t.Fatalf("FindStrandedConvoys: %v", findErr)
+	}
+	if len(stranded) != 0 {
+		t.Errorf("stranded = %+v, want none", stranded)
+	}
+	if !strings.Contains(string(got), "rig rig2 unreadable") {
+		t.Errorf("stderr warning not passed through, got %q", got)
 	}
 }

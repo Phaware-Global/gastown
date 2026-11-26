@@ -132,6 +132,11 @@ type ConvoyManager struct {
 	// duplicate convoy checks for the same stranded convoy.
 	scanMu sync.Mutex
 
+	// lastStrandedWarnings is the stderr of the previous successful stranded
+	// scan, so an unchanged warning is logged once and not on every scan.
+	// Guarded by scanMu.
+	lastStrandedWarnings string
+
 	// lastEventIDs tracks per-store high-water marks for event polling.
 	// Key matches stores map keys ("hq", "gastown", etc.).
 	lastEventIDs sync.Map // map[string]time.Time
@@ -787,6 +792,18 @@ func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("%s", util.FirstLine(stderr.String()))
+	}
+
+	// A successful scan can still warn on stderr (a skipped convoy, a rig whose
+	// sling contexts are unreadable). Log it, or the scan's result has no
+	// visible cause.
+	if warnings := strings.TrimSpace(stderr.String()); warnings != m.lastStrandedWarnings {
+		m.lastStrandedWarnings = warnings
+		for _, line := range strings.Split(warnings, "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				m.logger("Convoy: stranded scan: %s", line)
+			}
+		}
 	}
 
 	var stranded []strandedConvoyInfo
