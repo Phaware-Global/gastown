@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -116,5 +117,70 @@ exit 0
 	}
 	if agentLists != 0 {
 		t.Errorf("agent-bead lists = %d, want 0: the scan does not use worker info\n%s", agentLists, logData)
+	}
+}
+
+// A rig whose sling contexts cannot be read is not a rig with no contexts: its
+// beads are held as scheduled, while beads in readable rigs are unaffected.
+func TestScheduledSnapshot_UnreadableRigFailsClosedForItsBeadsOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping scheduler test on Windows")
+	}
+
+	binDir := t.TempDir()
+	townRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"mayor", ".beads", "rig1/mayor/rig/.beads", "rig2/mayor/rig/.beads"} {
+		if err := os.MkdirAll(filepath.Join(townRoot, dir), 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	routes := `{"prefix":"hq-","path":"."}` + "\n" + `{"prefix":"r1-","path":"rig1/mayor/rig"}` + "\n" + `{"prefix":"r2-","path":"rig2/mayor/rig"}` + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// bd fails for every call made from rig2's beads dir and returns no
+	// contexts elsewhere.
+	script := `#!/bin/sh
+case "$PWD" in
+  */rig2/*) echo "database unavailable" >&2; exit 1 ;;
+esac
+echo '[]'
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Chdir(townRoot)
+
+	// Capture stderr: the hold must name the unreadable rig and the cause.
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	got := areScheduled([]string{"r1-a", "r2-b", "hq-c"})
+	os.Stderr = origStderr
+	w.Close()
+	warn, _ := io.ReadAll(r)
+	if !strings.Contains(string(warn), "rig rig2") || !strings.Contains(string(warn), "held as scheduled") {
+		t.Errorf("no warning naming the unreadable rig on stderr, got: %q", warn)
+	}
+	if strings.Contains(string(warn), "rig rig1") || strings.Contains(string(warn), "town beads") {
+		t.Errorf("warning names a readable beads dir: %q", warn)
+	}
+	if !got["r2-b"] {
+		t.Errorf("r2-b not treated as scheduled although rig2's sling contexts were unreadable: %v", got)
+	}
+	if got["r1-a"] || got["hq-c"] {
+		t.Errorf("beads outside the unreadable rig treated as scheduled: %v", got)
 	}
 }
