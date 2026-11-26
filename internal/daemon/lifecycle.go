@@ -984,85 +984,21 @@ func identityToBDActor(identity string) string {
 // Defined in constants package — this alias avoids updating all call sites.
 const GUPPViolationTimeout = constants.GUPPViolationTimeout
 
-// listAgentBeadsJSON queries both the issues and wisps tables for agent beads
-// and unmarshals the combined results into the provided slice pointer.
-// The wisps query is best-effort (gracefully ignored if table doesn't exist).
+// listAgentBeadsJSON queries the town database for agent beads and unmarshals
+// them into the provided slice pointer. "bd mol wisp list" is not consulted: its
+// entries carry neither hook_bead nor agent_state.
 func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
-	// Query issues table (backward compat during migration)
 	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
-	issuesOutput, issuesErr := cmd.Output()
-
-	// Query wisps table (primary source after agent bead migration)
-	wispCmd := exec.Command(d.bdPath, "mol", "wisp", "list", "--json") //nolint:gosec // G204: bd is a trusted internal tool
-	wispCmd.Dir = d.config.TownRoot
-	wispCmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
-	util.SetDetachedProcessGroup(wispCmd)
-
-	wispOutput, _ := wispCmd.Output() // Best-effort: wisps table may not exist
-
-	// Merge results: parse wisps first, then issues (wisps take precedence)
-	combined := mergeAgentBeadJSON(wispOutput, issuesOutput)
-	if combined == nil {
-		if issuesErr != nil {
-			return fmt.Errorf("bd list failed: %w", issuesErr)
-		}
-		return fmt.Errorf("no agent beads found")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("bd list failed: %w", err)
 	}
 
-	return json.Unmarshal(combined, dest)
-}
-
-// mergeAgentBeadJSON merges JSON arrays from wisps and issues queries.
-// Returns a combined JSON array with wisps taking precedence for duplicate IDs.
-// Filters wisps to only include agent beads (type=agent or label gt:agent).
-func mergeAgentBeadJSON(wispJSON, issuesJSON []byte) []byte {
-	type agentEntry struct {
-		ID     string   `json:"id"`
-		Type   string   `json:"issue_type"`
-		Labels []string `json:"labels"`
-	}
-
-	// Track IDs from wisps to avoid duplicates
-	seenIDs := make(map[string]bool)
-	var result []json.RawMessage
-
-	// Parse wisps first (primary source)
-	if len(wispJSON) > 0 {
-		var wispEntries []json.RawMessage
-		if json.Unmarshal(wispJSON, &wispEntries) == nil {
-			for _, raw := range wispEntries {
-				var entry agentEntry
-				if json.Unmarshal(raw, &entry) == nil && beads.IsAgentBead(&beads.Issue{Type: entry.Type, Labels: entry.Labels}) {
-					seenIDs[entry.ID] = true
-					result = append(result, raw)
-				}
-			}
-		}
-	}
-
-	// Then issues (backward compat, skip duplicates)
-	if len(issuesJSON) > 0 {
-		var issueEntries []json.RawMessage
-		if json.Unmarshal(issuesJSON, &issueEntries) == nil {
-			for _, raw := range issueEntries {
-				var entry agentEntry
-				if json.Unmarshal(raw, &entry) == nil && !seenIDs[entry.ID] {
-					result = append(result, raw)
-				}
-			}
-		}
-	}
-
-	if len(result) == 0 {
-		return nil
-	}
-
-	combined, _ := json.Marshal(result)
-	return combined
+	return json.Unmarshal(output, dest)
 }
 
 // checkGUPPViolations looks for agents that have work-on-hook but aren't
