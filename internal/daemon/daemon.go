@@ -26,6 +26,7 @@ import (
 	"github.com/steveyegge/gastown/internal/assistant"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
@@ -1969,11 +1970,15 @@ func (d *Daemon) ensureWitnessesRunning() {
 	})
 }
 
-// hasPendingEvents checks if there are pending .event files in the given channel directory.
+// hasPendingEvents checks if there are pending .event files in the given channel
+// directory; rigName selects the rig's partition on per-rig channels.
 // Used to gate agent spawning: don't burn API credits starting a Claude session when
 // there's nothing to process. The agent's await-event handles the actual consumption.
-func (d *Daemon) hasPendingEvents(channel string) bool {
-	eventDir := filepath.Join(d.config.TownRoot, "events", channel)
+func (d *Daemon) hasPendingEvents(channel, rigName string) bool {
+	eventDir, err := channelevents.Dir(d.config.TownRoot, channel, rigName)
+	if err != nil {
+		return false
+	}
 	entries, err := os.ReadDir(eventDir)
 	if err != nil {
 		return false // Directory doesn't exist or unreadable = no pending events
@@ -2059,7 +2064,7 @@ const refineryWedgeBackstopMultiplier = 8
 // a beads outage anyway, so deferring a restart/reap to the next successful cycle
 // (or a fresh wake event) is safer than spawn-looping or reaping on uncertainty.
 func (d *Daemon) refineryHasWork(mgr *refinery.Manager, rigName string) bool {
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("refinery", rigName) {
 		return true
 	}
 	queue, err := mgr.Queue()
@@ -2143,7 +2148,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 			wedgeBackstop := time.Duration(refineryWedgeBackstopMultiplier) * hung
 			var reapReason string
 			switch {
-			case d.hasPendingEvents("refinery"):
+			case d.hasPendingEvents("refinery", rigName):
 				reapReason = fmt.Sprintf("pending events, no activity for >%v", hung)
 			case mgr.IsHealthy(wedgeBackstop) == tmux.AgentHung && d.refineryHasWork(mgr, rigName):
 				reapReason = fmt.Sprintf("work queued, no activity for >%v (wedge backstop)", wedgeBackstop)

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"regexp"
 	"strings"
 	"sync"
@@ -647,6 +648,15 @@ func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string, container
 			env = append(env, key+"="+v)
 		}
 	}
+	// A native agent runs as the worker's own account and expects to be told
+	// which: Claude Code on macOS finds its login in the keychain by USER.
+	// Taken from the process rather than the environment, which a service
+	// manager need not populate. A container's user is the image's.
+	if !container {
+		if name := workerUserName(); name != "" {
+			env = append(env, "USER="+name, "LOGNAME="+name)
+		}
+	}
 	// Endpoints are worker-local: the wire cannot carry them
 	// (sockproto.EnvEndpointKey), so the worker supplies the agent's
 	// control-plane URL from its own session relay.
@@ -683,6 +693,16 @@ func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string, container
 		}
 	}
 	return env, nil
+}
+
+// workerUserName is the login name of the account this worker runs as, or ""
+// when it cannot be determined.
+func workerUserName() string {
+	u, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return u.Username
 }
 
 // containerExcludedEnv are variables a container must take from its image, not

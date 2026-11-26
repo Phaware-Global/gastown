@@ -962,6 +962,23 @@ func identityToBDActor(identity string) string {
 // Defined in constants package — this alias avoids updating all call sites.
 const GUPPViolationTimeout = constants.GUPPViolationTimeout
 
+// listAgentBeadsJSON queries the town database for agent beads and unmarshals
+// them into the provided slice pointer. "bd mol wisp list" is not consulted: its
+// entries carry neither hook_bead nor agent_state.
+func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
+	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
+	util.SetDetachedProcessGroup(cmd)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("bd list failed: %w", err)
+	}
+
+	return json.Unmarshal(output, dest)
+}
+
 // polecatWork is a work bead on a polecat's hook. The work bead's status and
 // assignee are the only record of hook state.
 type polecatWork struct {

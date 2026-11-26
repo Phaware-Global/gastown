@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -808,8 +809,9 @@ func TestHandleReceivePackIntegration(t *testing.T) {
 	runGit(localRepo, "add", "README")
 	runGit(localRepo, "commit", "-m", "initial")
 
-	// pushRef runs git push with mTLS client cert/key/CA configured via -c flags.
-	pushRef := func(refspec string) ([]byte, error) {
+	// proxyGit runs a git command in dir with the mTLS client cert/key/CA
+	// configured via -c flags.
+	proxyGit := func(dir string, gitArgs ...string) ([]byte, error) {
 		args := []string{
 			"-c", "credential.helper=",
 		}
@@ -827,12 +829,14 @@ func TestHandleReceivePackIntegration(t *testing.T) {
 			"-c", "http.sslCert="+certFile,
 			"-c", "http.sslKey="+keyFile,
 			"-c", "http.sslCAInfo="+caFile,
-			"push", repoURL, refspec,
 		)
-		cmd := exec.Command(gitPath, args...)
-		cmd.Dir = localRepo
+		cmd := exec.Command(gitPath, append(args, gitArgs...)...)
+		cmd.Dir = dir
 		cmd.Env = baseEnv
 		return cmd.CombinedOutput()
+	}
+	pushRef := func(refspec string) ([]byte, error) {
+		return proxyGit(localRepo, "push", repoURL, refspec)
 	}
 
 	t.Run("push to allowed polecat ref succeeds", func(t *testing.T) {
@@ -843,6 +847,92 @@ func TestHandleReceivePackIntegration(t *testing.T) {
 	t.Run("push to disallowed ref is rejected", func(t *testing.T) {
 		out, err := pushRef("HEAD:refs/heads/main")
 		assert.Error(t, err, "push to disallowed ref should fail, got output:\n%s", out)
+	})
+
+	// git gzips an upload-pack request once it passes 1 KiB, which a fetch
+	// naming a few dozen distinct commits does.
+	t.Run("fetch with a gzip-compressed request succeeds", func(t *testing.T) {
+		const branches = 40
+		for i := 0; i < branches; i++ {
+			runGit(localRepo, "commit", "--allow-empty", "-m", fmt.Sprintf("tip %d", i))
+			runGit(localRepo, "branch", fmt.Sprintf("many-%d", i))
+		}
+		// Seed the served repo directly; the proxy only accepts polecat refs.
+		runGit(localRepo, "push", filepath.Join(townRoot, rig, ".repo.git"), "refs/heads/many-*:refs/heads/many-*")
+
+		clone := t.TempDir()
+		runGit(clone, "init")
+		baseEnv = append(baseEnv, "GIT_CURL_VERBOSE=1")
+		out, err := proxyGit(clone, "fetch", repoURL, "refs/heads/many-*:refs/remotes/proxy/many-*")
+		require.NoError(t, err, "fetch through the proxy should succeed:\n%s", out)
+		require.Contains(t, string(out), "Content-Encoding: gzip",
+			"the fetch request was not gzip-compressed, so this test proves nothing")
+
+		refs, err := exec.Command(gitPath, "-C", clone, "for-each-ref", "refs/remotes/proxy").Output()
+		require.NoError(t, err)
+		assert.Len(t, strings.Split(strings.TrimSpace(string(refs)), "\n"), branches)
+	})
+}
+
+// gzipBytes returns b gzip-compressed.
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err := zw.Write(b)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	return buf.Bytes()
+}
+
+// TestHandlePackGzipBody covers request bodies sent with Content-Encoding: gzip.
+func TestHandlePackGzipBody(t *testing.T) {
+	gitPath := requireGit(t)
+	const cn = "gt-testrip-raider"
+
+	post := func(t *testing.T, srv *Server, service string, body []byte, encoding string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := fakeGitRequest("POST", "/v1/git/testrip/"+service, body, cn)
+		req.Header.Set("Content-Encoding", encoding)
+		rec := httptest.NewRecorder()
+		srv.handleGit(rec, req)
+		return rec
+	}
+
+	t.Run("receive-pack ref rules apply to the decoded body", func(t *testing.T) {
+		srv, townRoot, lc := newGitServerWithLog(t)
+		makeBareRepo(t, gitPath, townRoot)
+		rec := post(t, srv, "git-receive-pack", gzipBytes(t, receivePackBody("refs/heads/main")), "gzip")
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		e, ok := lc.findEntry(slog.LevelWarn, "git push denied")
+		require.True(t, ok, "the denial should be logged with the decoded ref")
+		assert.Equal(t, "[refs/heads/main]", e.attrs["refs"])
+	})
+
+	t.Run("allowed gzip receive-pack reaches git", func(t *testing.T) {
+		srv, townRoot, lc := newGitServerWithLog(t)
+		makeBareRepo(t, gitPath, townRoot)
+		rec := post(t, srv, "git-receive-pack", gzipBytes(t, receivePackBody("refs/heads/polecat/raider-x")), "x-gzip")
+		assert.Equal(t, http.StatusOK, rec.Code)
+		e, ok := lc.findEntry(slog.LevelInfo, "git push")
+		require.True(t, ok)
+		assert.Equal(t, "[refs/heads/polecat/raider-x]", e.attrs["refs"])
+	})
+
+	t.Run("gzip upload-pack body is decoded before git reads it", func(t *testing.T) {
+		srv, townRoot, lc := newGitServerWithLog(t)
+		makeBareRepo(t, gitPath, townRoot)
+		rec := post(t, srv, "git-upload-pack", gzipBytes(t, []byte("0000")), "gzip")
+		assert.Equal(t, http.StatusOK, rec.Code)
+		_, failed := lc.findEntry(slog.LevelError, "git pack failed")
+		assert.False(t, failed, "git should accept the decoded flush packet")
+	})
+
+	t.Run("body that is not gzip returns 400", func(t *testing.T) {
+		srv, townRoot, _ := newGitServerWithLog(t)
+		makeBareRepo(t, gitPath, townRoot)
+		rec := post(t, srv, "git-upload-pack", []byte("0000"), "gzip")
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 }
 

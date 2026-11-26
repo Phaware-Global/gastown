@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -326,32 +327,62 @@ const slingContextTTL = 30 * time.Minute
 // Scans all rig beads dirs since sling contexts are created in the target
 // rig's beads dir (GH#3468). On error, fails closed: treats ALL requested
 // beads as scheduled to prevent false stranded detection and duplicate
-// scheduling attempts.
+// scheduling attempts. When only some rigs' contexts cannot be read, the beads
+// whose prefix routes to those rigs are treated as scheduled.
 //
 // Sling contexts older than slingContextTTL are ignored — they are likely
 // orphans from failed spawn attempts (GH#2279).
 func areScheduled(beadIDs []string) map[string]bool {
-	result := make(map[string]bool)
 	if len(beadIDs) == 0 {
-		return result
+		return make(map[string]bool)
 	}
+	return loadScheduledSnapshot().filter(beadIDs)
+}
 
+// scheduledSnapshot is one read of the town's open sling contexts. Loading it
+// costs a bd list and a bd sql per beads dir, so a caller that checks several
+// groups of beads in one pass loads it once and filters it per group.
+type scheduledSnapshot struct {
+	failClosed bool            // town root unknown: every bead counts as scheduled
+	workBeads  map[string]bool // work bead IDs that have a live sling context
+	// unreadRigs holds the rigs whose sling contexts could not be read ("" is
+	// the town-level beads dir). Their beads count as scheduled, because an
+	// unreadable rig is not a rig with no contexts.
+	unreadRigs map[string]bool
+	townRoot   string
+}
+
+func loadScheduledSnapshot() *scheduledSnapshot {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
 		// Can't determine town root — fail closed (treat all as scheduled)
-		for _, id := range beadIDs {
-			result[id] = true
-		}
-		return result
+		return &scheduledSnapshot{failClosed: true}
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
-	contexts := listAllSlingContexts(townRoot)
+	records, failed := listAllSlingContextRecordsWithFailures(townRoot)
+	unreadRigs := make(map[string]bool, len(failed))
+	for _, f := range failed {
+		rigName := rigNameForBeadsSearchDir(townRoot, f.dir)
+		if unreadRigs[rigName] {
+			continue // a rig can have two beads dirs; warn once
+		}
+		unreadRigs[rigName] = true
+		// Say why these beads are held: callers report them as "already
+		// scheduled" or "not ready", which would otherwise hide the outage.
+		// stderr, because stdout may be JSON read by the daemon.
+		label := "rig " + rigName
+		if rigName == "" {
+			label = "town beads"
+		}
+		fmt.Fprintf(os.Stderr, "⚠ Warning: sling contexts for %s unreadable (%v); its beads are held as scheduled\n", label, f.err)
+	}
 
 	// Build lookup of work bead IDs from open contexts, skipping stale ones.
 	scheduledWorkBeads := make(map[string]bool)
 	now := time.Now()
-	for _, ctx := range contexts {
+	for _, rec := range records {
+		ctx := rec.issue
 		// Skip stale sling contexts (GH#2279): contexts older than the TTL
 		// are likely orphans from failed spawn attempts. Ignoring them allows
 		// the task to appear as "ready" again for re-dispatch.
@@ -367,14 +398,37 @@ func areScheduled(beadIDs []string) map[string]bool {
 			scheduledWorkBeads[fields.WorkBeadID] = true
 		}
 	}
+	return &scheduledSnapshot{workBeads: scheduledWorkBeads, unreadRigs: unreadRigs, townRoot: townRoot}
+}
 
-	// Filter to just the requested IDs
+// rigNameForBeadsSearchDir maps a dir from beadsSearchDirs to its rig name, or
+// "" for the town root itself.
+func rigNameForBeadsSearchDir(townRoot, dir string) string {
+	rel, err := filepath.Rel(townRoot, dir)
+	if err != nil || rel == "." {
+		return ""
+	}
+	return strings.SplitN(filepath.ToSlash(rel), "/", 2)[0]
+}
+
+// filter returns the subset of beadIDs that are scheduled in this snapshot.
+func (s *scheduledSnapshot) filter(beadIDs []string) map[string]bool {
+	result := make(map[string]bool)
 	for _, id := range beadIDs {
-		if scheduledWorkBeads[id] {
+		if s.failClosed || s.workBeads[id] || s.inUnreadRig(id) {
 			result[id] = true
 		}
 	}
 	return result
+}
+
+// inUnreadRig reports whether the bead's prefix routes to a rig whose sling
+// contexts could not be read in this snapshot.
+func (s *scheduledSnapshot) inUnreadRig(beadID string) bool {
+	if len(s.unreadRigs) == 0 {
+		return false
+	}
+	return s.unreadRigs[beads.GetRigNameForPrefix(s.townRoot, beads.ExtractPrefix(beadID))]
 }
 
 // isScheduled checks if a single bead has an open sling context.
