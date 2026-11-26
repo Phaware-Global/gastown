@@ -742,11 +742,8 @@ func (r *Router) resolveAgentsByRole(roleType, rig string) ([]string, error) {
 	var addresses []string
 	for _, agent := range agents {
 		// Filter by rig if specified
-		if rig != "" {
-			// Check if agent's description contains matching rig
-			if !strings.Contains(agent.Description, "rig: "+rig) {
-				continue
-			}
+		if rig != "" && beads.ParseAgentFields(agent.Description).Rig != rig {
+			continue
 		}
 		if addr := agentBeadToAddress(agent); addr != "" {
 			addresses = append(addresses, addr)
@@ -758,12 +755,15 @@ func (r *Router) resolveAgentsByRole(roleType, rig string) ([]string, error) {
 
 // resolveAgentsByRig resolves @rig/<rigname> to all agents in that rig.
 func (r *Router) resolveAgentsByRig(rig string) ([]string, error) {
-	// Query for agents with matching rig in description
+	// The query matches substrings, so "rig: demo" also returns demo_ios agents.
 	query := "rig: " + rig
 	agents := r.queryAgents(query)
 
 	var addresses []string
 	for _, agent := range agents {
+		if beads.ParseAgentFields(agent.Description).Rig != rig {
+			continue
+		}
 		if addr := agentBeadToAddress(agent); addr != "" {
 			addresses = append(addresses, addr)
 		}
@@ -820,9 +820,17 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 }
 
 // queryAgentsInDir queries agent beads in a specific beads directory with optional description filtering.
-// Queries both the issues and wisps tables, merging results.
+// "bd mol wisp list" is not consulted: its entries carry no description and it
+// takes no description filter.
 func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, error) {
 	args := []string{"list", "--label=gt:agent", "--json", "--flat", "--limit=0"}
+
+	// --include-infra surfaces type=agent records. On the town database it makes
+	// this query several times slower, and every crew or polecat send runs it,
+	// so only rig queries pass it.
+	if filepath.Clean(beadsDir) != filepath.Clean(r.resolveBeadsDir()) {
+		args = append(args, "--include-infra")
+	}
 
 	if descContains != "" {
 		args = append(args, "--desc-contains="+descContains)
@@ -831,43 +839,13 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 	ctx, cancel := bdReadCtx()
 	defer cancel()
 
-	// Query issues table (backward compat during migration)
-	stdout, issuesErr := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 
-	// Also query wisps table for migrated agent beads (best-effort)
-	wispCtx, wispCancel := bdReadCtx()
-	defer wispCancel()
-	wispOut, _ := runBdCommand(wispCtx, []string{"mol", "wisp", "list", "--json"}, filepath.Dir(beadsDir), beadsDir)
-
-	// Merge results: collect agent beads from both sources
-	seenIDs := make(map[string]bool)
 	var agents []*agentBead
-
-	// Parse wisps first (primary source after migration)
-	if len(wispOut) > 0 {
-		var wispAgents []*agentBead
-		if json.Unmarshal(wispOut, &wispAgents) == nil {
-			for _, agent := range wispAgents {
-				if isAgentBeadEntry(agent) {
-					seenIDs[agent.ID] = true
-					agents = append(agents, agent)
-				}
-			}
-		}
-	}
-
-	// Then issues (backward compat, skip duplicates)
 	if len(stdout) > 0 {
-		var issueAgents []*agentBead
-		if json.Unmarshal(stdout, &issueAgents) == nil {
-			for _, agent := range issueAgents {
-				if !seenIDs[agent.ID] {
-					agents = append(agents, agent)
-				}
-			}
-		}
-	} else if issuesErr != nil && len(agents) == 0 {
-		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, issuesErr)
+		_ = json.Unmarshal(stdout, &agents)
+	} else if err != nil {
+		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, err)
 	}
 
 	// Filter for active agents (closed/deleted agents are inactive)
@@ -879,19 +857,6 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 	}
 
 	return active, nil
-}
-
-// isAgentBeadEntry checks if an agentBead entry is an actual agent bead.
-func isAgentBeadEntry(a *agentBead) bool {
-	if a.Type == "agent" {
-		return true
-	}
-	for _, l := range a.Labels {
-		if l == "gt:agent" {
-			return true
-		}
-	}
-	return false
 }
 
 // queryAgentsFromDir queries agent beads from a specific beads directory.

@@ -1699,6 +1699,80 @@ exit 0
 	}
 }
 
+// A successful stranded scan's stderr warnings reach the daemon log, once per
+// distinct warning rather than on every scan.
+func TestFindStranded_LogsStderrWarningsOncePerChange(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	binDir := t.TempDir()
+	townRoot := t.TempDir()
+	warnFile := filepath.Join(binDir, "warning")
+
+	gtScript := `#!/bin/sh
+if [ -f "` + warnFile + `" ]; then cat "` + warnFile + `" >&2; fi
+echo '[]'
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write mock gt: %v", err)
+	}
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	m := NewConvoyManager(townRoot, logger, filepath.Join(binDir, "gt"), 10*time.Minute, nil, nil, nil)
+
+	scan := func() {
+		t.Helper()
+		if _, err := m.findStranded(); err != nil {
+			t.Fatalf("findStranded: %v", err)
+		}
+	}
+	countWarnings := func() int {
+		n := 0
+		for _, l := range logged {
+			if strings.Contains(l, "unreadable") {
+				n++
+			}
+		}
+		return n
+	}
+
+	scan()
+	if len(logged) != 0 {
+		t.Fatalf("clean scan logged %q, want nothing", logged)
+	}
+
+	warning := "Warning: sling contexts for rig rig2 unreadable (boom); its beads are held as scheduled\n"
+	if err := os.WriteFile(warnFile, []byte(warning), 0644); err != nil {
+		t.Fatal(err)
+	}
+	scan()
+	if countWarnings() != 1 {
+		t.Fatalf("after first warning scan, logged %q, want the warning once", logged)
+	}
+	scan()
+	if countWarnings() != 1 {
+		t.Errorf("unchanged warning logged again: %q", logged)
+	}
+
+	// Cleared, then back: a recurrence is logged again.
+	if err := os.Remove(warnFile); err != nil {
+		t.Fatal(err)
+	}
+	scan()
+	if err := os.WriteFile(warnFile, []byte(warning), 0644); err != nil {
+		t.Fatal(err)
+	}
+	scan()
+	if countWarnings() != 2 {
+		t.Errorf("recurring warning not logged again: %q", logged)
+	}
+}
+
 func TestFindStranded_InvalidJSON_ReturnsError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on Windows")

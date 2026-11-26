@@ -19,6 +19,7 @@ import (
 
 var (
 	awaitEventChannel              string
+	awaitEventRig                  string
 	awaitEventTimeout              string
 	awaitEventBackoffBase          string
 	awaitEventBackoffMult          int
@@ -44,6 +45,10 @@ Events are emitted via "gt mol step emit-event" or programmatically.
 Channels are single-consumer: only one process should watch a given channel
 at a time. If multiple consumers watch the same channel with --cleanup,
 events may be deleted before all consumers read them.
+
+The "refinery" channel is per-rig: events live in
+~/gt/events/refinery/<rig>/ and each rig's refinery sees only its own. The rig
+comes from --rig, else GT_RIG, else the current directory.
 
 EVENT FORMAT:
 Events are JSON files in ~/gt/events/<channel>/*.event:
@@ -132,6 +137,8 @@ func init() {
 		"Yield after this wall-clock interval so the caller can assess context (e.g., 5m). Returns reason 'context-yield'.")
 	moleculeAwaitEventCmd.Flags().BoolVar(&moleculeJSON, "json", false,
 		"Output as JSON")
+	moleculeAwaitEventCmd.Flags().StringVar(&awaitEventRig, "rig", "",
+		"Rig whose events to consume on a per-rig channel (default: GT_RIG or cwd)")
 	_ = moleculeAwaitEventCmd.MarkFlagRequired("channel")
 
 	moleculeStepCmd.AddCommand(moleculeAwaitEventCmd)
@@ -150,7 +157,14 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		home, _ := os.UserHomeDir()
 		townRoot = filepath.Join(home, "gt")
 	}
-	eventDir := filepath.Join(townRoot, "events", awaitEventChannel)
+	var rigName string
+	if channelevents.RigScoped(awaitEventChannel) {
+		rigName = resolveEventRig(townRoot, awaitEventRig)
+	}
+	eventDir, err := channelevents.Dir(townRoot, awaitEventChannel, rigName)
+	if err != nil {
+		return fmt.Errorf("%w (pass --rig)", err)
+	}
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		return fmt.Errorf("creating event directory: %w", err)
 	}
@@ -323,6 +337,23 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// resolveEventRig picks the rig for a per-rig event channel: the explicit
+// value, else GT_RIG, else the rig containing the current directory. It returns
+// "" when none applies.
+func resolveEventRig(townRoot, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if env := os.Getenv("GT_RIG"); env != "" {
+		return env
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return detectRigFromPath(townRoot, cwd)
 }
 
 // calculateEventTimeout mirrors calculateEffectiveTimeout for await-event.
