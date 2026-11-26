@@ -11,11 +11,6 @@ import (
 // covering the Skipped / Stale / Fresh branches added for GH#4034.
 // It asserts on the unstyled literal substrings (style.Render only wraps
 // the leading glyph, not the message text) so it is colour-agnostic.
-//
-// Note: outputStaleText is a plain function; this test never executes the
-// cobra command tree, so the macOS unsigned-binary guard in
-// persistentPreRun is not tripped. Run targeted (`-run TestOutputStaleText`)
-// to avoid sibling tests that do execute commands.
 func TestOutputStaleText(t *testing.T) {
 	tests := []struct {
 		name    string
