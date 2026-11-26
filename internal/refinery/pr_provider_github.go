@@ -29,6 +29,16 @@ func (p *githubPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, erro
 	return p.git.GhPrApprovedBy(prNumber, user)
 }
 
+// PRAuthor implements HeadApprovalChecker.
+func (p *githubPRProvider) PRAuthor(prNumber int) (string, error) {
+	return p.git.GhPrAuthor(prNumber)
+}
+
+// IsPRApprovedAtSHA implements HeadApprovalChecker.
+func (p *githubPRProvider) IsPRApprovedAtSHA(prNumber int, user, sha string) (bool, error) {
+	return p.git.GhPrApprovedAtSHA(prNumber, user, sha)
+}
+
 func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {
 	return p.git.GhPrMerge(prNumber, method)
 }
