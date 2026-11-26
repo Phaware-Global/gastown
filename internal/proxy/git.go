@@ -52,6 +52,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -173,6 +174,13 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request, repoPath, se
 		return
 	}
 
+	// git gzips a larger request body (a fetch naming many refs), so decode it
+	// before anything reads pkt-lines from it.
+	if err := decodeGzipBody(r); err != nil {
+		http.Error(w, "malformed gzip request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	identity := cnToIdentity(clientCN)
 
 	// For receive-pack: enforce CN-scoped branch authorization.
@@ -221,6 +229,25 @@ func (s *Server) handlePack(w http.ResponseWriter, r *http.Request, repoPath, se
 	} else {
 		s.log.Info("git fetch", "identity", identity, "rig", rig)
 	}
+}
+
+// decodeGzipBody replaces r.Body with its decoded stream when the request
+// declares Content-Encoding: gzip (or x-gzip), which git's HTTP client uses for
+// request bodies over 1 KiB. Every later reader, including the receive-pack
+// ref check and its size limit, then sees plain pkt-lines. A body that does
+// not start with a gzip header is an error.
+func decodeGzipBody(r *http.Request) error {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
+	case "gzip", "x-gzip":
+	default:
+		return nil
+	}
+	zr, err := gzip.NewReader(r.Body)
+	if err != nil {
+		return err
+	}
+	r.Body = zr
+	return nil
 }
 
 // authorizeReceivePack checks that the push only touches refs/heads/polecat/<cn-name>-* or
