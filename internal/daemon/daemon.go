@@ -1149,12 +1149,8 @@ func (d *Daemon) heartbeat(state *State) {
 	// 10. Check for GUPP violations (agents with work-on-hook not progressing)
 	d.checkGUPPViolations()
 
-	// 11. Check for orphaned work (assigned to dead agents)
-	d.checkOrphanedWork()
-
-	// 12. Check polecat session health (proactive crash detection)
-	// This validates tmux sessions are still alive for polecats with work-on-hook
-	d.checkPolecatSessionHealth()
+	// 11. Check for work stranded on dead agents (crashed polecats, orphaned work)
+	d.checkStrandedWork()
 
 	// 12b. Reap idle polecat sessions to prevent API slot burn.
 	// Polecats transition to IDLE after gt done but sessions stay alive.
@@ -3102,6 +3098,12 @@ func KillOrphanedDaemons(townRoot string) (int, error) {
 	}
 
 	return killed, nil
+}
+
+// checkStrandedWork reports hooked work whose agent cannot finish it.
+func (d *Daemon) checkStrandedWork() {
+	d.checkOrphanedWork()
+	d.checkPolecatSessionHealth()
 }
 
 // checkPolecatSessionHealth proactively validates polecat tmux sessions.
