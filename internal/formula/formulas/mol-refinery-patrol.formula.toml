@@ -1835,9 +1835,9 @@ End of patrol cycle decision. Use the signals from context-check to decide.
 
 Resolve your agent bead ID for this patrol cycle. You MUST replace `<YOUR_RIG>` below with your actual rig name (e.g., `beads`, `town`) before running:
 ```bash
-bd list --label=gt:agent --include-infra --desc-contains="role_type: refinery" --json | jq -r '.[] | select(.status != "closed") | select(.description | test("(?m)^\\\\s*rig: <YOUR_RIG>\\\\s*$")) | .id'
+bd list --label=gt:agent --include-infra --limit=0 --json | jq -r --arg rig "<YOUR_RIG>" 'def says($l): (.description // "") | split("\\n") | any(gsub("^\\\\s+|\\\\s+$"; "") == $l); [.[] | select(.status != "closed") | ((.metadata | objects) // {}) as $m | select(($m.role_type == "refinery" and $m.rig == $rig) or (says("role_type: refinery") and says("rig: " + $rig))) | .id] | if length == 1 then .[0] else error("expected 1 refinery agent bead for rig \\($rig), found \\(length): \\(join(", "))") end'
 ```
-This must return exactly one bead ID. If it returns zero results, STOP and report an error — verify you substituted `<YOUR_RIG>` correctly. If it returns multiple results, STOP and report an error — manual disambiguation is required. Use the single resolved bead ID as YOUR_AGENT_BEAD in the commands below.
+The lookup matches the role in bead metadata or in the structured description. It must print exactly one bead ID. Otherwise it fails with an error giving the count and the matching IDs: STOP, and escalate with that error. Do not pick one of the IDs yourself. If it reports 0 beads, first verify you substituted `<YOUR_RIG>` correctly. Use the single resolved bead ID as YOUR_AGENT_BEAD in the commands below.
 
 Then use await-event to subscribe to the refinery event channel with exponential backoff:
 
