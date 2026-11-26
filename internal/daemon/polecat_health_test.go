@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -232,6 +233,46 @@ func TestCheckRigPolecatHealth_RetriesFailedMailWithoutRecordingAnotherDeath(t *
 	}
 	if got := len(f.d.recentDeaths); got != 1 {
 		t.Errorf("expected 1 recorded death, got %d", got)
+	}
+}
+
+// useStrandedWorkCheck prepares the fixture for the whole heartbeat step, which
+// finds its rigs in mayor/rigs.json.
+func (f *stuckWorkFixture) useStrandedWorkCheck(t *testing.T) {
+	t.Helper()
+	mayorDir := filepath.Join(f.d.config.TownRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatalf("creating mayor dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{"myr":{}}}`), 0644); err != nil {
+		t.Fatalf("writing rigs.json: %v", err)
+	}
+	f.d.ctx = context.Background()
+	f.d.rigPool = newRigWorkerPool(1, time.Minute, f.d.logger)
+}
+
+func TestCheckStrandedWork_OneMailForADeadPolecat(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	two := append(workBead("hooked", "myr/polecats/mycat", time.Hour), map[string]string{
+		"id": "gt-work2", "status": "in_progress", "assignee": "myr/polecats/mycat", "updated_at": ago(2 * time.Hour),
+	})
+	for name, list := range map[string][]map[string]string{"one bead": bead, "two beads": two} {
+		t.Run(name, func(t *testing.T) {
+			f := newCrashFixture(t, false, list, bead)
+			f.useStrandedWorkCheck(t)
+
+			f.d.checkStrandedWork()
+
+			if got := f.mail(t); strings.Count(got, "mail send") != 1 {
+				t.Fatalf("expected 1 mail in one heartbeat, got %q (log: %s)", got, f.logs)
+			}
+
+			f.d.checkStrandedWork()
+
+			if got := f.mail(t); strings.Count(got, "mail send") != 1 {
+				t.Errorf("expected no further mail on the next heartbeat, got %q", got)
+			}
+		})
 	}
 }
 
