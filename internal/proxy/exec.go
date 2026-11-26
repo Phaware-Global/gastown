@@ -111,8 +111,9 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// root, where gt reads the wrong branch and bd the wrong database.
 	workDir, err := s.polecatWorkDir(identity)
 	if err != nil {
+		// The host path stays in the log; the client only learns the reason.
 		s.log.Warn("exec refused: no polecat worktree", "identity", identity, "err", err)
-		http.Error(w, err.Error(), http.StatusConflict)
+		http.Error(w, fmt.Sprintf("no polecat worktree for %q on the host", identity), http.StatusConflict)
 		return
 	}
 
