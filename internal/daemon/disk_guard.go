@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -47,6 +48,10 @@ const (
 	// diskGuardEscalateTimeout bounds the gt escalate subprocess; it runs inline
 	// on the heartbeat path.
 	diskGuardEscalateTimeout = 20 * time.Second
+
+	// diskGuardCreatedMarker is the text gt escalate prints, followed by the
+	// bead ID, after it has written the escalation and tried its mail.
+	diskGuardCreatedMarker = "Escalation created: "
 )
 
 type diskLevel int
@@ -72,9 +77,12 @@ const (
 //     starts or continues after that still alerts.
 //  3. Delivery. Bounded duplicates are acceptable; a lost alert is not. There
 //     is no duplicate-suppression key and no "suppressed" exit path. An alert
-//     counts as sent only after gt escalate exits 0. Any failure (non-zero
-//     exit or timeout) is retried on the next heartbeat, at most 3 attempts
-//     per alert; after that the guard logs an error naming the path and
+//     counts as sent when gt escalate exits 0, or when it exits non-zero
+//     within the deadline after reporting the escalation as created: gt prints
+//     that once the bead is written and mail has been tried, then fails if a
+//     notification was skipped, so a retry would only file it again. Any other
+//     failure (a timeout, or a non-zero exit without that report) is retried
+//     on the next heartbeat, at most 3 attempts per alert; after that the guard logs an error naming the path and
 //     severity and stays quiet until the next scheduled CRITICAL repeat or the
 //     next episode.
 //  4. No orphans. gt runs in its own session and a timeout signals every
@@ -277,8 +285,9 @@ func diskGuardBdTimeoutSec(timeout time.Duration) int {
 	return 1
 }
 
-// runDiskGuardEscalation runs gt with args in dir, bounded by timeout. Any
-// non-zero exit or deadline is an error.
+// runDiskGuardEscalation runs gt with args in dir, bounded by timeout. A
+// deadline is an error, as is a non-zero exit unless gt reported the escalation
+// as created; that case is logged and counts as delivered.
 func runDiskGuardEscalation(gt, dir string, args []string, timeout time.Duration, logf func(string, ...interface{})) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -296,15 +305,27 @@ func runDiskGuardEscalationCtx(ctx context.Context, gt, dir string, args []strin
 		"GT_BD_TIMEOUT_SEC="+strconv.Itoa(diskGuardBdTimeoutSec(timeout)))
 	// gt starts each bd in its own process group, so a group kill of gt alone
 	// would orphan a hung bd: run gt in its own session and signal all of it.
-	setEscalationSession(cmd, diskGuardEscalateGrace)
+	recordStart := setEscalationSession(cmd, diskGuardEscalateGrace, logf)
 	// WaitDelay is the backstop that closes the output pipes if a descendant
 	// outlives the signal.
 	cmd.WaitDelay = 5 * time.Second
-	if output, err := cmd.CombinedOutput(); err != nil {
-		logf("disk_guard: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
-		return err
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	err := cmd.Start()
+	if err == nil {
+		recordStart() // before Wait, while gt's pid cannot be reused
+		err = cmd.Wait()
 	}
-	return nil
+	if err == nil {
+		return nil
+	}
+	out := strings.TrimSpace(output.String())
+	if ctx.Err() == nil && strings.Contains(out, diskGuardCreatedMarker) {
+		logf("disk_guard: warning: escalation filed, but gt reported a notification failure: %v (%s)", err, out)
+		return nil
+	}
+	logf("disk_guard: escalation failed: %v (%s)", err, out)
+	return err
 }
 
 // escalateDiskFree files an escalation via gt escalate at the given severity.
