@@ -1848,7 +1848,8 @@ gt mol step await-event --channel refinery --agent-bead YOUR_AGENT_BEAD \
 ```
 
 This command:
-1. Watches `~/gt/events/refinery/` for event files (polling-based)
+1. Watches `~/gt/events/refinery/<your rig>/` for event files (polling-based);
+   the rig comes from GT_RIG or your cwd, so other rigs' events are never seen
 2. Returns IMMEDIATELY when an event is emitted (MERGE_READY, PATROL_WAKE, MQ_SUBMIT)
 3. If no events, times out with exponential backoff:
    - First timeout: 30s

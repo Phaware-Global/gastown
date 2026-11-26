@@ -674,14 +674,14 @@ func TestIsRunningFromPID_LiveProcess(t *testing.T) {
 
 func TestHasPendingEvents_EmptyDir(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "refinery", "testrig")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("refinery", "testrig") {
 		t.Error("expected false for empty event directory")
 	}
 }
@@ -691,14 +691,14 @@ func TestHasPendingEvents_MissingDir(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("refinery", "testrig") {
 		t.Error("expected false when event directory doesn't exist")
 	}
 }
 
 func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "refinery", "testrig")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -711,14 +711,14 @@ func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents("refinery", "testrig") {
 		t.Error("expected true when .event files exist")
 	}
 }
 
 func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "refinery", "testrig")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +730,7 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("refinery", "testrig") {
 		t.Error("expected false when only non-.event files exist")
 	}
 }

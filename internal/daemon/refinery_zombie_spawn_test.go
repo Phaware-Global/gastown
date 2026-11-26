@@ -121,7 +121,7 @@ func setupRefineryZombieTest(t *testing.T) string {
 
 	// Create events dir with a pending event so hasPendingEvents returns true.
 	// Without this, ensureRefineryRunning skips spawn if no session is detected healthy.
-	eventsDir := filepath.Join(townRoot, "events", "refinery")
+	eventsDir := filepath.Join(townRoot, "events", "refinery", "testrig")
 	if err := os.MkdirAll(eventsDir, 0o755); err != nil {
 		t.Fatalf("create events dir: %v", err)
 	}
@@ -271,7 +271,7 @@ func runEnsureRefinerySilentTest(t *testing.T, silentFor time.Duration) (logOut,
 	t.Helper()
 	townRoot := setupRefineryZombieTest(t)
 	// No pending event: hasPendingEvents is false, so only the wedge backstop can reap.
-	if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
+	if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "testrig", "pending.event")); err != nil {
 		t.Fatalf("remove pending event: %v", err)
 	}
 
@@ -414,7 +414,7 @@ func TestRefineryHasWork(t *testing.T) {
 
 	t.Run("empty queue and no events is no work", func(t *testing.T) {
 		townRoot := setupRefineryZombieTest(t)
-		if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
+		if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "testrig", "pending.event")); err != nil {
 			t.Fatalf("remove pending event: %v", err)
 		}
 		fakeBinDir := t.TempDir()
@@ -427,7 +427,7 @@ func TestRefineryHasWork(t *testing.T) {
 
 	t.Run("queued MR counts as work without any event", func(t *testing.T) {
 		townRoot := setupRefineryZombieTest(t)
-		if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
+		if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "testrig", "pending.event")); err != nil {
 			t.Fatalf("remove pending event: %v", err)
 		}
 		fakeBinDir := t.TempDir()
