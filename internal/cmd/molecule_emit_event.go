@@ -4,15 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/channelevents"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
 	emitEventChannel string
 	emitEventType    string
 	emitEventPayload []string
+	emitEventRig     string
 )
 
 var moleculeEmitEventCmd = &cobra.Command{
@@ -27,13 +30,17 @@ EVENT FORMAT:
 Creates a JSON file at ~/gt/events/<channel>/<timestamp>.event:
   {"type": "...", "channel": "...", "timestamp": "...", "payload": {...}}
 
+The "refinery" channel is per-rig: the file goes to
+~/gt/events/refinery/<rig>/ and the payload carries rig=<rig>. The rig comes
+from --payload rig=, else --rig, else GT_RIG, else the current directory.
+
 EXAMPLES:
   # Emit a MERGE_READY event for the refinery
   gt mol step emit-event --channel refinery --type MERGE_READY \
     --payload polecat=nux --payload branch=polecat/nux/gt-iw7m
 
   # Emit a PATROL_WAKE event
-  gt mol step emit-event --channel refinery --type PATROL_WAKE \
+  gt mol step emit-event --channel refinery --rig myrig --type PATROL_WAKE \
     --payload source=witness --payload queue_depth=3
 
   # Emit an MQ_SUBMIT event
@@ -56,6 +63,8 @@ func init() {
 		"Event type (required, e.g., 'MERGE_READY')")
 	moleculeEmitEventCmd.Flags().StringArrayVar(&emitEventPayload, "payload", nil,
 		"Payload key=value pairs (repeatable)")
+	moleculeEmitEventCmd.Flags().StringVar(&emitEventRig, "rig", "",
+		"Target rig on a per-rig channel (default: GT_RIG or cwd)")
 	moleculeEmitEventCmd.Flags().BoolVar(&moleculeJSON, "json", false,
 		"Output as JSON")
 	_ = moleculeEmitEventCmd.MarkFlagRequired("channel")
@@ -65,7 +74,14 @@ func init() {
 }
 
 func runMoleculeEmitEvent(cmd *cobra.Command, args []string) error {
-	path, err := channelevents.Emit(emitEventChannel, emitEventType, emitEventPayload)
+	payload := emitEventPayload
+	if channelevents.RigScoped(emitEventChannel) {
+		var err error
+		if payload, err = rigEventPayload(payload, emitEventRig); err != nil {
+			return err
+		}
+	}
+	path, err := channelevents.Emit(emitEventChannel, emitEventType, payload)
 	if err != nil {
 		return err
 	}
@@ -82,4 +98,20 @@ func runMoleculeEmitEvent(cmd *cobra.Command, args []string) error {
 
 	fmt.Println(path)
 	return nil
+}
+
+// rigEventPayload makes sure a per-rig channel's payload names its target rig.
+func rigEventPayload(payload []string, rigFlag string) ([]string, error) {
+	if named := channelevents.Payload(payload)["rig"]; named != "" {
+		if rigFlag != "" && rigFlag != named {
+			return nil, fmt.Errorf("--rig %s conflicts with --payload rig=%s", rigFlag, named)
+		}
+		return payload, nil
+	}
+	townRoot, _ := workspace.FindFromCwd()
+	rigName := resolveEventRig(townRoot, rigFlag)
+	if rigName == "" {
+		return nil, fmt.Errorf("channel %q is per-rig: pass --rig", emitEventChannel)
+	}
+	return append(slices.Clone(payload), "rig="+rigName), nil
 }

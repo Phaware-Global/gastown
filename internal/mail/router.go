@@ -742,11 +742,8 @@ func (r *Router) resolveAgentsByRole(roleType, rig string) ([]string, error) {
 	var addresses []string
 	for _, agent := range agents {
 		// Filter by rig if specified
-		if rig != "" {
-			// Check if agent's description contains matching rig
-			if !strings.Contains(agent.Description, "rig: "+rig) {
-				continue
-			}
+		if rig != "" && beads.ParseAgentFields(agent.Description).Rig != rig {
+			continue
 		}
 		if addr := agentBeadToAddress(agent); addr != "" {
 			addresses = append(addresses, addr)
@@ -758,12 +755,15 @@ func (r *Router) resolveAgentsByRole(roleType, rig string) ([]string, error) {
 
 // resolveAgentsByRig resolves @rig/<rigname> to all agents in that rig.
 func (r *Router) resolveAgentsByRig(rig string) ([]string, error) {
-	// Query for agents with matching rig in description
+	// The query matches substrings, so "rig: demo" also returns demo_ios agents.
 	query := "rig: " + rig
 	agents := r.queryAgents(query)
 
 	var addresses []string
 	for _, agent := range agents {
+		if beads.ParseAgentFields(agent.Description).Rig != rig {
+			continue
+		}
 		if addr := agentBeadToAddress(agent); addr != "" {
 			addresses = append(addresses, addr)
 		}
@@ -824,6 +824,13 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 // takes no description filter.
 func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, error) {
 	args := []string{"list", "--label=gt:agent", "--json", "--flat", "--limit=0"}
+
+	// --include-infra surfaces type=agent records. On the town database it makes
+	// this query several times slower, and every crew or polecat send runs it,
+	// so only rig queries pass it.
+	if filepath.Clean(beadsDir) != filepath.Clean(r.resolveBeadsDir()) {
+		args = append(args, "--include-infra")
+	}
 
 	if descContains != "" {
 		args = append(args, "--desc-contains="+descContains)

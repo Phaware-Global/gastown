@@ -424,3 +424,60 @@ func TestMRFilteringByLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestParseBranchNameWorker(t *testing.T) {
+	tests := []struct {
+		branch     string
+		wantWorker string
+	}{
+		// polecat/<worker>/<issue>[@<timestamp>]
+		{"polecat/keeper/gt-abc@mk123456", "keeper"},
+		{"polecat/bullet-farmer/gt-abc", "bullet-farmer"},
+		// polecat/<worker>-<timestamp>
+		{"polecat/keeper-mk0vro62", "keeper"},
+		{"polecat/bullet-farmer-mk0vro62", "bullet-farmer"},
+		// polecat/<worker>-<bead-id>, from gt polecat checkout-branch
+		{"polecat/keeper-gt-abc12", "keeper"},
+		{"polecat/keeper-gt-abc.1", "keeper"},
+		{"polecat/keeper-gt-wfs-abc12", ""},
+		{"polecat/keeper-hq-wisp-ku6", ""},
+		// More than one name/bead-id split: no guess.
+		{"polecat/bullet-farmer-gt-abc12", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.branch, func(t *testing.T) {
+			if got := parseBranchName(tt.branch).Worker; got != tt.wantWorker {
+				t.Errorf("parseBranchName(%q).Worker = %q, want %q", tt.branch, got, tt.wantWorker)
+			}
+		})
+	}
+}
+
+func TestPreferKnownWorker(t *testing.T) {
+	tests := []struct {
+		branch string
+		caller string
+		issue  string
+		want   string
+	}{
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "gt-abc12", "bullet-farmer"},
+		{"polecat/keeper-gt-wfs-abc12", "keeper", "gt-wfs-abc12", "keeper"},
+		// A shorter prefix of the owner's name never matches.
+		{"polecat/bullet-farmer-gt-abc12", "bullet", "gt-abc12", ""},
+		{"polecat/bullet-farmer-mk0vro62", "bullet", "gt-abc12", "bullet-farmer"},
+		// No known caller or issue, or another issue's branch: keep the parse.
+		{"polecat/keeper-gt-abc12", "", "gt-abc12", "keeper"},
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "", ""},
+		{"polecat/bullet-farmer-gt-abc12", "bullet-farmer", "gt-zzz99", ""},
+		// The slash form names the worker unambiguously.
+		{"polecat/dog-alpha/gt-abc12", "dog", "gt-abc12", "dog-alpha"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.branch+" as "+tt.caller+" on "+tt.issue, func(t *testing.T) {
+			got := preferKnownWorker(tt.branch, parseBranchName(tt.branch).Worker, tt.caller, tt.issue)
+			if got != tt.want {
+				t.Errorf("worker = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

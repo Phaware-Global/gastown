@@ -8,6 +8,13 @@ import (
 	"testing"
 )
 
+// A go test binary looks like an unsigned dev build, so on macOS
+// persistentPreRun would os.Exit the whole test process, silently skipping every
+// later test. Mark it as properly built for any test that runs a command.
+func init() {
+	BuiltProperly = "1"
+}
+
 // buildGT builds the gt binary and returns its path.
 // It caches the build across tests in the same run.
 var cachedGTBinary string
