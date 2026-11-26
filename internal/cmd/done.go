@@ -737,6 +737,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
+	worker = preferKnownWorker(branch, worker, polecatName, issueID)
+
 	// Write done-intent label EARLY, before push/MR operations.
 	// If gt done crashes after this point, the Witness can detect the intent
 	// and auto-nuke the zombie polecat.
@@ -1418,7 +1420,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					prBodyBuilder.WriteString("```\n\n")
 				}
 				prBodyBuilder.WriteString("---\n")
-				prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
+				footer := "Issue: " + issueID
+				if worker != "" {
+					footer = "Polecat: " + worker + " | " + footer
+				}
+				prBodyBuilder.WriteString("*" + footer + "*\n")
 				prBody := prBodyBuilder.String()
 
 				ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",
