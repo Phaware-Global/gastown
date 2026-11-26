@@ -210,15 +210,14 @@ func gitReviewThreadsToProvider(in []git.GhReviewThread) []ReviewThread {
 	out := make([]ReviewThread, 0, len(in))
 	for _, t := range in {
 		out = append(out, ReviewThread{
-			ID:         t.ID,
-			IsResolved: t.IsResolved,
-			IsOutdated: t.IsOutdated,
-			Path:       t.Path,
-			Line:       t.Line,
-			Author:     t.Author,
-			Body:       t.Body,
-			URL:        t.URL,
-
+			ID:              t.ID,
+			IsResolved:      t.IsResolved,
+			IsOutdated:      t.IsOutdated,
+			Path:            t.Path,
+			Line:            t.Line,
+			Author:          t.Author,
+			Body:            t.Body,
+			URL:             t.URL,
 			LastReplyAuthor: t.LastReplyAuthor,
 		})
 	}
