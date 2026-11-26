@@ -108,6 +108,11 @@ orchestrator cannot send them, and it cannot send an endpoint either — a wire
 `ANTHROPIC_BASE_URL` is refused, because it would redirect this key. If the
 agent needs a non-default endpoint, pin it here alongside the key.
 
+Apart from this file and the session variables the orchestrator sends, a native
+agent's environment holds only `HOME`, `PATH`, `LANG`, `TERM` and `TMPDIR` from
+the worker's own environment, and `USER` and `LOGNAME` for the account the
+worker runs as. A line in the file overrides any of them.
+
 ## 3. Install the service
 
 On the worker:
