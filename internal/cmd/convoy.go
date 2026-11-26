@@ -1505,6 +1505,10 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
 
+	// One read of the town's sling contexts serves every convoy in the scan;
+	// it is loaded on the first convoy that has tracked issues.
+	var scheduled *scheduledSnapshot
+
 	// Check each convoy for stranded state
 	for _, convoy := range convoys {
 		// Extract base_branch from convoy description fields
@@ -1513,7 +1517,9 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			baseBranch = cf.BaseBranch
 		}
 
-		tracked, err := getTrackedIssues(townBeads, convoy.ID)
+		// The scan reads status, blocked and assignee only, so it skips the
+		// worker lookup (a bd list of agent beads in every rig, per convoy).
+		tracked, err := trackedIssuesFor(townBeads, convoy.ID, false)
 		if err != nil {
 			// Write to stderr explicitly — stdout may be consumed as JSON
 			// by the daemon's JSON parser (fixes #2142).
@@ -1545,12 +1551,15 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
 		// Non-slingable types (epics, convoys, etc.) are also excluded.
 
-		// Batch-check scheduling status for all tracked issues (single DB query).
+		// Batch-check scheduling status for all tracked issues.
 		var trackedIDs []string
 		for _, t := range tracked {
 			trackedIDs = append(trackedIDs, t.ID)
 		}
-		scheduledSet := areScheduled(trackedIDs)
+		if scheduled == nil {
+			scheduled = loadScheduledSnapshot()
+		}
+		scheduledSet := scheduled.filter(trackedIDs)
 
 		var readyIssues []string
 		for _, t := range tracked {
@@ -2326,6 +2335,12 @@ func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 // for older bd versions that don't support bd sql.
 // Then fetches fresh issue details via bd show with prefix routing.
 func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
+	return trackedIssuesFor(townBeads, convoyID, true)
+}
+
+// trackedIssuesFor is getTrackedIssues with the worker lookup optional. With
+// withWorkers false, Worker and WorkerAge are left empty.
+func trackedIssuesFor(townBeads, convoyID string, withWorkers bool) ([]trackedIssueInfo, error) {
 	// Prefer raw SQL — works for cross-database deps where tracked beads
 	// live in different Dolt databases. Falls back to bd dep list if bd sql
 	// is not available (older bd versions).
@@ -2379,7 +2394,10 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 			openIssueIDs = append(openIssueIDs, dep.ID)
 		}
 	}
-	workersMap := getWorkersForIssues(openIssueIDs)
+	var workersMap map[string]*workerInfo
+	if withWorkers {
+		workersMap = getWorkersForIssues(openIssueIDs)
+	}
 
 	// Build result
 	var tracked []trackedIssueInfo
