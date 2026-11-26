@@ -356,6 +356,7 @@ func TestStartIntegration(t *testing.T) {
 
 	clientCertPEM, clientKeyPEM, err := ca.IssuePolecat("gt-gastown-testclient", time.Hour)
 	require.NoError(t, err)
+	addPolecatWorktree(t, srv, "gt-gastown-testclient")
 	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
 	require.NoError(t, err)
 
@@ -819,6 +820,7 @@ func TestAdminIssueCertEndpoint(t *testing.T) {
 		var result issueCertResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 		assert.Equal(t, "gt-MyRig-rust", result.CN)
+		addPolecatWorktree(t, srv, result.CN)
 		assert.NotEmpty(t, result.Cert)
 		assert.NotEmpty(t, result.Key)
 		assert.NotEmpty(t, result.CA)
@@ -1061,6 +1063,7 @@ func TestAdminSignCSREndpoint(t *testing.T) {
 		var result signCSRResponse
 		require.NoError(t, json.Unmarshal(raw, &result))
 		assert.Equal(t, "gt-MyRig-rust", result.CN)
+		addPolecatWorktree(t, srv, result.CN)
 		assert.NotEmpty(t, result.Cert)
 		assert.NotEmpty(t, result.CA)
 		assert.NotEmpty(t, result.Serial)

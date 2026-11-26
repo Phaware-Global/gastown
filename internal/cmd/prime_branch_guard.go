@@ -66,6 +66,20 @@ func ensurePolecatOffMain(ctx RoleContext, hookedBead *beads.Issue) error {
 		return nil
 	}
 
+	// A relayed gt prime (GT_PROXY_IDENTITY, which only the proxy sets) is a
+	// remote polecat's, running in its worktree on this host. It must not move
+	// that worktree: the branch it would check out can be one the worker
+	// pushed, and a checkout would put the worker's tree, hooks included, on
+	// the host. Refuse and leave the restore to the host.
+	if os.Getenv("GT_PROXY_IDENTITY") != "" {
+		fmt.Fprintf(os.Stderr, "\n%s\n", style.Bold.Render("## 🚫 ON MAIN — DO NOT WORK OR RUN gt done 🚫"))
+		fmt.Fprintf(os.Stderr, "This polecat's worktree on the host is on %q, and a remote session cannot\n", branch)
+		fmt.Fprintf(os.Stderr, "restore it. Escalate; the work branch has to be restored on the host:\n")
+		fmt.Fprintf(os.Stderr, "  gt escalate -s HIGH \"polecat host worktree stuck on %s\"\n\n", branch)
+		return fmt.Errorf("polecat host worktree is on %q and a relayed gt prime does not restore it "+
+			"(polecat=%q bead=%q) — restore the work branch on the host", branch, polecatName, beadID)
+	}
+
 	// Without both halves we can't name the work branch → genuinely stuck.
 	// Refuse loudly and direct the operator at the recovery affordance.
 	if polecatName == "" || beadID == "" {

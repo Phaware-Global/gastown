@@ -30,11 +30,16 @@ func startProxy(t *testing.T) (mainAddr, adminAddr string) {
 	ca, err := proxy.GenerateCA(t.TempDir())
 	require.NoError(t, err)
 
+	// The proxy runs a polecat's commands in its host worktree and refuses a
+	// polecat that has none, so the identity these tests exec as gets one.
+	townRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(townRoot, "MyRig", "polecats", "furiosa", "MyRig"), 0755))
+
 	srv, err := proxy.New(proxy.Config{
 		ListenAddr:      "127.0.0.1:0",
 		AdminListenAddr: "127.0.0.1:0",
 		AllowedCommands: []string{"echo"},
-		TownRoot:        t.TempDir(),
+		TownRoot:        townRoot,
 	}, ca)
 	require.NoError(t, err)
 

@@ -90,6 +90,18 @@ func newExecTestServer(t *testing.T, cfg Config) *Server {
 	return srv
 }
 
+// addPolecatWorktree creates the host worktree directory of the polecat that
+// cn names and returns it. handleExec runs an identified polecat's commands
+// there and refuses one that has none.
+func addPolecatWorktree(t *testing.T, srv *Server, cn string) string {
+	t.Helper()
+	rig, name, ok := strings.Cut(cnToIdentity(cn), "/")
+	require.True(t, ok, "cn %q is not a polecat identity", cn)
+	dir := filepath.Join(srv.cfg.TownRoot, rig, "polecats", name, rig)
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	return dir
+}
+
 // makeFakeRequest builds an httptest.Request with a fake TLS peer certificate CN.
 func makeFakeRequest(method, path, body, cn string) *http.Request {
 	var bodyReader *strings.Reader
@@ -242,6 +254,7 @@ func TestHandleExec(t *testing.T) {
 		t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 		srv2 := newExecTestServer(t, Config{AllowedCommands: []string{commandName}})
+		addPolecatWorktree(t, srv2, "gt-gastown-rust")
 		body := `{"argv":["` + commandName + `"]}`
 		req := makeFakeRequest("POST", "/v1/exec", body, "gt-gastown-rust")
 		rec := httptest.NewRecorder()
@@ -590,6 +603,7 @@ func TestHandleExecAuditLog(t *testing.T) {
 		lc := &logCapture{}
 		logger := slog.New(lc)
 		srv := newExecTestServer(t, Config{AllowedCommands: []string{"echo"}, Logger: logger})
+		addPolecatWorktree(t, srv, "gt-gastown-shiny")
 
 		req := makeFakeRequest("POST", "/v1/exec", `{"argv":["echo","hi"]}`, "gt-gastown-shiny")
 		rec := httptest.NewRecorder()
@@ -627,6 +641,8 @@ func TestExecRateLimit(t *testing.T) {
 		ExecRateLimit:   0.001, // near-zero refill; burst covers the first request
 		ExecRateBurst:   1,
 	})
+	addPolecatWorktree(t, srv, "gt-gastown-ratelimitclient")
+	addPolecatWorktree(t, srv, "gt-gastown-otherclient")
 
 	body := `{"argv":["echo","hi"]}`
 
@@ -788,6 +804,7 @@ func TestBinaryResolution(t *testing.T) {
 // proxied call must be able to carry it.
 func TestHandleExec_ForwardsStdin(t *testing.T) {
 	srv := newExecTestServer(t, Config{AllowedCommands: []string{"cat"}})
+	addPolecatWorktree(t, srv, "gt-demo-furiosa")
 
 	req := makeFakeRequest("POST", "/v1/exec", `{"argv":["cat"],"stdin":"{\"tool_input\":{\"command\":\"ls\"}}"}`, "gt-demo-furiosa")
 	rec := httptest.NewRecorder()
@@ -804,6 +821,7 @@ func TestHandleExec_ForwardsStdin(t *testing.T) {
 // server's own.
 func TestHandleExec_NoStdinIsEmpty(t *testing.T) {
 	srv := newExecTestServer(t, Config{AllowedCommands: []string{"cat"}})
+	addPolecatWorktree(t, srv, "gt-demo-furiosa")
 
 	req := makeFakeRequest("POST", "/v1/exec", `{"argv":["cat"]}`, "gt-demo-furiosa")
 	rec := httptest.NewRecorder()
@@ -814,4 +832,123 @@ func TestHandleExec_NoStdinIsEmpty(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	assert.Equal(t, 0, resp.ExitCode)
 	assert.Empty(t, resp.Stdout)
+}
+
+// execPwd runs pwd through handleExec as cn and returns the HTTP status and,
+// when the command ran, the directory it ran in with symlinks resolved.
+func execPwd(t *testing.T, srv *Server, cn, body string) (int, string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	srv.handleExec(rec, makeFakeRequest("POST", "/v1/exec", body, cn))
+	if rec.Code != http.StatusOK {
+		return rec.Code, ""
+	}
+	var resp execResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Equal(t, 0, resp.ExitCode, resp.Stderr)
+	return rec.Code, strings.TrimSpace(resp.Stdout)
+}
+
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	out, err := filepath.EvalSymlinks(path)
+	require.NoError(t, err)
+	return out
+}
+
+// A relayed command runs in the calling polecat's own worktree on the host,
+// not in the server's directory (the town root, where gt would read the town
+// repo's branch and bd the town's beads).
+func TestHandleExec_RunsInPolecatWorktree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses pwd")
+	}
+	const pwd = `{"argv":["pwd","-P"]}`
+
+	t.Run("current layout polecats/<name>/<rig>", func(t *testing.T) {
+		srv := newExecTestServer(t, Config{AllowedCommands: []string{"pwd"}})
+		want := addPolecatWorktree(t, srv, "gt-myrig-rust")
+		code, got := execPwd(t, srv, "gt-myrig-rust", pwd)
+		require.Equal(t, http.StatusOK, code)
+		assert.Equal(t, resolved(t, want), got)
+	})
+
+	t.Run("legacy layout polecats/<name> holding .git", func(t *testing.T) {
+		srv := newExecTestServer(t, Config{AllowedCommands: []string{"pwd"}})
+		want := filepath.Join(srv.cfg.TownRoot, "myrig", "polecats", "rust")
+		require.NoError(t, os.MkdirAll(want, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(want, ".git"), []byte("gitdir: elsewhere\n"), 0644))
+		code, got := execPwd(t, srv, "gt-myrig-rust", pwd)
+		require.Equal(t, http.StatusOK, code)
+		assert.Equal(t, resolved(t, want), got)
+	})
+
+	t.Run("each polecat gets its own", func(t *testing.T) {
+		srv := newExecTestServer(t, Config{AllowedCommands: []string{"pwd"}})
+		rust := addPolecatWorktree(t, srv, "gt-myrig-rust")
+		nux := addPolecatWorktree(t, srv, "gt-myrig-nux")
+		_, gotRust := execPwd(t, srv, "gt-myrig-rust", pwd)
+		_, gotNux := execPwd(t, srv, "gt-myrig-nux", pwd)
+		assert.Equal(t, resolved(t, rust), gotRust)
+		assert.Equal(t, resolved(t, nux), gotNux)
+	})
+
+	t.Run("the request cannot choose the directory", func(t *testing.T) {
+		srv := newExecTestServer(t, Config{AllowedCommands: []string{"pwd"}})
+		want := addPolecatWorktree(t, srv, "gt-myrig-rust")
+		other := addPolecatWorktree(t, srv, "gt-myrig-nux")
+		body := `{"argv":["pwd","-P"],"dir":"` + other + `","cwd":"` + other + `","workDir":"` + other + `"}`
+		code, got := execPwd(t, srv, "gt-myrig-rust", body)
+		require.Equal(t, http.StatusOK, code)
+		assert.Equal(t, resolved(t, want), got)
+	})
+}
+
+// A polecat with no worktree on the host is refused before its command runs:
+// there is no directory to run it in that would not misdirect it.
+func TestHandleExec_RefusesPolecatWithoutWorktree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script")
+	}
+	marker := filepath.Join(t.TempDir(), "ran")
+	scriptDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(scriptDir, "leavemark"),
+		[]byte("#!/bin/sh\n: > '"+marker+"'\n"), 0755))
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for name, tc := range map[string]struct {
+		cn    string
+		setup func(t *testing.T, srv *Server)
+	}{
+		"no polecat directory": {cn: "gt-myrig-rust"},
+		"polecat directory without a worktree": {cn: "gt-myrig-rust", setup: func(t *testing.T, srv *Server) {
+			require.NoError(t, os.MkdirAll(filepath.Join(srv.cfg.TownRoot, "myrig", "polecats", "rust"), 0755))
+		}},
+		// gt-..-rust would resolve to <town>/../polecats/rust/.., outside the town.
+		"rig that climbs out of the town": {cn: "gt-..-rust", setup: func(t *testing.T, srv *Server) {
+			require.NoError(t, os.MkdirAll(filepath.Join(filepath.Dir(srv.cfg.TownRoot), "polecats", "rust"), 0755))
+		}},
+		"polecat name that climbs out of its rig": {cn: "gt-myrig-..", setup: func(t *testing.T, srv *Server) {
+			require.NoError(t, os.MkdirAll(filepath.Join(srv.cfg.TownRoot, "myrig", "myrig"), 0755))
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lc := &logCapture{}
+			srv := newExecTestServer(t, Config{AllowedCommands: []string{"leavemark"}, Logger: slog.New(lc)})
+			if tc.setup != nil {
+				tc.setup(t, srv)
+			}
+			rec := httptest.NewRecorder()
+			srv.handleExec(rec, makeFakeRequest("POST", "/v1/exec", `{"argv":["leavemark"]}`, tc.cn))
+
+			assert.Equal(t, http.StatusConflict, rec.Code)
+			assert.Contains(t, rec.Body.String(), "no polecat worktree")
+			// The host's layout stays in the server log.
+			assert.NotContains(t, rec.Body.String(), filepath.Dir(srv.cfg.TownRoot))
+			assert.NoFileExists(t, marker, "the command must not run")
+			entry, logged := lc.findEntry(slog.LevelWarn, "exec refused: no polecat worktree")
+			assert.True(t, logged)
+			assert.NotEmpty(t, entry.attrs["err"])
+		})
+	}
 }
