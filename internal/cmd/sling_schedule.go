@@ -331,18 +331,25 @@ const slingContextTTL = 30 * time.Minute
 // Sling contexts older than slingContextTTL are ignored — they are likely
 // orphans from failed spawn attempts (GH#2279).
 func areScheduled(beadIDs []string) map[string]bool {
-	result := make(map[string]bool)
 	if len(beadIDs) == 0 {
-		return result
+		return make(map[string]bool)
 	}
+	return loadScheduledSnapshot().filter(beadIDs)
+}
 
+// scheduledSnapshot is one read of the town's open sling contexts. Loading it
+// costs a bd list and a bd sql per beads dir, so a caller that checks several
+// groups of beads in one pass loads it once and filters it per group.
+type scheduledSnapshot struct {
+	failClosed bool            // town root unknown: every bead counts as scheduled
+	workBeads  map[string]bool // work bead IDs that have a live sling context
+}
+
+func loadScheduledSnapshot() *scheduledSnapshot {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
 		// Can't determine town root — fail closed (treat all as scheduled)
-		for _, id := range beadIDs {
-			result[id] = true
-		}
-		return result
+		return &scheduledSnapshot{failClosed: true}
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
@@ -367,10 +374,14 @@ func areScheduled(beadIDs []string) map[string]bool {
 			scheduledWorkBeads[fields.WorkBeadID] = true
 		}
 	}
+	return &scheduledSnapshot{workBeads: scheduledWorkBeads}
+}
 
-	// Filter to just the requested IDs
+// filter returns the subset of beadIDs that are scheduled in this snapshot.
+func (s *scheduledSnapshot) filter(beadIDs []string) map[string]bool {
+	result := make(map[string]bool)
 	for _, id := range beadIDs {
-		if scheduledWorkBeads[id] {
+		if s.failClosed || s.workBeads[id] {
 			result[id] = true
 		}
 	}
