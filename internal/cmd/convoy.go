@@ -2714,7 +2714,7 @@ func getWorkersForIssues(issueIDs []string) map[string]*workerInfo {
 		go func(workDir string) {
 			defer wg.Done()
 
-			out, err := BdCmd("list", "--label=gt:agent", "--status=open", "--json", "--limit=0", "--flat").
+			out, err := BdCmd("list", "--label=gt:agent", "--include-infra", "--status=open", "--json", "--limit=0", "--flat").
 				Dir(workDir).
 				StripBeadsDir().
 				Stderr(io.Discard).
