@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/templates"
 )
 
 // A failed probe means staleness is unknown. Treating it as "clean tree, no agent
@@ -106,6 +107,65 @@ func TestProbeUncommittedWork_RealRepo(t *testing.T) {
 	}
 	if has, probeErr := probeUncommittedWork(dir); !has || probeErr != "" {
 		t.Fatalf("dirty repo = (%v, %q), want (true, \"\")", has, probeErr)
+	}
+}
+
+// Gas Town writes these into every polecat worktree. In a repo that does not ignore
+// them they are untracked forever, so counting them as work made every polecat of the
+// rig unreclaimable and left the rig pinned at its directory cap.
+func TestProbeUncommittedWork_IgnoresProvisionedFilesOnly(t *testing.T) {
+	newRepo := func(t *testing.T) string {
+		dir := t.TempDir()
+		write := func(rel string) {
+			path := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("testdata/fixture.db")
+		for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "i"}} {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+		for _, f := range []string{".beads/x.jsonl", ".runtime/session_id", ".claude/commands/" + templates.CommandNames()[0] + ".md", "CLAUDE.local.md"} {
+			write(f)
+		}
+		return dir
+	}
+
+	if has, probeErr := probeUncommittedWork(newRepo(t)); has || probeErr != "" {
+		t.Fatalf("provisioned files only = (%v, %q), want (false, \"\")", has, probeErr)
+	}
+
+	// Real work must still protect the polecat, including under paths gt done's
+	// broader runtime-artifact list would skip.
+	for _, rel := range []string{
+		"notes.txt",
+		".claude/skills/new/SKILL.md",
+		".claude/commands/my-own-command.md",
+		"internal/coverage/report.go",
+		"docs/CLAUDE.local.md",
+		"testdata/fixture.db", // tracked file, modified
+	} {
+		t.Run(rel, func(t *testing.T) {
+			dir := newRepo(t)
+			path := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if has, probeErr := probeUncommittedWork(dir); !has || probeErr != "" {
+				t.Fatalf("with %s = (%v, %q), want (true, \"\")", rel, has, probeErr)
+			}
+		})
 	}
 }
 
