@@ -754,6 +754,9 @@ func TestSessionOpen_OriginTracksTheHostsUpstreamRefs(t *testing.T) {
 	}
 	check("after bring-up")
 	assert.Equal(t, work, git(t, worktree, "rev-parse", "HEAD"))
+	// The clone's local base branch must not stay on the stale head.
+	assert.Equal(t, fresh, git(t, worktree, "rev-parse", base))
+	assert.Equal(t, "origin/"+base, git(t, worktree, "rev-parse", "--abbrev-ref", base+"@{upstream}"))
 
 	// Upstream moves again and the host fetches it; a plain fetch on the
 	// worker must follow, not fall back to the host's local head.
@@ -764,6 +767,26 @@ func TestSessionOpen_OriginTracksTheHostsUpstreamRefs(t *testing.T) {
 	check("after a later fetch")
 	git(t, worktree, "pull", "--ff-only")
 	check("after a pull")
+	git(t, worktree, "checkout", base)
+	git(t, worktree, "pull", "--ff-only")
+	assert.Equal(t, fresh, git(t, worktree, "rev-parse", "HEAD"), "a pull on the base branch must follow origin/%s", base)
+}
+
+// Without a polecat branch the worktree stays on the default branch, which
+// must then be the host's origin/<default> too.
+func TestSessionOpen_DefaultBranchFollowsTheHostsUpstreamRef(t *testing.T) {
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	base := git(t, rigRepo, "symbolic-ref", "--short", "HEAD")
+	stale := git(t, rigRepo, "rev-parse", "refs/heads/"+base)
+	fresh := git(t, rigRepo, "commit-tree", "-m", "upstream moved on", "-p", stale, stale+"^{tree}")
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/"+base, fresh)
+
+	worktree := provisionOn(t, proxyURL, ca, "")
+	assert.Equal(t, base, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+	assert.Equal(t, fresh, git(t, worktree, "rev-parse", "HEAD"))
+	assert.Equal(t, "origin/"+base, git(t, worktree, "rev-parse", "--abbrev-ref", "@{upstream}"))
+	assert.Empty(t, git(t, worktree, "status", "--porcelain"))
 }
 
 func TestValidBranch(t *testing.T) {

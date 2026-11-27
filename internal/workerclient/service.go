@@ -1165,6 +1165,12 @@ func (s *Service) loadPersisted() {
 // origin/<branch>; a negative refspec keeps an upstream copy of the same name
 // from being fetched to the same ref, which git refuses. origin/HEAD is
 // left out too: the clone's is a symref, and a fetch would write through it.
+//
+// The clone also made a local default branch from the host's head, tracking
+// refs/heads/<default>, which no refspec maps any more. It is moved to
+// origin/<default> and set to track it, so `git rebase <default>` or a pull
+// on it uses the same commit as origin/<default>. When the polecat's branch
+// is the default branch it tracks the host's head and is left alone.
 func useUpstreamTrackingRefs(ctx context.Context, worktree, branch string) error {
 	steps := [][]string{
 		{"config", "remote.origin.fetch", "+refs/remotes/origin/*:refs/remotes/origin/*"},
@@ -1184,6 +1190,21 @@ func useUpstreamTrackingRefs(ctx context.Context, worktree, branch string) error
 		if out, err := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...).CombinedOutput(); err != nil {
 			return fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
 		}
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output()
+	def := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/")
+	if err != nil || def == branch {
+		return nil
+	}
+	if exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+def).Run() != nil {
+		return nil // the host has no upstream ref for it; keep the clone's
+	}
+	args := []string{"branch", "--quiet", "--force", "--track", def, "origin/" + def}
+	if branch == "" { // no polecat branch: the worktree is on the default branch
+		args = []string{"checkout", "--quiet", "-B", def, "--track", "origin/" + def}
+	}
+	if out, err := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...).CombinedOutput(); err != nil {
+		return fmt.Errorf("git %s %s: %v: %s", args[0], def, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
