@@ -1,8 +1,13 @@
 package rig
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -532,13 +537,13 @@ func TestGasTownLocalExcludePatterns_IncludesBeads(t *testing.T) {
 	localPatterns := gasTownLocalExcludePatterns()
 	found := false
 	for _, p := range localPatterns {
-		if p == ".beads/" {
+		if p == "/.beads/" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("gasTownLocalExcludePatterns() must include .beads/ (gas-7vg defense-in-depth)")
+		t.Error("gasTownLocalExcludePatterns() must include /.beads/ (gas-7vg defense-in-depth)")
 	}
 
 	// Regression guard: .gitignore patterns must NOT include .beads/
@@ -584,4 +589,301 @@ func splitLines(content string) []string {
 		lines = append(lines, content[start:])
 	}
 	return lines
+}
+
+// Polecat worktrees are linked worktrees of a shared bare repo. git reads
+// info/exclude only from the shared git dir, so the excludes must reach git through
+// a per-worktree core.excludesFile, and enabling per-worktree config must not break
+// the bare repo or the sibling worktrees that share it.
+func TestEnsureLocalExcludePatterns_LinkedWorktreeOfBareRepo(t *testing.T) {
+	isolateGitConfig(t, "")
+	root := t.TempDir()
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git -C %s %v: %v\n%s", dir, args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(src, "init", "-q")
+	git(src, "commit", "-q", "--allow-empty", "-m", "init")
+	bare := filepath.Join(root, "repo.git")
+	git(root, "clone", "-q", "--bare", src, bare)
+	polecat := filepath.Join(root, "polecat")
+	sibling := filepath.Join(root, "sibling")
+	git(bare, "worktree", "add", "-q", polecat, "-b", "p")
+	git(bare, "worktree", "add", "-q", sibling, "-b", "s")
+
+	provisioned := []string{".runtime/session_id", ".beads/x.jsonl", "CLAUDE.local.md", ".claude/commands/" + gasTownCommandName(t) + ".md"}
+	work := []string{"notes.txt", ".claude/skills/new/SKILL.md", "CLAUDE.md", "docs/CLAUDE.local.md"}
+	for _, wt := range []string{polecat, sibling} {
+		for _, rel := range append(append([]string{}, provisioned...), work...) {
+			path := filepath.Join(wt, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	for i := 0; i < 2; i++ { // second call must be a no-op
+		if err := EnsureLocalExcludePatterns(polecat); err != nil {
+			t.Fatalf("EnsureLocalExcludePatterns (call %d): %v", i+1, err)
+		}
+	}
+
+	untracked := func(wt string) string {
+		return strings.Join(strings.Fields(strings.ReplaceAll(git(wt, "status", "--porcelain", "-uall"), "?? ", "")), " ")
+	}
+	if got, want := untracked(polecat), ".claude/skills/new/SKILL.md CLAUDE.md docs/CLAUDE.local.md notes.txt"; got != want {
+		t.Errorf("polecat worktree untracked = %q, want only real work %q", got, want)
+	}
+	// The sibling shares the repo but was not set up: nothing may be hidden there.
+	for _, rel := range provisioned {
+		if !strings.Contains(untracked(sibling), rel) {
+			t.Errorf("sibling worktree lost %s from git status; excludes leaked across worktrees", rel)
+		}
+	}
+	// The shared bare repo must still be bare and usable.
+	if got := git(bare, "rev-parse", "--is-bare-repository"); got != "true" {
+		t.Errorf("bare repo is-bare = %q, want true", got)
+	}
+	git(bare, "worktree", "add", "-q", filepath.Join(root, "third"), "-b", "t")
+	git(sibling, "commit", "-q", "--allow-empty", "-m", "still works")
+}
+
+func gasTownCommandName(t *testing.T) string {
+	t.Helper()
+	for _, p := range gasTownLocalExcludePatterns() {
+		if name, ok := strings.CutPrefix(p, "/.claude/commands/"); ok {
+			return strings.TrimSuffix(name, ".md")
+		}
+	}
+	t.Fatal("no provisioned command pattern")
+	return ""
+}
+
+// isolateGitConfig hides the developer's global and system git config from the test
+// and installs globalIgnore (if any) as git's default global excludes file.
+func isolateGitConfig(t *testing.T, globalIgnore string) {
+	t.Helper()
+	xdg := t.TempDir()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if globalIgnore != "" {
+		if err := os.MkdirAll(filepath.Join(xdg, "git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(xdg, "git", "ignore"), []byte(globalIgnore), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// bareRepoWithWorktrees creates a bare repo under a temp dir with n linked worktrees.
+func bareRepoWithWorktrees(t *testing.T, n int) (bare string, worktrees []string) {
+	t.Helper()
+	root := t.TempDir()
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git -C %s %v: %v\n%s", dir, args, err, out)
+		}
+	}
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(src, "init", "-q")
+	run(src, "commit", "-q", "--allow-empty", "-m", "init")
+	bare = filepath.Join(root, "repo.git")
+	run(root, "clone", "-q", "--bare", src, bare)
+	for i := 0; i < n; i++ {
+		wt := filepath.Join(root, fmt.Sprintf("wt%d", i))
+		run(bare, "worktree", "add", "-q", wt, "-b", fmt.Sprintf("b%d", i))
+		worktrees = append(worktrees, wt)
+	}
+	return bare, worktrees
+}
+
+// git reads one excludes file, so the per-worktree file must carry along whatever
+// excludes file applied before. Otherwise a secret hidden only by the user's ignore
+// file becomes visible to `git add -A` in every polecat.
+func TestEnsureLocalExcludePatterns_KeepsInheritedIgnore(t *testing.T) {
+	ignoreFile := func(t *testing.T) string {
+		path := filepath.Join(t.TempDir(), "myignore")
+		if err := os.WriteFile(path, []byte(".env\n*.pem\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	writeConfig := func(t *testing.T, path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := map[string]func(t *testing.T, bare string){
+		"default XDG ignore file": func(t *testing.T, _ string) {
+			isolateGitConfig(t, ".env\n*.pem\n")
+		},
+		"core.excludesFile in global config": func(t *testing.T, _ string) {
+			isolateGitConfig(t, "")
+			global := filepath.Join(t.TempDir(), "gitconfig")
+			writeConfig(t, global, "[core]\n\texcludesFile = "+filepath.ToSlash(ignoreFile(t))+"\n")
+			t.Setenv("GIT_CONFIG_GLOBAL", global)
+		},
+		"core.excludesFile via include in global config": func(t *testing.T, _ string) {
+			isolateGitConfig(t, "")
+			dir := t.TempDir()
+			included := filepath.Join(dir, "gitconfig.local")
+			writeConfig(t, included, "[core]\n\texcludesFile = "+filepath.ToSlash(ignoreFile(t))+"\n")
+			global := filepath.Join(dir, "gitconfig")
+			writeConfig(t, global, "[include]\n\tpath = "+filepath.ToSlash(included)+"\n")
+			t.Setenv("GIT_CONFIG_GLOBAL", global)
+		},
+		"core.excludesFile in repository config": func(t *testing.T, bare string) {
+			isolateGitConfig(t, "")
+			if out, err := exec.Command("git", "--git-dir", bare, "config", "core.excludesFile", ignoreFile(t)).CombinedOutput(); err != nil {
+				t.Fatalf("git config: %v\n%s", err, out)
+			}
+		},
+	}
+	tests["relative core.excludesFile in repository config"] = func(t *testing.T, bare string) {
+		isolateGitConfig(t, "")
+		if out, err := exec.Command("git", "--git-dir", bare, "config", "core.excludesFile", ".git-local-ignore").CombinedOutput(); err != nil {
+			t.Fatalf("git config: %v\n%s", err, out)
+		}
+	}
+	for name, setup := range tests {
+		t.Run(name, func(t *testing.T) {
+			isolateGitConfig(t, "") // for the repo setup; the case re-isolates as it needs
+			bare, wts := bareRepoWithWorktrees(t, 1)
+			setup(t, bare)
+			for _, f := range []string{".env", "id.pem", "notes.txt"} {
+				if err := os.WriteFile(filepath.Join(wts[0], f), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Target of the relative case; it hides itself so every case sees the same status.
+			if err := os.WriteFile(filepath.Join(wts[0], ".git-local-ignore"), []byte(".env\n*.pem\n.git-local-ignore\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(name, "relative") {
+				if err := os.Remove(filepath.Join(wts[0], ".git-local-ignore")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			status := func() string {
+				out, err := exec.Command("git", "-C", wts[0], "status", "--porcelain", "-uall").CombinedOutput()
+				if err != nil {
+					t.Fatalf("git status: %v\n%s", err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			if got := status(); got != "?? notes.txt" {
+				t.Fatalf("precondition: status before setup = %q, want only notes.txt", got)
+			}
+			for i := 0; i < 2; i++ { // the re-run must not lose the inherited patterns
+				if err := EnsureLocalExcludePatterns(wts[0]); err != nil {
+					t.Fatalf("EnsureLocalExcludePatterns: %v", err)
+				}
+				if got := status(); got != "?? notes.txt" {
+					t.Errorf("after call %d: status = %q, want only notes.txt (inherited ignores must stay in force)", i+1, got)
+				}
+			}
+		})
+	}
+}
+
+// A repository can switch the global ignore off with an empty core.excludesFile.
+// Files it left visible on purpose must not be hidden again by a copied-in ignore.
+func TestEnsureLocalExcludePatterns_EmptyExcludesFileInheritsNothing(t *testing.T) {
+	isolateGitConfig(t, ".env\n")
+	bare, wts := bareRepoWithWorktrees(t, 1)
+	if out, err := exec.Command("git", "--git-dir", bare, "config", "core.excludesFile", "").CombinedOutput(); err != nil {
+		t.Fatalf("git config: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(wts[0], ".env"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureLocalExcludePatterns(wts[0]); err != nil {
+		t.Fatalf("EnsureLocalExcludePatterns: %v", err)
+	}
+	out, _ := exec.Command("git", "-C", wts[0], "status", "--porcelain", "-uall").CombinedOutput()
+	if got := strings.TrimSpace(string(out)); got != "?? .env" {
+		t.Errorf("status = %q, want .env still visible", got)
+	}
+}
+
+// If git cannot report the inherited excludes file (git older than 2.26 rejects
+// --show-scope), installing the per-worktree file anyway would un-ignore whatever
+// the user's own ignore hides. The setup must fail and leave the worktree alone.
+func TestEnsureLocalExcludePatterns_FailsClosedWhenGitCannotResolveInherited(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a sh git wrapper")
+	}
+	isolateGitConfig(t, "")
+	_, wts := bareRepoWithWorktrees(t, 1)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	wrapper := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --show-scope ] && { printf 'error: unknown option\\nusage: git config [<options>]\\n    --global  use global config file\\n' >&2; exit 129; }; done\nexec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	err = EnsureLocalExcludePatterns(wts[0])
+	if err == nil {
+		t.Fatal("EnsureLocalExcludePatterns succeeded although the inherited excludes could not be resolved")
+	}
+	if !strings.Contains(err.Error(), "unknown option") || !strings.Contains(err.Error(), "2.26") || strings.Contains(err.Error(), "\n") {
+		t.Errorf("error %q should be one line carrying git's error and the minimum git version", err)
+	}
+	out, _ := exec.Command(realGit, "-C", wts[0], "config", "--get", "core.excludesFile").Output()
+	if got := strings.TrimSpace(string(out)); got != "" {
+		t.Errorf("core.excludesFile = %q, want unset after a failed setup", got)
+	}
+}
+
+// Sibling polecats are spawned in parallel under per-polecat locks only, so the
+// one-time repository migration must be safe to race.
+func TestEnsureLocalExcludePatterns_ConcurrentFirstEnable(t *testing.T) {
+	isolateGitConfig(t, "")
+	bare, wts := bareRepoWithWorktrees(t, 8)
+	errs := make([]error, len(wts))
+	var wg sync.WaitGroup
+	for i, wt := range wts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = EnsureLocalExcludePatterns(wt)
+		}()
+	}
+	wg.Wait()
+	for i, wt := range wts {
+		if errs[i] != nil {
+			t.Errorf("worktree %d: %v", i, errs[i])
+		}
+		out, _ := exec.Command("git", "-C", wt, "config", "--worktree", "--get", "core.excludesFile").Output()
+		if strings.TrimSpace(string(out)) == "" {
+			t.Errorf("worktree %d has no core.excludesFile", i)
+		}
+	}
+	out, err := exec.Command("git", "--git-dir", bare, "rev-parse", "--is-bare-repository").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		t.Errorf("bare repo is-bare = %q (%v), want true", strings.TrimSpace(string(out)), err)
+	}
 }
