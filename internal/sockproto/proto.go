@@ -119,6 +119,9 @@ type SessionSummary struct {
 	Polecat   string    `json:"polecat"`
 	State     string    `json:"state"` // "ready" | "orphaned"
 	StartedAt time.Time `json:"started_at"`
+	// Branch is the work branch the session was opened with (session_open's
+	// branch). A worker that predates the field reports none.
+	Branch string `json:"branch,omitempty"`
 }
 
 // Message is the single control-connection message shape. Fields are
