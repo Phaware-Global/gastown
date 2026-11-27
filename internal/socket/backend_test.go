@@ -65,6 +65,10 @@ type fakeWorker struct {
 	hang         bool // accept + handshake, then never answer a request
 
 	openBranch string // branch of the last session_open
+	// exitOnTeardown: the teardown ends the session and then drops the
+	// connection unanswered, as a worker does when it exits to apply a staged
+	// binary once its last session is gone.
+	exitOnTeardown bool
 }
 
 // pushedBinary is a completed push_binaries transfer as the fake worker saw it.
@@ -280,6 +284,12 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				return
 			}
 			w.removeSession(m.Session)
+			if w.exitOnTeardown {
+				w.mu.Lock()
+				w.upgraded = true
+				w.mu.Unlock()
+				return
+			}
 			reply(&sockproto.Message{Type: sockproto.TypeTeardownComplete, ID: m.ID, Session: m.Session})
 		default:
 			_ = codec.SendErr(m.ID, "unknown", m.Type)
@@ -426,6 +436,40 @@ func TestProvision_LiveSessionOnAnotherBranchIsReplaced(t *testing.T) {
 			require.NoError(t, err)
 			// Flushed and torn down first, then opened afresh on the new branch.
 			assert.Equal(t, []string{"auth", "hello", "shutdown", "teardown", "session_open", "cert"}, w.got())
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			assert.Equal(t, "polecat/furiosa/gt-b", w.openBranch)
+		})
+	}
+}
+
+// Tearing the stale session down empties a worker that has a binary staged,
+// by this provision or an earlier one. It exits to apply it before answering
+// the teardown and is not listening until its supervisor has it back. That is
+// a restart to retry through, not a failed provision.
+func TestProvision_ReplacementRetriesThroughTheWorkersUpgradeRestart(t *testing.T) {
+	for name, staged := range map[string]bool{"staged by this provision": true, "staged earlier": false} {
+		t.Run(name, func(t *testing.T) {
+			b, w, s := stagedUpgradeBackend(t)
+			if !staged {
+				b.GTVersion = w.gtVersion // nothing to push
+			}
+			w.exitOnTeardown = true
+			w.preload(sockproto.SessionSummary{Session: "gt-MyRig-furiosa", Rig: "MyRig", Polecat: "furiosa", State: "ready", Branch: "polecat/furiosa/gt-a"})
+			dials := 0
+			b.dialFn = func(ctx context.Context, st *Settings, id, ver string) (*conn, error) {
+				dials++
+				if dials == 2 {
+					return nil, errors.New("dial unix: connect: connection refused")
+				}
+				return dial(ctx, st, id, ver)
+			}
+
+			s.Branch = "polecat/furiosa/gt-b"
+			_, err := b.Provision(context.Background(), s)
+			require.NoError(t, err)
+			assert.Equal(t, 3, dials)
+			assert.Equal(t, 1, w.sessionOpenAttempts())
 			w.mu.Lock()
 			defer w.mu.Unlock()
 			assert.Equal(t, "polecat/furiosa/gt-b", w.openBranch)

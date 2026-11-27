@@ -229,7 +229,17 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 			"session", spec.Session, "branch", sess.Branch, "want", spec.Branch)
 		tdCtx, cancel := context.WithTimeout(ctx, controlTimeout)
 		err := teardownOn(tdCtx, c, spec.Session)
+		timedOut := tdCtx.Err() != nil
 		cancel()
+		// A teardown that empties the worker is also when it applies a staged
+		// binary: it exits for its supervisor before it can answer. So a
+		// connection that drops here, rather than a refusal or a worker that
+		// hangs, is taken for that restart, whether or not this provision did
+		// the staging (an earlier one may have). The retry finds the session
+		// gone and opens it; a worker that is really down fails the redial.
+		if errors.Is(err, errNoReply) && !timedOut {
+			return execution.Endpoint{}, fmt.Errorf("replacing the session on branch %q: %w: %w", sess.Branch, errUpgradeStaged, err)
+		}
 		if err != nil {
 			return execution.Endpoint{}, fmt.Errorf("replacing the session on branch %q: %w", sess.Branch, err)
 		}
@@ -378,6 +388,10 @@ func (b *SocketBackend) Teardown(ctx context.Context, ep execution.Endpoint) err
 	return teardownOn(ctx, c, ep.ID)
 }
 
+// errNoReply marks a request the worker never answered: the connection
+// dropped or timed out, as opposed to a refusal.
+var errNoReply = errors.New("no reply from the worker")
+
 // teardownOn ends session on an open control connection.
 func teardownOn(ctx context.Context, c *conn, session string) error {
 	// Graceful stop first (§6 step 1-2): best-effort — a worker that already
@@ -390,7 +404,7 @@ func teardownOn(ctx context.Context, c *conn, session string) error {
 	})
 	resp, err := c.request(ctx, &sockproto.Message{Type: sockproto.TypeTeardown, Session: session})
 	if err != nil {
-		return fmt.Errorf("socket: teardown: %w", err)
+		return fmt.Errorf("socket: teardown: %w: %w", errNoReply, err)
 	}
 	if resp.Type == sockproto.TypeError {
 		return fmt.Errorf("socket: teardown %s: %s: %s", session, resp.Code, resp.Msg)
