@@ -240,7 +240,9 @@ liveness check (§3.2). Any stream fault (write error, read error, liveness
 timeout) ends the stream only, and the exec moves to `detached`.
 
 Exec states: `attached`, `detached`, `exited` (exit code held, not yet
-delivered) and `ended` (its end routine, §3.5, has finished). `session.execCancel` becomes a pointer to the exec. The session's
+delivered), `ended` (its end routine, §3.5, has finished) and `end_failed`
+(the routine could not finish). `session.execCancel` becomes a pointer to the
+exec. The session's
 `ready` state is unchanged. The session records one timestamp, `idle_since`:
 set when the session becomes `ready` and whenever its last stream ends (the
 exec detaches, or exits with no stream attached), cleared while a stream is
@@ -291,9 +293,8 @@ read itself has failed.
 tolerate. The feature is negotiated the way `agent_files` was: a capability.
 
 - `hello_ack.capabilities.exec_resume: true` from a worker that implements this
-  and has a non-zero detach timeout. It commits the worker to resume, to
-  pinging every `echo` stream every 10s for as long as the stream exists, and
-  to the armed kill (§3.3). `DialExecStream` currently discards the ack
+  and has a non-zero detach timeout. It commits the worker to resume and to
+  pinging every `echo` stream every 10s for as long as the stream exists. `DialExecStream` currently discards the ack
   (`internal/socket/execstream.go:53-57`); it returns the capabilities.
 - `hello_ack.capabilities.idle_reclaim: true` from a worker with a non-zero
   idle-session timeout. It covers `idle_since`, `touch` and conditional
@@ -339,9 +340,8 @@ How the worker treats an attach to a session:
 |---|---|---|
 | no `resume` | none | start the agent (today) |
 | no `resume` | `attached` | `echo` stream: **probe** (below); alive, refuse with 125 (today); dead, end the stream and continue as `detached`. Stream without `echo`: refuse with 125 at once (today) |
-| no `resume` | `detached` | **replace**: run the old exec's end routine (§3.5) to `ended`, then start the new one |
+| no `resume` | `detached`, `exited` or `end_failed` | **replace**: run the exec's end routine (§3.5); once it is `ended`, start the new agent; if the routine fails, refuse. An undelivered exit code is logged and dropped |
 | no `resume` | another attach's probe or replace in progress | refuse with 125 |
-| no `resume` | `exited` | if the exec is not yet `ended` (its end routine is still running), wait for it; then log and drop the undelivered code and start the agent |
 | `resume` matches | `attached` | supersede: close the old connection, continue on this one |
 | `resume` matches | `detached` | resume from `offset` |
 | `resume` matches | `exited` | send remaining output, then the exit frame |
@@ -398,8 +398,9 @@ Frames already written to a connection that then died are not resent:
 at-most-once, because a duplicated prompt is worse than a lost keystroke.
 
 **Exit code.** If the agent exits while detached the exec becomes `exited` and
-keeps the code and the ring. It is released when a stream has written the exit
-frame and then read the launcher's EOF, or at the detach timeout. A launcher
+keeps the code and the ring. It is released, which means its end routine runs
+and the exec is removed, when a stream has written the exit frame and then
+read the launcher's EOF, or at the detach timeout. A launcher
 that lost the connection after the write but before reading the frame resumes
 and receives it again. A launcher process exits on the first exit frame it
 reads, so the pane sees the code once. Exit codes remain diagnostic (socket §5).
@@ -445,7 +446,11 @@ tmux server goes away. With `exec_resume` it no longer forwards `SIGHUP`; it
 closes the stream and exits, and the exec detaches. `SIGINT`, `SIGTERM` and
 `SIGQUIT` are still forwarded.
 
-Two things change on the worker (§1.2 table, rows 1 and 2, is the baseline).
+Two things change on a worker whose detach timeout is non-zero, for every
+launcher, old or new (§1.2 table, rows 1 and 2, is the baseline). With
+`-detach-timeout 0` neither applies: a drop cancels the exec and a container
+signal goes to PID 1, exactly as today, so the rollback setting keeps today's
+bounds.
 
 *Delivery in container mode.* A signal frame is delivered to the agent's
 processes with `kill -<SIG> -1`, run as root inside the work container (the
@@ -458,16 +463,23 @@ agent. After the change all four reach it and none stops the container. Only
 `StopWork` and `teardown` stop or remove a container.
 
 *Armed kill.* Today the drop enforces a native kill and the container stop
-enforces a container kill. Under this design a drop only detaches, and the
-container no longer stops, so neither bound would remain. A forwarded
-`SIGTERM` or `SIGQUIT` therefore arms the receiving exec's end routine (§3.5)
-with a deadline of `execWaitDelay` from the frame: the `TERM` step counts as
-done, and the kill step runs when the agent's own process exits or at the
-deadline, whichever is first. It runs even though that process has exited,
-because a child that ignores `TERM` can outlive it. A detach or a
-resume does not disarm it. The exec reaching `ended` by any path does, and
-nothing else can start in the session before that (§3.5), so the kill never
-meets a successor. The bound is 10s from the frame in both modes.
+enforces a container kill. With detach, a drop only detaches and the container
+no longer stops, so neither bound would remain. A forwarded `SIGTERM` or
+`SIGQUIT` therefore arms the receiving exec's end routine (§3.5) with a
+deadline of `execWaitDelay` from the frame: the `TERM` step counts as done,
+and the kill step runs when the agent's own process exits or at the deadline,
+whichever is first. A detach or a resume does not disarm it. Delivery and
+arming obey the ownership invariant in §3.5 like every other kill.
+
+What the kill step bounds, 10s from the frame:
+
+- Container: every process in the work container but PID 1.
+- Native, where the worker can hold the leader unreaped (§3.5): the whole
+  process group, including a child that ignores `TERM` and outlives the
+  agent.
+- Native elsewhere: the agent's own process only, as today. A descendant that
+  ignores `TERM` is not bounded, which is today's behaviour (§1.2 table, row
+  2).
 
 The armed kill needs the signal frame to arrive. If the launcher is killed
 before it writes the frame, or the path is already partitioned, the agent
@@ -534,84 +546,104 @@ implementation and its review should hold them to.
    starts, replaces or supersedes is taken under `s.mu`; anything that waits
    (probe, reap) happens outside it behind a mark that refuses other fresh
    attaches. `s.mu` is never held across a network write or a wait.
-4. **One end routine per exec, and no successor before it finishes.** See
-   below.
+4. **Exec ownership.** Stated once, below; every kill, signal and start rule
+   in this document is an application of it.
 5. **Every session stop ends the exec before the final flush**, through
-   `StopWork`, in both modes, and a stop whose end routine failed keeps the
-   debounce.
+   `StopWork`, in both modes, and a stop whose end routine did not reach
+   `ended` keeps the debounce.
 6. **Nothing new is assumed of an old peer.** `echo`, `ping`, the silence
    rule, `resume`, launcher retry and dropping `SIGHUP` forwarding require
-   `exec_resume`; `touch` and conditional teardown require `idle_reclaim`. A
+   `exec_resume`; `touch` and conditional teardown require `idle_reclaim`.
+   In-container signal delivery and the armed kill depend only on the
+   worker's own detach timeout, not on the launcher. A
    worker that detaches does so for old launchers too: they exit on the drop as
    today, and their next fresh attach replaces.
 7. **`idle_since` changes only under `s.mu`**, and the idle timer, `touch` and
    conditional teardown each read it and act in the same critical section, so
    exactly one of them wins.
 
-**The end routine.** Each exec object has one, single-flight and idempotent.
-It is the only code that kills an agent, and it is bound to the exec object,
-not to a pid or a container name.
+**Exec ownership.** Three clauses. Nothing else in this document grants a
+right to signal, kill or start.
 
-1. *`TERM` step.* Native: `SIGTERM` to the process group. Container:
-   `kill -TERM -1` as root inside the work container. Skipped when a forwarded
-   `TERM` or `QUIT` already armed the routine.
-2. *Grace.* Wait for the agent's own process to exit (native: observed, not
-   reaped; container: the `docker exec` client), at most `execWaitDelay` from
-   the `TERM` step or the arming frame. No wait if it has already exited.
-3. *Kill step.* Native: `SIGKILL` to the process group. Container:
-   `kill -KILL -1` as root inside the container, which spares PID 1. If the
-   container is not running there is nothing to kill.
-4. *Confirm and mark `ended`.* Reap the leader (native) or the `docker exec`
-   client (container). If docker cannot be reached the routine fails, the
-   exec is not `ended`, and the session stop's `docker stop` or `Teardown`'s
-   `docker rm -f` is the bound.
+- *Target.* A signal or kill reaches only its own exec's target. Container:
+  the container ID that `docker run -d` printed when the session was prepared
+  (`workenv.go:262-288` discards it today), never the per-polecat name, which
+  every later session of that polecat reuses (`workenv.go:156`, `:409`).
+  Native: the exec's process group, and only while the worker holds its
+  leader unreaped; otherwise the leader's own process handle and nothing
+  else.
+- *Currency.* Before a signal frame is delivered, a kill is armed, a timer
+  acts or the end routine takes a step, the worker checks under `s.mu` that
+  the session is still in `s.sessions` and that this exec is still the
+  session's exec. If not, the action is dropped. When a session leaves
+  `s.sessions` (teardown or orphan) its timers are disarmed and nothing is
+  retried for it.
+- *Succession.* A session starts a new agent only when it has no exec or its
+  exec is `ended`. There is no other case.
 
-An exec whose end routine has started is not released, and is not `ended`,
-until the routine finishes, even if its agent has already exited; and **a
-session starts a new agent only when it has no exec, its exec is `ended`, or
-its exec is `exited` with no end routine running**. A fresh attach that needs the
-slot calls the routine and waits for it; if the routine fails, the attach is
-refused. This ordering is what makes the container kill sound: `kill -1` is
-not exec-scoped, so it is only ever issued by the routine of the one exec the
-container can hold, strictly before any successor exists.
+**The end routine.** Each exec has one, single-flight and idempotent. It is
+the only code that kills an agent, and every exec ends through it, including
+one whose agent exited by itself: `ended` means the exec's target has been
+swept. (That is a change: leftover processes of an agent that exited are
+killed before the slot is reused, where today they are left.)
 
-| Trigger | Scope | Cancelled by | If a successor is wanted |
-|---|---|---|---|
-| Armed kill: signal frame + `execWaitDelay` (§3.3) | The exec that received the frame | That exec reaching `ended` | The fresh attach waits for the routine and starts after `ended` |
-| Detach timeout (§4) | The session's exec, if `detached` or `exited` when the timer's check runs under `s.mu` | A stream attaching, or `touch`, before that check; the exec reaching `ended` | Same routine, same wait |
-| Replace (§3.2) | The session's exec at the time the `replacing` mark is taken | Nothing; it runs to `ended` | The replacing attach is the only one admitted |
-| `StopWork` (§3.1) | The session's exec | Nothing | None: the session is fenced, then stopped |
-| Idle-session timeout (§4) | The session | A stream attaching or `touch` before the check | Not applicable |
-| Exit-code retention (§3.2) | An `exited` exec | Delivery, the detach timeout, a fresh attach | Code dropped; start after `ended` |
+1. *`TERM` step.* Native: `SIGTERM` to the process group (as `exec.go:622-627`
+   does). Container: `kill -TERM -1` as root in the container. Skipped when
+   the agent has already exited or a forwarded `TERM`/`QUIT` armed the
+   routine.
+2. *Grace.* Wait for the agent's own process to exit (container: the
+   `docker exec` client), at most `execWaitDelay` from the `TERM` step or the
+   arming frame.
+3. *Kill step.* Per the target clause. Container: `kill -KILL -1` as root in
+   the container, which spares PID 1; a container that is not running has
+   nothing to kill. Native with the leader held: `SIGKILL` to the group, then
+   reap. Native otherwise: kill the leader's own process if it is still
+   running; no group signal.
+4. *Result.* `ended` when the step was carried out and the leader or client is
+   reaped. `end_failed` when it could not be (docker unreachable, or a reap
+   that does not return). An `end_failed` exec still occupies the session: no
+   timer retries it; a fresh attach or `StopWork` may run the routine again
+   while the currency clause holds; otherwise the session stop's
+   `docker stop`, or `Teardown`'s `docker rm -f`, by container ID, is the
+   bound.
 
-A timer that fires finds its exec through the pointer it was created with and
-does nothing if that exec is `ended` or is no longer the session's exec.
+The same ID rule applies to session-level commands: `StopWork` and teardown
+address the container by ID, and an orphan record keeps the ID so that orphan
+teardown removes that container and not whichever one now carries the
+polecat's name (`service.go:891-897` removes by name today).
 
-**Pid reuse (native).** The agent is a group or session leader, so its pgid is
-its pid (`proc_unix.go:12-14`; `exec.go:607-616`). Once the leader is reaped
-and its group is empty, the kernel may hand that pid to a new process, which
-on a worker can be another session's agent, and a later `kill(-pgid)` would
-hit it. The existing signal path has the same exposure in a narrow window
-(`exec.go:730-734` checks only that the process was started). The required
-property is: **a group signal is sent only while the worker holds the leader
-unreaped.** That means observing the leader's exit without reaping it and
-reaping only after the kill step or after deciding none is needed. `waitid`
-with `WNOWAIT` and, on Linux, a pidfd can do this; whether either fits
-`os/exec` on every platform the worker supports is not established here (§8
-Q8). Until it is, the rule is conservative: where the leader cannot be held,
-a group signal is not sent after the leader has been reaped, the skipped kill
-is logged, and group members that outlived the leader are left as they are
-today (§1.2 table, row 2).
+| Trigger | Acts on | Dropped or cancelled when |
+|---|---|---|
+| Signal frame, and the armed kill it starts (§3.3) | The exec its stream is bound to | Currency fails; the exec is `ended` |
+| Detach timeout (§4) | The session's exec, if it is `detached` or `exited` | A stream attached or `touch` arrived before the check; currency fails |
+| Replace by a fresh attach (§3.2) | The session's exec when the `replacing` mark is taken | Never; it runs to `ended` or `end_failed` |
+| Release after the exit code is delivered (§3.2) | That `exited` exec | Currency fails |
+| `StopWork` (§3.1) | The session's exec | Never |
+| Idle-session timeout (§4) | The session | A stream attached or `touch` arrived before the check |
+
+**Holding the leader (native).** The agent is a group or session leader, so
+its pgid is its pid (`proc_unix.go:12-14`; `exec.go:607-616`), and
+`signalProcessGroup` is a bare `kill(-pid)` (`proc_unix.go:18-19`). `os/exec`
+reaps the leader inside `Wait`. After the reap, if the group is empty, the pid
+can be reused, possibly by another session's agent, and a group signal would
+hit it. Holding the leader means observing its exit without reaping it and
+reaping only after the kill step. `waitid` with `WNOWAIT` and, on Linux, a
+pidfd can do this; whether either fits `os/exec` on every platform the worker
+supports is not established here (§8 Q8). A worker that cannot hold the
+leader follows the "otherwise" branch of the target clause and logs what it
+skipped.
 
 ## 4. Reclamation
 
 Two timers on the worker and one in the launcher, all flags with defaults. The
 worker's both count from `idle_since` (§3.1):
 
-- **Detach timeout** (`-detach-timeout`, default 15 min; 0 restores
-  cancel-on-drop and withdraws the capability). A detached exec is cancelled
-  when `idle_since` is this old, by its end routine (§3.5). An `exited` exec is dropped at the same age. The session
-  stays `ready`.
+- **Detach timeout** (`-detach-timeout`, default 15 min). A `detached` or
+  `exited` exec is ended by its end routine (§3.5) when `idle_since` is this
+  old. The session stays `ready`. Setting 0 is the rollback: cancel-on-drop,
+  no `exec_resume`, and signal frames and their bounds exactly as today
+  (§3.3). The drop then cancels the exec context as the current code does,
+  the one kill that does not go through the end routine.
 - **Idle-session timeout** (`-idle-session-timeout`, default 30 min). A `ready`
   session whose `idle_since` is this old is stopped through the supervisor
   with a new stop reason. `StopWork` ends any exec first (§3.1), the final
@@ -700,7 +732,7 @@ idle-session timeout the wait is bounded, and the orphan transition should call
 | # | Fault | Worker | Orchestrator | Outcome |
 |---|---|---|---|---|
 | 1 | Launcher killed (`SIGKILL`), or pane killed (`SIGHUP`) | Connection closes; exec `detached`, agent keeps running | Pane gone; crash path asks for a restart if work is hooked | New pane **replaces** the agent (or adopts, phase 4). No restart within the detach timeout: agent stopped; later the session is orphaned |
-| 1a | Intentional kill (`Stop`, nuke): launcher gets `SIGTERM`, then `SIGKILL` 2s later | Signal frame arms the exec's end routine: the agent's process group (native) or every process in the work container but PID 1 (container) is killed at most `execWaitDelay` later, even if it ignores `SIGTERM` and the stream drops; the container keeps running. A restart inside those 10s waits for the routine and starts after it. Frame never arrived: as 1 | Nuke also calls `Teardown` (phase 3) | Agent ended within 10s of the frame; without the frame, by `Teardown` or the detach timeout |
+| 1a | Intentional kill (`Stop`, nuke): launcher gets `SIGTERM`, then `SIGKILL` 2s later | Signal frame arms the exec's end routine; the kill step runs at most `execWaitDelay` later even if the stream drops, with the reach §3.3 lists per mode; the container keeps running. A restart inside those 10s is a replace and waits for `ended`. Frame never arrived: as 1 | Nuke also calls `Teardown` (phase 3) | Container, and native with the leader held: nothing of the agent is left 10s after the frame. Native otherwise: the agent's own process is gone, descendants that ignore `TERM` are not bounded, as today. Without the frame: `Teardown` or the detach timeout |
 | 2 | Network partition, no FIN or RST | `echo` stream: no inbound frame for 30s, `detached`. Writes may keep succeeding and prove nothing | No inbound frame for 30s; closes the socket and redials with backoff | Resume with replay when the path returns inside the window |
 | 3 | Launcher reconnects before the worker has declared the old stream dead | Old stream still `attached` | Launcher presents `exec_id` | Supersede: worker closes the stale connection and continues on the new one |
 | 4 | Partition longer than the launcher window | `detached`; the detach timeout or the dead-man switch, whichever is first, stops the agent; the dead-man stop takes a final local checkpoint after `StopWork` and orphans the session | Launcher exits 75; pane dies; crash path | Restart goes through bring-up; pushed work is resumed from the work ref |
@@ -751,8 +783,8 @@ worker only when it is idle.
 
 | Phase | Change | Rough size | Tests |
 |---|---|---|---|
-| 1 | Worker: session-owned exec, ring buffer, `detached`/`exited` states, replace-on-fresh-attach, `idle_since`, detach timeout (default 0 in this phase, so behaviour is unchanged until phase 2), `StopWork` wired in both modes to fence, end and reap the exec (error on reap timeout), the §3.5 end routine and the no-successor-before-`ended` rule in both modes, summary fields | ~600 lines + tests in `internal/workerclient` | Unit: ring wrap and offsets; agent survives a closed connection and keeps producing; output never blocks with no reader; detach timeout cancels; replace ends the old agent before starting the new; teardown, shutdown, `shutdownAll`, dead-man and `max_runtime` each reap a detached native agent before the final checkpoint is taken, and refuse an attach during the flush; existing exec and pty tests unchanged with timeout 0 |
-| 2 | Protocol and launcher: capability, `exec_id`/`offset`/`truncated`, `ping`/`pong` liveness on both sides, resume and supersede, exit-code retention, launcher retry loop, stdin buffer, `SIGHUP` detaches (and the stuck-agent-dog plugin stops using a bare `tmux kill-session`), in-container signal delivery, armed kill on forwarded `SIGTERM`/`SIGQUIT` | ~600 lines in `sockproto`, `socket`, `workerattach`, `workerclient` | Unit: every row of the §3.2 table; byte-exact replay across a cut at arbitrary offsets; exit while detached delivered once; `no_exec` never starts an agent; an offset beyond the counter is clamped; a peer that stops answering pings while its writes still succeed (a fake connection that accepts and discards) is declared dead in 30s, and a fresh attach then replaces instead of getting 125; two concurrent fresh attaches against a dead `echo` stream produce one replace and one 125, and the worker serves other connections during the probe; a `SIGTERM`-ignoring agent, and a `SIGTERM`-ignoring child of an agent that exited, are killed `execWaitDelay` after the signal frame whether the stream then stays, drops or resumes, in native and in container mode; container mode: a forwarded `TERM` leaves the container running and a restart after `Stop` attaches and runs; `QUIT` then a fresh attach within 10s, in both modes, and the new agent is still alive after the old deadline; an armed timer whose exec was replaced does nothing. Launcher: redials after 30s of silence on an `echo` stream; against an old fake worker with an idle agent it stays attached for more than 60s; retries only with the capability, backoff, window expiry exits 75, terminal restored on every exit. Compat: new launcher against a capability-less fake worker |
+| 1 | Worker: session-owned exec, ring buffer, `detached`/`exited` states, replace-on-fresh-attach, `idle_since`, detach timeout (default 0 in this phase, so behaviour is unchanged until phase 2), `StopWork` wired in both modes to fence, end and reap the exec (error on reap timeout), the §3.5 ownership invariant and end routine in both modes (container addressed by ID, `end_failed`, prototype of holding the leader), summary fields | ~600 lines + tests in `internal/workerclient` | Unit: ring wrap and offsets; agent survives a closed connection and keeps producing; output never blocks with no reader; detach timeout cancels; replace ends the old agent before starting the new; teardown, shutdown, `shutdownAll`, dead-man and `max_runtime` each reap a detached native agent before the final checkpoint is taken, and refuse an attach during the flush; existing exec and pty tests unchanged with timeout 0 |
+| 2 | Protocol and launcher: capability, `exec_id`/`offset`/`truncated`, `ping`/`pong` liveness on both sides, resume and supersede, exit-code retention, launcher retry loop, stdin buffer, `SIGHUP` detaches (and the stuck-agent-dog plugin stops using a bare `tmux kill-session`), in-container signal delivery, armed kill on forwarded `SIGTERM`/`SIGQUIT` | ~600 lines in `sockproto`, `socket`, `workerattach`, `workerclient` | Unit: every row of the §3.2 table; byte-exact replay across a cut at arbitrary offsets; exit while detached delivered once; `no_exec` never starts an agent; an offset beyond the counter is clamped; a peer that stops answering pings while its writes still succeed (a fake connection that accepts and discards) is declared dead in 30s, and a fresh attach then replaces instead of getting 125; two concurrent fresh attaches against a dead `echo` stream produce one replace and one 125, and the worker serves other connections during the probe; a `SIGTERM`-ignoring agent is killed `execWaitDelay` after the signal frame whether the stream then stays, drops or resumes, in both modes; a `SIGTERM`-ignoring child of an agent that exited is killed in container mode and, only on a platform where the leader is held, in native mode (on other platforms the test asserts that no group signal is sent after the reap); a signal frame or timer for an exec that is no longer the session's exec, or whose session was torn down or orphaned, does nothing, including when a new session of the same polecat has a container under the same name; with `-detach-timeout 0` a container `TERM` still goes to PID 1; container mode: a forwarded `TERM` leaves the container running and a restart after `Stop` attaches and runs; `QUIT` then a fresh attach within 10s, in both modes, and the new agent is still alive after the old deadline; a fresh attach on an `exited` exec sweeps before it starts; a failed routine leaves `end_failed` and refuses the attach. Launcher: redials after 30s of silence on an `echo` stream; against an old fake worker with an idle agent it stays attached for more than 60s; retries only with the capability, backoff, window expiry exits 75, terminal restored on every exit. Compat: new launcher against a capability-less fake worker |
 | 3 | Reclamation: idle-session timeout with flush, orphan triggers `applyPendingIfIdle`, `idle_reclaim` capability, orchestrator gate ignores orphans and reaps its own, `touch` from `Provision`, daemon sweep with conditional teardown, `Teardown` from nuke and polecat removal, detach timeout default 15 min | ~500 lines in `workerclient`, `sockproto`, `socket`, `daemon`, `cmd` | Unit: idle session is flushed then orphaned and the slot is free; staged binary applies after reclamation; gate arithmetic with orphans; sweep tears down only sessions with no tmux session whose `idle_since` is past the timeout, never by session age and never for another rig; a `touch` on a session being stopped answers `no_session` after the stop; a `touch` or an attach between the sweep's read and its teardown yields `busy`; `Provision` falls through to `session_open` on `no_session`; nuke of a remote polecat leaves no session on the worker |
 | 4 (optional) | Adoption by a new pane: `adopt` on attach, `Start` skips beacon and nudges when adopting, forced repaint; a session-scoped stop message for `Stop`, then stop forwarding `SIGTERM` | ~500 lines, mostly `internal/polecat` | Start-sequence tests with a detached exec present; end-to-end on a real worker |
 
@@ -779,12 +811,13 @@ worker only when it is idle.
 7. Drop all packets between launcher and worker without closing either socket.
    Within 30s the worker reports `exec: detached` and the launcher prints its
    reconnecting status.
-8. Run an agent that ignores `SIGTERM` and stop its polecat session. In native
-   mode the agent's process group is gone from the worker within
-   `execWaitDelay` of the stop; in container mode the work container has no
-   process left but PID 1 within the same bound and is still running. Start
-   the polecat again within those 10s: the new agent starts and is still
-   running a minute later.
+8. Run an agent that ignores `SIGTERM` and stop its polecat session. Within
+   `execWaitDelay` of the stop: in container mode the work container has no
+   process left but PID 1 and is still running; in native mode the agent's
+   own process is gone, and on a platform where the worker holds the leader
+   its whole process group is gone (elsewhere this part is not claimed).
+   Start the polecat again within those 10s: the new agent starts and is
+   still running a minute later.
 9. With the proxy unreachable for longer than the dead-man window and a native
    agent writing a tracked file continuously, the final checkpoint commit is
    taken after the agent's exit is logged.
@@ -822,18 +855,22 @@ worker only when it is idle.
    spec if needed, built on a per-session holder process; also correct socket
    spec §7, whose re-adoption text does not match the code.
 7. **Restart onto a stopped work container.** Today a forwarded `TERM` stops
-   the container under a `ready` session (§1.2). §3.3 removes that cause, but
+   the container under a `ready` session (§1.2). §3.3 removes that cause when
+   the detach timeout is non-zero, but
    a container can also stop on its own (docker restarted, out of memory).
    `Provision` returns early for a `ready` session and the attach then fails.
    *Recommendation:* in phase 3, have `touch` and attach check that the
    container is running and, if it is not, stop and orphan the session and
    answer `no_session`, so `Provision` re-opens it. Not specified further
    here.
-8. **Holding the leader unreaped (native pid reuse, §3.5).** The property is
-   stated; the mechanism needs a prototype against `os/exec` on Linux and
-   macOS. *Recommendation:* prototype `waitid(WNOWAIT)` in phase 1; ship the
-   conservative rule (no group signal after the leader is reaped) on any
-   platform where it does not hold, and say so in the operator guide.
+8. **Holding the leader unreaped (native, §3.5).** The property is stated;
+   the mechanism needs a prototype against `os/exec` on Linux and macOS. A
+   pgid is not reused while any member lives, so a group kill after the reap
+   is unsafe only when the group is already empty, which is also when it is
+   useless; the worker cannot tell the two cases apart without holding the
+   leader. *Recommendation:* prototype `waitid(WNOWAIT)` in phase 1; on any
+   platform where it does not hold, ship the leader-only branch and say so
+   in the operator guide.
 9. **Could not determine from the code:** how the witness carries out
    `RESTART_POLECAT` (it is an agent acting on mail), and so whether any
    restart path tears the worker session down first; and whether the dead-man
