@@ -188,10 +188,10 @@ func EnsureLocalExcludePatterns(worktreePath string) error {
 		return fmt.Errorf("creating local exclude dir: %w", err)
 	}
 	// git reads a single excludes file, so the per-worktree one would otherwise
-	// switch off the user's global ignore here and let `git add -A` stage whatever
+	// switch off the user's global (or repository-configured) ignore here and let `git add -A` stage whatever
 	// it hides (.env, key files). Carry its patterns over; this file is rewritten on
 	// every add or repair, so the copy stays current.
-	content := userGlobalExcludes() +
+	content := inheritedExcludes(worktreePath) +
 		"# Gas Town (written by gt; do not edit)\n" + strings.Join(gasTownLocalExcludePatterns(), "\n") + "\n"
 	if err := os.WriteFile(excludePath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("writing local exclude: %w", err)
@@ -206,16 +206,18 @@ func EnsureLocalExcludePatterns(worktreePath string) error {
 	return nil
 }
 
-// userGlobalExcludes returns the contents of the excludes file git applies outside
-// any repository: core.excludesFile from the global or system config, else git's
-// default $XDG_CONFIG_HOME/git/ignore (~/.config/git/ignore). Empty if there is none.
-func userGlobalExcludes() string {
+// inheritedExcludes returns the contents of the excludes file git would apply in
+// worktreePath without the per-worktree setting: the last core.excludesFile from
+// any other scope (system, global or repository config, with include and includeIf
+// resolved as git resolves them for this worktree), else git's default
+// $XDG_CONFIG_HOME/git/ignore (~/.config/git/ignore). Empty if there is none.
+func inheritedExcludes(worktreePath string) string {
 	var path string
-	for _, scope := range []string{"--global", "--system"} {
-		out, err := exec.Command("git", "config", scope, "--path", "--get", "core.excludesFile").Output()
-		if p := strings.TrimSpace(string(out)); err == nil && p != "" {
-			path = p
-			break
+	out, _ := exec.Command("git", "-C", worktreePath, "config", "--show-scope", "--path", "--get-all", "core.excludesFile").Output()
+	for _, line := range strings.Split(string(out), "\n") {
+		scope, value, ok := strings.Cut(strings.TrimRight(line, "\r"), "\t")
+		if ok && scope != "worktree" && value != "" {
+			path = value // later entries override earlier ones
 		}
 	}
 	if path == "" {

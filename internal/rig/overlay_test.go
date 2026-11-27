@@ -715,26 +715,77 @@ func bareRepoWithWorktrees(t *testing.T, n int) (bare string, worktrees []string
 	return bare, worktrees
 }
 
-// git reads one excludes file, so the per-worktree file must carry the user's
-// global ignore along. Otherwise a secret hidden only by the global gitignore
-// becomes visible to `git add -A` in every polecat.
-func TestEnsureLocalExcludePatterns_KeepsUserGlobalIgnore(t *testing.T) {
-	isolateGitConfig(t, ".env\n*.pem\n")
-	_, wts := bareRepoWithWorktrees(t, 1)
-	for _, f := range []string{".env", "id.pem", "notes.txt"} {
-		if err := os.WriteFile(filepath.Join(wts[0], f), []byte("x"), 0o644); err != nil {
+// git reads one excludes file, so the per-worktree file must carry along whatever
+// excludes file applied before. Otherwise a secret hidden only by the user's ignore
+// file becomes visible to `git add -A` in every polecat.
+func TestEnsureLocalExcludePatterns_KeepsInheritedIgnore(t *testing.T) {
+	ignoreFile := func(t *testing.T) string {
+		path := filepath.Join(t.TempDir(), "myignore")
+		if err := os.WriteFile(path, []byte(".env\n*.pem\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	writeConfig := func(t *testing.T, path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := EnsureLocalExcludePatterns(wts[0]); err != nil {
-		t.Fatalf("EnsureLocalExcludePatterns: %v", err)
+	tests := map[string]func(t *testing.T, bare string){
+		"default XDG ignore file": func(t *testing.T, _ string) {
+			isolateGitConfig(t, ".env\n*.pem\n")
+		},
+		"core.excludesFile in global config": func(t *testing.T, _ string) {
+			isolateGitConfig(t, "")
+			global := filepath.Join(t.TempDir(), "gitconfig")
+			writeConfig(t, global, "[core]\n\texcludesFile = "+filepath.ToSlash(ignoreFile(t))+"\n")
+			t.Setenv("GIT_CONFIG_GLOBAL", global)
+		},
+		"core.excludesFile via include in global config": func(t *testing.T, _ string) {
+			isolateGitConfig(t, "")
+			dir := t.TempDir()
+			included := filepath.Join(dir, "gitconfig.local")
+			writeConfig(t, included, "[core]\n\texcludesFile = "+filepath.ToSlash(ignoreFile(t))+"\n")
+			global := filepath.Join(dir, "gitconfig")
+			writeConfig(t, global, "[include]\n\tpath = "+filepath.ToSlash(included)+"\n")
+			t.Setenv("GIT_CONFIG_GLOBAL", global)
+		},
+		"core.excludesFile in repository config": func(t *testing.T, bare string) {
+			isolateGitConfig(t, "")
+			if out, err := exec.Command("git", "--git-dir", bare, "config", "core.excludesFile", ignoreFile(t)).CombinedOutput(); err != nil {
+				t.Fatalf("git config: %v\n%s", err, out)
+			}
+		},
 	}
-	out, err := exec.Command("git", "-C", wts[0], "status", "--porcelain", "-uall").CombinedOutput()
-	if err != nil {
-		t.Fatalf("git status: %v\n%s", err, out)
-	}
-	if got := strings.TrimSpace(string(out)); got != "?? notes.txt" {
-		t.Errorf("status = %q, want only notes.txt (globally ignored files must stay ignored)", got)
+	for name, setup := range tests {
+		t.Run(name, func(t *testing.T) {
+			isolateGitConfig(t, "") // for the repo setup; the case re-isolates as it needs
+			bare, wts := bareRepoWithWorktrees(t, 1)
+			setup(t, bare)
+			for _, f := range []string{".env", "id.pem", "notes.txt"} {
+				if err := os.WriteFile(filepath.Join(wts[0], f), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			status := func() string {
+				out, err := exec.Command("git", "-C", wts[0], "status", "--porcelain", "-uall").CombinedOutput()
+				if err != nil {
+					t.Fatalf("git status: %v\n%s", err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			if got := status(); got != "?? notes.txt" {
+				t.Fatalf("precondition: status before setup = %q, want only notes.txt", got)
+			}
+			for i := 0; i < 2; i++ { // the re-run must not lose the inherited patterns
+				if err := EnsureLocalExcludePatterns(wts[0]); err != nil {
+					t.Fatalf("EnsureLocalExcludePatterns: %v", err)
+				}
+				if got := status(); got != "?? notes.txt" {
+					t.Errorf("after call %d: status = %q, want only notes.txt (inherited ignores must stay in force)", i+1, got)
+				}
+			}
+		})
 	}
 }
 
