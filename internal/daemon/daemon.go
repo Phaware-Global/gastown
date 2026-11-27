@@ -3745,22 +3745,30 @@ func (d *Daemon) runCapReliefCleanup(parent context.Context, rigName string) {
 	d.logger.Printf("Cap-relief cleanup for rig %s finished: %s", rigName, capReliefOutcome(string(out)))
 }
 
-// capReliefOutcomeMaxBytes caps how much of a cleanup's outcome one log entry carries.
-const capReliefOutcomeMaxBytes = 2000
+// capReliefOutcomeTailBytes caps how much of a long cleanup outcome is logged after
+// its Summary line.
+const capReliefOutcomeTailBytes = 1800
 
 // capReliefOutcome extracts what a successful `gt polecat stale --cleanup` did: its
 // "Summary:" line and everything after it (each nuke, skip and failure), without the
 // per-polecat listing above. A cleanup exits 0 even when every nuke is skipped or
-// fails, so without this a rig that never gets relief logs only "finished".
+// fails, so without this a rig that never gets relief logs only "finished". A long
+// outcome keeps the Summary line and the tail, cut at a line start, because the
+// final "Nuked N" tally is printed last.
 func capReliefOutcome(out string) string {
 	out = strings.TrimSpace(out)
-	if i := strings.LastIndex(out, "Summary:"); i >= 0 {
-		out = out[i:]
+	if i := strings.LastIndex(out, "\nSummary:"); i >= 0 {
+		out = out[i+1:]
 	}
-	if len(out) > capReliefOutcomeMaxBytes {
-		out = out[:capReliefOutcomeMaxBytes] + "\n... (truncated)"
+	summary, rest, _ := strings.Cut(out, "\n")
+	if len(rest) <= capReliefOutcomeTailBytes {
+		return out
 	}
-	return out
+	tail := rest[len(rest)-capReliefOutcomeTailBytes:]
+	if i := strings.Index(tail, "\n"); i >= 0 {
+		tail = tail[i+1:]
+	}
+	return fmt.Sprintf("%s\n... (%d bytes elided)\n%s", summary, len(rest)-len(tail), tail)
 }
 
 // resolveRigPolecatCap returns the effective polecat-directory cap for a rig

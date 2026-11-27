@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/polecat"
 )
@@ -169,8 +170,12 @@ func TestCapReliefOutcome(t *testing.T) {
 		t.Errorf("no Summary line: got %q, want the whole output", got)
 	}
 
-	long := "Summary: 9 stale, 0 active\n" + strings.Repeat("Nuking x...\n", 500)
-	if got := capReliefOutcome(long); len(got) > capReliefOutcomeMaxBytes+len("\n... (truncated)") || !strings.HasSuffix(got, "(truncated)") {
-		t.Errorf("long output not truncated: %d bytes", len(got))
+	long := "listing\nSummary: 20 stale, 0 active\n" + strings.Repeat("Nuking x...\n  ✓ deleted worktree\n", 200) + "\n✓ Nuked 20 stale polecat(s).\n"
+	got = capReliefOutcome(long)
+	if !strings.HasPrefix(got, "Summary: 20 stale, 0 active\n... (") || !strings.HasSuffix(got, "✓ Nuked 20 stale polecat(s).") {
+		t.Errorf("long output must keep the Summary line and the final tally, got:\n%s", got)
+	}
+	if len(got) > capReliefOutcomeTailBytes+100 || !utf8.ValidString(got) {
+		t.Errorf("long output: %d bytes, valid UTF-8 = %v", len(got), utf8.ValidString(got))
 	}
 }
