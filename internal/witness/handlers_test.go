@@ -3073,14 +3073,11 @@ func TestHandleZombieRestart_RestartsByDefault(t *testing.T) {
 // done-intent branch of dead-session detection, which restarts directly rather
 // than through handleZombieRestart.
 //
-// Not parallel: overrides a package-level seam.
+// Not parallel: overrides package-level seams.
 func TestDetectZombieDeadSession_DoneIntentNoRestart(t *testing.T) {
 	for _, noRestart := range []bool{true, false} {
 		t.Run(fmt.Sprintf("noRestart=%v", noRestart), func(t *testing.T) {
-			oldRestart := restartPolecatSession
-			restarts := 0
-			restartPolecatSession = func(workDir, rigName, polecatName string) error { restarts++; return nil }
-			t.Cleanup(func() { restartPolecatSession = oldRestart })
+			restarted, _ := stubRestartSeams(t, []*beads.Issue{{ID: "tr-1"}}, nil)
 
 			bd, _ := mockBd(
 				func(args []string) (string, error) { return "[]", nil },
@@ -3105,8 +3102,8 @@ func TestDetectZombieDeadSession_DoneIntentNoRestart(t *testing.T) {
 					t.Errorf("action = %q, want %q", z.Action, want)
 				}
 			}
-			if restarts != wantRestarts {
-				t.Errorf("restartPolecatSession called %d times, want %d", restarts, wantRestarts)
+			if *restarted != wantRestarts {
+				t.Errorf("restartPolecatSession called %d times, want %d", *restarted, wantRestarts)
 			}
 		})
 	}
