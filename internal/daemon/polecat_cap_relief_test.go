@@ -153,3 +153,24 @@ func TestRunCapReliefCleanup_CancelSendsSIGTERM(t *testing.T) {
 		t.Error("gt was not sent SIGTERM on cancel (killed outright instead)")
 	}
 }
+
+// A cleanup exits 0 even when it reclaims nothing, so the log entry must carry what
+// it actually did, minus the per-polecat listing.
+func TestCapReliefOutcome(t *testing.T) {
+	out := "Detecting stale polecats in myrig...\n\n○ alpha (stale)\n    Reason: no active session\n\n" +
+		"Summary: 1 stale, 4 active\n\nCleaning up 1 stale polecat(s)...\nNuking alpha...\n  failed (worktree removal failed: busy)\n"
+	got := capReliefOutcome(out)
+	want := "Summary: 1 stale, 4 active\n\nCleaning up 1 stale polecat(s)...\nNuking alpha...\n  failed (worktree removal failed: busy)"
+	if got != want {
+		t.Errorf("capReliefOutcome = %q, want %q", got, want)
+	}
+
+	if got := capReliefOutcome("No polecats found.\n"); got != "No polecats found." {
+		t.Errorf("no Summary line: got %q, want the whole output", got)
+	}
+
+	long := "Summary: 9 stale, 0 active\n" + strings.Repeat("Nuking x...\n", 500)
+	if got := capReliefOutcome(long); len(got) > capReliefOutcomeMaxBytes+len("\n... (truncated)") || !strings.HasSuffix(got, "(truncated)") {
+		t.Errorf("long output not truncated: %d bytes", len(got))
+	}
+}

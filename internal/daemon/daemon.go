@@ -3742,7 +3742,25 @@ func (d *Daemon) runCapReliefCleanup(parent context.Context, rigName string) {
 		d.logger.Printf("Warning: cap-relief cleanup for rig %s failed: %v\n%s", rigName, err, msg)
 		return
 	}
-	d.logger.Printf("Cap-relief cleanup for rig %s finished", rigName)
+	d.logger.Printf("Cap-relief cleanup for rig %s finished: %s", rigName, capReliefOutcome(string(out)))
+}
+
+// capReliefOutcomeMaxBytes caps how much of a cleanup's outcome one log entry carries.
+const capReliefOutcomeMaxBytes = 2000
+
+// capReliefOutcome extracts what a successful `gt polecat stale --cleanup` did: its
+// "Summary:" line and everything after it (each nuke, skip and failure), without the
+// per-polecat listing above. A cleanup exits 0 even when every nuke is skipped or
+// fails, so without this a rig that never gets relief logs only "finished".
+func capReliefOutcome(out string) string {
+	out = strings.TrimSpace(out)
+	if i := strings.LastIndex(out, "Summary:"); i >= 0 {
+		out = out[i:]
+	}
+	if len(out) > capReliefOutcomeMaxBytes {
+		out = out[:capReliefOutcomeMaxBytes] + "\n... (truncated)"
+	}
+	return out
 }
 
 // resolveRigPolecatCap returns the effective polecat-directory cap for a rig
