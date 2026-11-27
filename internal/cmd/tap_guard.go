@@ -133,6 +133,7 @@ Available guards:
   bd-init            - Block bd init in wrong directories
   mol-patrol         - Block mol patrol from agent contexts
   dangerous-command  - Block rm -rf, force push, hard reset, git clean
+  env-dump           - Block commands that print environment values or secret variables
   memory-write       - Block writes to Claude Code memory paths for worker roles
   interactive-input  - Block synchronous user-input tools (AskUserQuestion, plan mode) for autonomous roles
   command-substitution - Block backtick / $(...) constructs inside text-bearing bd/gt CLI flag arguments

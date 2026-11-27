@@ -1502,6 +1502,11 @@ func DefaultBase() *HooksConfig {
 						Type:    "command",
 						Command: gtCommand("gt tap guard command-substitution"),
 					},
+					// A printed environment puts secrets in the transcript.
+					{
+						Type:    "command",
+						Command: gtCommand("gt tap guard env-dump"),
+					},
 					// Shell redirects write memory files too.
 					{
 						Type:    "command",

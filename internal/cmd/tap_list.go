@@ -78,6 +78,14 @@ func runTapList(cmd *cobra.Command, args []string) error {
 			implemented: true,
 		},
 		{
+			name:        "env-dump",
+			kind:        "guard",
+			description: "Block commands that print environment values or secret variables",
+			event:       "PreToolUse",
+			matchers:    []string{"Bash"},
+			implemented: true,
+		},
+		{
 			name:        "memory-write",
 			kind:        "guard",
 			description: "Block writes to Claude Code memory paths for worker roles",

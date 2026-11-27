@@ -39,6 +39,14 @@ File discovered work as beads (`bd create`) but don't fix it yourself.
 
 ---
 
+## Secrets: never print environment values
+
+Never print environment values; check presence only
+(`test -n "$VAR" && echo set`). List names with `compgen -e`. Command output
+goes into your transcript, and a sed or grep redaction can fail silently.
+
+---
+
 ## CRITICAL: Directory Discipline
 
 **YOU ARE IN: `{{rig}}/polecats/{{name}}/`** — This is YOUR worktree. Stay here.
