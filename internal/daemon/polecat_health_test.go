@@ -319,6 +319,117 @@ func TestCheckStrandedWork_ReportsNewWorkAfterAnEarlierCrash(t *testing.T) {
 	}
 }
 
+// resetMail replaces the fake gt and empties its log. A failing gt still logs
+// the attempt.
+func (f *stuckWorkFixture) resetMail(t *testing.T, delivers bool) {
+	t.Helper()
+	body := `echo "$*" >> ` + f.mailLog + "\n"
+	if !delivers {
+		body += "exit 1\n"
+	}
+	f.setScript(t, "gt", body)
+	if err := os.Remove(f.mailLog); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("removing mail log: %v", err)
+	}
+}
+
+func TestCheckStrandedWork_UndeliveredCrashAlertIsRetried(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.resetMail(t, false)
+
+	f.d.checkStrandedWork()
+
+	if got := f.mail(t); !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("an undelivered crash alert must not mute orphaned work, got attempts %q", got)
+	}
+
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "CRASHED_POLECAT") {
+		t.Errorf("expected exactly 1 CRASHED_POLECAT mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_UndeliveredCrashAlertFallsBackToOrphanedWork(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.resetMail(t, false)
+	f.d.checkStrandedWork()
+
+	// Crash detection now skips the polecat, so it will not retry.
+	f.setAgent(t, "idle", "idle", time.Minute)
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("expected exactly 1 ORPHANED_WORK mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_StaleCrashAlertFallsBackToOrphanedWork(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.d.checkStrandedWork()
+
+	// Crash detection no longer visits the polecat, and its alert has aged out.
+	// A second polecat keeps the rig under crash detection.
+	polecatsDir := filepath.Join(f.d.config.TownRoot, "myr", "polecats")
+	if err := os.Rename(filepath.Join(polecatsDir, "mycat"), filepath.Join(polecatsDir, "other")); err != nil {
+		t.Fatalf("replacing polecat dir: %v", err)
+	}
+	for key := range f.d.workAlerts {
+		f.d.workAlerts[key] = time.Now().Add(-workAlertRepeat - time.Minute)
+	}
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("expected exactly 1 ORPHANED_WORK mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_ForgetsACrashWhenItsWorkLeavesThePolecat(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.d.checkStrandedWork()
+
+	hooked := filepath.Join(f.binDir, "hooked.json")
+	held, err := os.ReadFile(hooked)
+	if err != nil {
+		t.Fatalf("reading hooked work: %v", err)
+	}
+	reassigned := strings.ReplaceAll(string(held), "polecats/mycat", "polecats/other")
+	if err := os.WriteFile(hooked, []byte(reassigned), 0644); err != nil {
+		t.Fatalf("reassigning work: %v", err)
+	}
+	f.d.checkRigPolecatHealth("myr")
+
+	if got := len(f.d.crashedSessions); got != 0 {
+		t.Errorf("expected the crash entry to be cleared, %d remain", got)
+	}
+
+	// The same work comes back to the still-dead polecat.
+	if err := os.WriteFile(hooked, held, 0644); err != nil {
+		t.Fatalf("restoring work: %v", err)
+	}
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "CRASHED_POLECAT") {
+		t.Errorf("expected a new CRASHED_POLECAT mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
 // writeFakeTmuxWithAgent creates a shell script that simulates a live tmux session
 // with an agent process running. has-session succeeds, display-message returns the
 // given paneCommand (e.g., "claude" or "codex") so IsAgentRunning returns true.
