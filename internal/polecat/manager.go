@@ -52,6 +52,11 @@ const (
 	doltStateRetries = 3
 )
 
+// ensureCodegraphIndex starts a detached indexer that outlives its caller and
+// writes into the worktree. It is a variable so tests can replace it: a live
+// indexer recreates .codegraph/ under a t.TempDir that is being removed.
+var ensureCodegraphIndex = rig.EnsureCodegraphIndex
+
 // doltBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
 // Formula: base * 2^(attempt-1) * (1 ± 25% random), capped at doltBackoffMax.
 func doltBackoff(attempt int) time.Duration {
@@ -853,7 +858,7 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		return nil, err
 	}
 
-	if err := rig.EnsureCodegraphIndex(clonePath, townRoot, m.rig.Path); err != nil {
+	if err := ensureCodegraphIndex(clonePath, townRoot, m.rig.Path); err != nil {
 		style.PrintWarning("could not start codegraph indexing: %v", err)
 	}
 
@@ -1083,7 +1088,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 		return nil, err
 	}
 
-	if err := rig.EnsureCodegraphIndex(clonePath, townRoot, m.rig.Path); err != nil {
+	if err := ensureCodegraphIndex(clonePath, townRoot, m.rig.Path); err != nil {
 		style.PrintWarning("could not start codegraph indexing: %v", err)
 	}
 
@@ -2124,7 +2129,7 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		style.PrintWarning("could not update local git excludes: %v", err)
 	}
 
-	if err := rig.EnsureCodegraphIndex(newClonePath, m.townRoot, m.rig.Path); err != nil {
+	if err := ensureCodegraphIndex(newClonePath, m.townRoot, m.rig.Path); err != nil {
 		style.PrintWarning("could not start codegraph indexing: %v", err)
 	}
 

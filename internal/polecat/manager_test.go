@@ -1394,13 +1394,6 @@ func TestReuseIdlePolecat_ResumeBranchHardSyncsAwayStaleContent(t *testing.T) {
 		t.Fatalf("checkout mayorRig back to main: %v", err)
 	}
 
-	// A background codegraph watcher on the dev machine touches
-	// .codegraph/.gitignore in any git repo it notices, including this
-	// test's tmp worktree — an environmental artifact, not real dirtiness.
-	// Clear it so the reuse-safety gate below sees exactly what the test
-	// intends: a clean, pushed worktree.
-	_ = os.RemoveAll(filepath.Join(polecat.ClonePath, ".codegraph"))
-
 	reused, err := mgr.ReuseIdlePolecat("toast", AddOptions{ResumeBranch: prBranch, HookBead: "gt-166"})
 	if err != nil {
 		t.Fatalf("ReuseIdlePolecat: %v", err)
@@ -3756,6 +3749,25 @@ func TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo(t *testing.T)
 	out, runErr := exec.Command("sh", "-c", risk.RecoveryCommand()).CombinedOutput()
 	if runErr != nil || !strings.Contains(string(out), "stranded bare-repo work") {
 		t.Fatalf("recovery command %q must list the stranded commit: %v\n%s", risk.RecoveryCommand(), runErr, out)
+	}
+}
+
+func TestAddWithOptions_IndexesTheNewWorktree(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	var indexed []string
+	prev := ensureCodegraphIndex
+	ensureCodegraphIndex = func(worktreePath, _, _ string) error {
+		indexed = append(indexed, worktreePath)
+		return nil
+	}
+	t.Cleanup(func() { ensureCodegraphIndex = prev })
+
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if len(indexed) != 1 || indexed[0] != p.ClonePath {
+		t.Errorf("indexed = %q, want only %q", indexed, p.ClonePath)
 	}
 }
 
