@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,21 +15,8 @@ import (
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/wisp"
 )
-
-// writeFakeTestTmux creates a shell script in dir named "tmux" that simulates
-// "session not found" for has-session calls and fails on anything else.
-func writeFakeTestTmux(t *testing.T, dir string) {
-	t.Helper()
-	script := "#!/bin/sh\n" +
-		"case \"$*\" in\n" +
-		"  *has-session*) echo \"can't find session\" >&2; exit 1;;\n" +
-		"  *) echo 'unexpected tmux command' >&2; exit 1;;\n" +
-		"esac\n"
-	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0755); err != nil {
-		t.Fatalf("writing fake tmux: %v", err)
-	}
-}
 
 // writeFakeTestBD creates a shell script in dir named "bd" that outputs a
 // polecat agent bead JSON. The descState parameter controls what appears in
@@ -52,9 +40,8 @@ func writeFakeTestBD(t *testing.T, dir, descState, dbState, hookBead, updatedAt 
 }
 
 // writeFakeBDWithHookBead creates a shell script in dir named "bd" that returns
-// different JSON based on the bead ID: the agent bead in one state, and the hook
-// bead (work bead) in a separate state. Used to test cases where the agent and hook
-// beads have independent lifecycles (e.g., agent done/nuked while hook_bead open).
+// different JSON based on the bead ID: an agent bead carrying a legacy hook_bead,
+// and the bead that slot points to. "list" finds no work.
 func writeFakeBDWithHookBead(t *testing.T, dir, agentState, hookBeadID, hookBeadStatus, updatedAt string) string {
 	t.Helper()
 	agentJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","issue_type":"agent","labels":["gt:agent"],"description":"agent_state: %s","hook_bead":"%s","agent_state":"%s","updated_at":"%s"}]`,
@@ -74,310 +61,372 @@ func writeFakeBDWithHookBead(t *testing.T, dir, agentState, hookBeadID, hookBead
 	return bdPath
 }
 
-// TestCheckPolecatHealth_SkipsSpawning verifies that checkPolecatHealth does NOT
-// attempt to restart a polecat in agent_state=spawning when recently updated.
-// This is the regression test for the double-spawn bug (issue #1752): the daemon
-// heartbeat fires during the window between bead creation (hook_bead set atomically
-// by gt sling) and the actual tmux session launch, causing a second Claude process.
-func TestCheckPolecatHealth_SkipsSpawning(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
+// newCrashFixture is a rig with one polecat, mycat, whose work exists only on the
+// work bead.
+func newCrashFixture(t *testing.T, sessionAlive bool, list, show []map[string]string) *stuckWorkFixture {
+	t.Helper()
+	f := newStuckWorkFixture(t, sessionAlive, list, show)
+	dir := filepath.Join(f.d.config.TownRoot, "myr", "polecats", "mycat")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("creating polecat dir: %v", err)
 	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	// Use a recent timestamp so the spawning guard's time-bound is satisfied
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "spawning", "spawning", "gt-xyz", recentTime)
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "spawning") {
-		t.Errorf("expected log to mention 'spawning', got: %q", got)
-	}
-	if strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("spawning polecat must not trigger CRASH DETECTED, got: %q", got)
-	}
+	return f
 }
 
-// TestCheckPolecatHealth_DetectsCrashedPolecat verifies that checkPolecatHealth
-// does detect a crash for a polecat in agent_state=working with a dead session.
-// This ensures the spawning guard in issue #1752 does not accidentally suppress
-// legitimate crash detection for polecats that were running normally.
-func TestCheckPolecatHealth_DetectsCrashedPolecat(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "working", "working", "gt-xyz", recentTime)
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("expected CRASH DETECTED for working polecat with dead session, got: %q", got)
-	}
-}
-
-// TestCheckPolecatHealth_SpawningGuardExpires verifies that the spawning guard
-// has a time-bound: polecats stuck in agent_state=spawning for more than 5 minutes
-// are treated as crashed (gt sling may have failed during spawn).
-func TestCheckPolecatHealth_SpawningGuardExpires(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	// Use a timestamp >5 minutes ago to expire the spawning guard
-	oldTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "spawning", "spawning", "gt-xyz", oldTime)
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "Spawning guard expired") {
-		t.Errorf("expected spawning guard to expire for old timestamp, got: %q", got)
-	}
-	if !strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("expected CRASH DETECTED after spawning guard expires, got: %q", got)
-	}
-}
-
-// TestCheckPolecatHealth_DescriptionStateOverridesLegacyDBColumn verifies that
-// daemon lifecycle reads the description's agent_state first. bd >= 0.62.0 no
-// longer has a supported structured agent_state writer, so the description is
-// Gastown's active contract and the DB column is legacy fallback only.
-func TestCheckPolecatHealth_DescriptionStateOverridesLegacyDBColumn(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	// Description says "spawning" (current Gastown contract) while the legacy
-	// structured column still says "working".
-	bdPath := writeFakeTestBD(t, binDir, "spawning", "working", "gt-xyz", recentTime)
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "spawning") {
-		t.Errorf("expected log to mention description-backed spawning state, got: %q", got)
-	}
-	if strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("daemon should honor description state 'spawning' and skip crash detection, got: %q", got)
-	}
-}
-
-// TestCheckPolecatHealth_SkipsClosedHookBead verifies that checkPolecatHealth
-// does NOT fire CRASHED_POLECAT when the hook_bead is already closed.
-// This is the regression test for the false-positive spam bug (issue hq-1o7):
-// when a polecat completes work normally, the hook_bead gets closed but the
-// stale reference remains on the agent bead, causing repeated false alerts.
-func TestCheckPolecatHealth_SkipsClosedHookBead(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeBDWithHookBead(t, binDir, "working", "fe-xyz", "closed", recentTime)
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "hook_bead fe-xyz is already closed") {
-		t.Errorf("expected log about closed hook_bead, got: %q", got)
-	}
-	if strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("closed hook_bead must not trigger CRASH DETECTED, got: %q", got)
-	}
-}
-
-// TestCheckPolecatHealth_NotifiesWitnessOnCrash verifies that when a polecat
-// crash is detected, the daemon sends a notification to the witness via
-// `gt mail send` with a CRASHED_POLECAT subject. Restart is deferred to the
-// stuck-agent-dog plugin for context-aware recovery.
-func TestCheckPolecatHealth_NotifiesWitnessOnCrash(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "working", "working", "gt-xyz", recentTime)
-
-	// Create a fake gt script that logs invocations to a file
-	gtLog := filepath.Join(t.TempDir(), "gt-invocations.log")
-	fakeGt := filepath.Join(binDir, "gt")
-	gtScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n", gtLog)
-	if err := os.WriteFile(fakeGt, []byte(gtScript), 0755); err != nil {
-		t.Fatalf("writing fake gt: %v", err)
-	}
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	townRoot := t.TempDir()
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-		gtPath: fakeGt,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "CRASH DETECTED") {
-		t.Fatalf("expected CRASH DETECTED, got: %q", got)
-	}
-
-	// Verify gt mail send was called with CRASHED_POLECAT subject
-	logData, err := os.ReadFile(gtLog)
+// setAgent replaces the polecat's agent bead.
+func (f *stuckWorkFixture) setAgent(t *testing.T, descState, dbState string, age time.Duration) {
+	t.Helper()
+	data, err := json.Marshal([]map[string]any{{
+		"id": "gt-myr-polecat-mycat", "issue_type": "task", "labels": []string{"gt:agent"},
+		"description": "agent_state: " + descState, "agent_state": dbState, "updated_at": ago(age),
+	}})
 	if err != nil {
-		t.Fatalf("reading gt invocation log: %v", err)
+		t.Fatalf("marshaling agent bead: %v", err)
 	}
-	invocations := string(logData)
-	if !strings.Contains(invocations, "mail send") {
-		t.Errorf("expected gt mail send invocation, got: %q", invocations)
-	}
-	if !strings.Contains(invocations, "CRASHED_POLECAT") {
-		t.Errorf("expected CRASHED_POLECAT in mail subject, got: %q", invocations)
-	}
-	if !strings.Contains(invocations, "myr/witness") {
-		t.Errorf("expected witness address myr/witness, got: %q", invocations)
+	if err := os.WriteFile(filepath.Join(f.binDir, "agent.json"), data, 0644); err != nil {
+		t.Fatalf("writing agent bead: %v", err)
 	}
 }
 
-// TestCheckPolecatHealth_SkipsDonePolecat verifies that checkPolecatHealth does
-// NOT fire CRASH DETECTED when a polecat has agent_state=done (completed normally)
-// even if its hook_bead is still open. This is the race-window regression test for
-// bug #2795 part 2: between gt done setting agent_state=done and the hook_bead
-// being closed, the daemon heartbeat fires on the dead session + open hook_bead
-// combination, causing repeated false CRASHED_POLECAT alerts to the witness.
-func TestCheckPolecatHealth_SkipsDonePolecat(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeBDWithHookBead(t, binDir, "done", "gt-xyz", "open", recentTime)
-
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-	}
-
-	d.checkPolecatHealth("myr", "mycat")
-
-	got := logBuf.String()
-	if !strings.Contains(got, "Skipping crash detection") {
-		t.Errorf("expected skip log message, got: %q", got)
-	}
-	if !strings.Contains(got, "agent_state=done") {
-		t.Errorf("expected agent_state=done in skip log, got: %q", got)
-	}
-	if strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("done polecat with open hook_bead must not trigger CRASH DETECTED, got: %q", got)
+func (f *stuckWorkFixture) setScript(t *testing.T, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.binDir, name), []byte("#!/bin/sh\n"+body), 0755); err != nil {
+		t.Fatalf("writing fake %s: %v", name, err)
 	}
 }
 
-// TestCheckPolecatHealth_SkipsNukedPolecat verifies that checkPolecatHealth does
-// NOT fire CRASH DETECTED when a polecat has been nuked (agent_state=nuked) even
-// if its hook_bead (work bead) is still open. This is the regression test for
-// bug #2795: `gt polecat nuke --force` sets agent_state=nuked on the agent bead
-// but leaves the work bead open, causing repeated false RECOVERY_NEEDED alerts
-// on every heartbeat cycle.
-func TestCheckPolecatHealth_SkipsNukedPolecat(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses Unix shell script mocks for tmux and bd")
-	}
-	binDir := t.TempDir()
-	writeFakeTestTmux(t, binDir)
-	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeBDWithHookBead(t, binDir, "nuked", "gt-xyz", "open", recentTime)
+func TestCheckRigPolecatHealth_ReportsCrashFromWorkBead(t *testing.T) {
+	for _, status := range []string{"hooked", "in_progress"} {
+		t.Run(status, func(t *testing.T) {
+			bead := workBead(status, "myr/polecats/mycat", time.Hour)
+			f := newCrashFixture(t, false, bead, bead)
 
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+			f.d.checkRigPolecatHealth("myr")
 
-	var logBuf strings.Builder
-	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+			if !strings.Contains(f.logs.String(), "CRASH DETECTED") {
+				t.Errorf("expected CRASH DETECTED, got log: %s", f.logs)
+			}
+			got := f.mail(t)
+			for _, want := range []string{"mail send myr/witness", "CRASHED_POLECAT", "gt-work1"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("expected mail containing %q, got %q", want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckRigPolecatHealth_Quiet(t *testing.T) {
+	held := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	cases := map[string]struct {
+		alive, parked bool
+		agentState    string
+		list, show    []map[string]string
+	}{
+		"live session":   {alive: true, list: held, show: held},
+		"no hooked work": {},
+		"closed since":   {list: held, show: workBead("closed", "myr/polecats/mycat", time.Hour)},
+		"reassigned":     {list: held, show: workBead("hooked", "myr/polecats/other", time.Hour)},
+		"done":           {agentState: "done", list: held, show: held},
+		"nuked":          {agentState: "nuked", list: held, show: held},
+		"idle":           {agentState: "idle", list: held, show: held},
+		"stuck":          {agentState: "stuck", list: held, show: held},
+		"spawning":       {agentState: "spawning", list: held, show: held},
+		"parked rig":     {parked: true, list: held, show: held},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newCrashFixture(t, tc.alive, tc.list, tc.show)
+			if tc.agentState != "" {
+				f.setAgent(t, tc.agentState, tc.agentState, time.Minute)
+			}
+			if tc.parked {
+				if err := wisp.NewConfig(f.d.config.TownRoot, "myr").Set("status", "parked"); err != nil {
+					t.Fatalf("parking rig: %v", err)
+				}
+			}
+
+			f.d.checkRigPolecatHealth("myr")
+
+			if got := f.mail(t); got != "" {
+				t.Errorf("expected no mail, got %q", got)
+			}
+			if strings.Contains(f.logs.String(), "CRASH DETECTED") {
+				t.Errorf("expected no crash, got log: %s", f.logs)
+			}
+		})
+	}
+}
+
+// A gt sling that died mid-spawn leaves agent_state=spawning behind; the guard
+// against double-spawning (issue #1752) is therefore time-bound.
+func TestCheckRigPolecatHealth_SpawningGuardExpires(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.setAgent(t, "spawning", "spawning", 10*time.Minute)
+
+	f.d.checkRigPolecatHealth("myr")
+
+	for _, want := range []string{"Spawning guard expired", "CRASH DETECTED"} {
+		if !strings.Contains(f.logs.String(), want) {
+			t.Errorf("expected %q in log, got: %s", want, f.logs)
+		}
+	}
+}
+
+// The description's agent_state is the active contract; the DB column is a
+// legacy fallback.
+func TestCheckRigPolecatHealth_DescriptionStateOverridesLegacyDBColumn(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.setAgent(t, "spawning", "working", time.Minute)
+
+	f.d.checkRigPolecatHealth("myr")
+
+	if got := f.mail(t); got != "" {
+		t.Errorf("expected no mail, got %q", got)
+	}
+	if !strings.Contains(f.logs.String(), "agent_state=spawning") {
+		t.Errorf("expected spawning skip, got log: %s", f.logs)
+	}
+}
+
+func TestCheckRigPolecatHealth_ReportsEachCrashOnce(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+
+	f.d.checkRigPolecatHealth("myr")
+	f.d.checkRigPolecatHealth("myr")
+
+	if got := strings.Count(f.mail(t), "mail send"); got != 1 {
+		t.Errorf("expected 1 mail across two heartbeats, got %d", got)
+	}
+	if got := len(f.d.recentDeaths); got != 1 {
+		t.Errorf("expected 1 recorded death, got %d", got)
 	}
 
-	d.checkPolecatHealth("myr", "mycat")
+	// The session recovers and dies again.
+	dead, err := os.ReadFile(filepath.Join(f.binDir, "tmux"))
+	if err != nil {
+		t.Fatalf("reading fake tmux: %v", err)
+	}
+	f.setScript(t, "tmux", "exit 0\n")
+	f.d.checkRigPolecatHealth("myr")
+	f.setScript(t, "tmux", strings.TrimPrefix(string(dead), "#!/bin/sh\n"))
+	f.d.checkRigPolecatHealth("myr")
 
-	got := logBuf.String()
-	if !strings.Contains(got, "Skipping crash detection") {
-		t.Errorf("expected skip log message, got: %q", got)
+	if got := strings.Count(f.mail(t), "mail send"); got != 2 {
+		t.Errorf("expected a second mail for the second crash, got %d", got)
 	}
-	if !strings.Contains(got, "agent_state=nuked") {
-		t.Errorf("expected agent_state=nuked in skip log, got: %q", got)
+}
+
+func TestCheckRigPolecatHealth_RetriesFailedMailWithoutRecordingAnotherDeath(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.setScript(t, "gt", `echo "$*" >> `+f.mailLog+"\nexit 1\n")
+
+	f.d.checkRigPolecatHealth("myr")
+	f.d.checkRigPolecatHealth("myr")
+
+	if got := strings.Count(f.mail(t), "mail send"); got != 2 {
+		t.Errorf("expected the failed mail to be retried, got %d attempts", got)
 	}
-	if strings.Contains(got, "CRASH DETECTED") {
-		t.Errorf("nuked polecat must not trigger CRASH DETECTED, got: %q", got)
+	if got := len(f.d.recentDeaths); got != 1 {
+		t.Errorf("expected 1 recorded death, got %d", got)
+	}
+}
+
+// useStrandedWorkCheck prepares the fixture for the whole heartbeat step, which
+// finds its rigs in mayor/rigs.json.
+func (f *stuckWorkFixture) useStrandedWorkCheck(t *testing.T) {
+	t.Helper()
+	mayorDir := filepath.Join(f.d.config.TownRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatalf("creating mayor dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{"myr":{}}}`), 0644); err != nil {
+		t.Fatalf("writing rigs.json: %v", err)
+	}
+	f.d.ctx = context.Background()
+	f.d.rigPool = newRigWorkerPool(1, time.Minute, f.d.logger)
+}
+
+func TestCheckStrandedWork_OneMailForADeadPolecat(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	two := append(workBead("hooked", "myr/polecats/mycat", time.Hour), map[string]string{
+		"id": "gt-work2", "status": "in_progress", "assignee": "myr/polecats/mycat", "updated_at": ago(2 * time.Hour),
+	})
+	for name, list := range map[string][]map[string]string{"one bead": bead, "two beads": two} {
+		t.Run(name, func(t *testing.T) {
+			f := newCrashFixture(t, false, list, bead)
+			f.useStrandedWorkCheck(t)
+
+			f.d.checkStrandedWork()
+
+			if got := f.mail(t); strings.Count(got, "mail send") != 1 {
+				t.Fatalf("expected 1 mail in one heartbeat, got %q (log: %s)", got, f.logs)
+			}
+			if got := f.mail(t); !strings.Contains(got, "CRASHED_POLECAT") {
+				t.Errorf("expected the mail to come from crash detection, got %q", got)
+			}
+
+			f.d.checkStrandedWork()
+
+			if got := f.mail(t); strings.Count(got, "mail send") != 1 {
+				t.Errorf("expected no further mail on the next heartbeat, got %q", got)
+			}
+		})
+	}
+}
+
+func TestCheckStrandedWork_OrphanedWorkCoversWhatCrashDetectionSkips(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.setAgent(t, "idle", "idle", time.Minute)
+
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("expected 1 ORPHANED_WORK mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_ReportsNewWorkAfterAnEarlierCrash(t *testing.T) {
+	first := workBead("hooked", "myr/polecats/mycat", 2*time.Hour)
+	f := newCrashFixture(t, false, first, first)
+	f.useStrandedWorkCheck(t)
+	f.d.checkStrandedWork()
+
+	// Newer work lands on the dead polecat, which crash detection now skips.
+	second, err := json.Marshal([]map[string]string{{
+		"id": "gt-work2", "status": "hooked", "assignee": "myr/polecats/mycat", "updated_at": ago(time.Hour),
+	}})
+	if err != nil {
+		t.Fatalf("marshaling work bead: %v", err)
+	}
+	for _, name := range []string{"hooked.json", "show.json"} {
+		if err := os.WriteFile(filepath.Join(f.binDir, name), second, 0644); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+	}
+	f.setAgent(t, "idle", "idle", time.Minute)
+	f.d.checkStrandedWork()
+
+	if got := f.mail(t); !strings.Contains(got, "ORPHANED_WORK") || !strings.Contains(got, "gt-work2") {
+		t.Errorf("expected ORPHANED_WORK naming gt-work2, got %q (log: %s)", got, f.logs)
+	}
+}
+
+// resetMail replaces the fake gt and empties its log. A failing gt still logs
+// the attempt.
+func (f *stuckWorkFixture) resetMail(t *testing.T, delivers bool) {
+	t.Helper()
+	body := `echo "$*" >> ` + f.mailLog + "\n"
+	if !delivers {
+		body += "exit 1\n"
+	}
+	f.setScript(t, "gt", body)
+	if err := os.Remove(f.mailLog); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("removing mail log: %v", err)
+	}
+}
+
+func TestCheckStrandedWork_UndeliveredCrashAlertIsRetried(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.resetMail(t, false)
+
+	f.d.checkStrandedWork()
+
+	if got := f.mail(t); !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("an undelivered crash alert must not mute orphaned work, got attempts %q", got)
+	}
+
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "CRASHED_POLECAT") {
+		t.Errorf("expected exactly 1 CRASHED_POLECAT mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_UndeliveredCrashAlertFallsBackToOrphanedWork(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.resetMail(t, false)
+	f.d.checkStrandedWork()
+
+	// Crash detection now skips the polecat, so it will not retry.
+	f.setAgent(t, "idle", "idle", time.Minute)
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("expected exactly 1 ORPHANED_WORK mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_StaleCrashAlertFallsBackToOrphanedWork(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.d.checkStrandedWork()
+
+	// Crash detection no longer visits the polecat, and its alert has aged out.
+	// A second polecat keeps the rig under crash detection.
+	polecatsDir := filepath.Join(f.d.config.TownRoot, "myr", "polecats")
+	if err := os.Rename(filepath.Join(polecatsDir, "mycat"), filepath.Join(polecatsDir, "other")); err != nil {
+		t.Fatalf("replacing polecat dir: %v", err)
+	}
+	for key := range f.d.workAlerts {
+		f.d.workAlerts[key] = time.Now().Add(-workAlertRepeat - time.Minute)
+	}
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("expected exactly 1 ORPHANED_WORK mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_ForgetsACrashWhenItsWorkLeavesThePolecat(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.d.checkStrandedWork()
+
+	hooked := filepath.Join(f.binDir, "hooked.json")
+	held, err := os.ReadFile(hooked)
+	if err != nil {
+		t.Fatalf("reading hooked work: %v", err)
+	}
+	reassigned := strings.ReplaceAll(string(held), "polecats/mycat", "polecats/other")
+	if err := os.WriteFile(hooked, []byte(reassigned), 0644); err != nil {
+		t.Fatalf("reassigning work: %v", err)
+	}
+	f.d.checkRigPolecatHealth("myr")
+
+	if got := len(f.d.crashedSessions); got != 0 {
+		t.Errorf("expected the crash entry to be cleared, %d remain", got)
+	}
+
+	// The same work comes back to the still-dead polecat.
+	if err := os.WriteFile(hooked, held, 0644); err != nil {
+		t.Fatalf("restoring work: %v", err)
+	}
+	f.resetMail(t, true)
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "CRASHED_POLECAT") {
+		t.Errorf("expected a new CRASHED_POLECAT mail, got %q (log: %s)", got, f.logs)
 	}
 }
 
@@ -624,5 +673,53 @@ func TestReapIdlePolecat_ReapsIdleNoHook(t *testing.T) {
 	}
 	if !strings.Contains(got, "working-no-hook") {
 		t.Errorf("expected working-no-hook reason, got: %q", got)
+	}
+}
+
+// A legacy hook_bead left on an agent bead says nothing about current work.
+func TestReapIdlePolecat_IgnoresLegacyHookBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	old := session.DefaultRegistry()
+	reg := session.NewPrefixRegistry()
+	reg.Register("myr", "myr")
+	session.SetDefaultRegistry(reg)
+	defer session.SetDefaultRegistry(old)
+
+	binDir := t.TempDir()
+	writeFakeTmuxIdleSession(t, binDir)
+	bdPath := writeFakeBDWithHookBead(t, binDir, "working", "gt-xyz", "open", ago(time.Hour))
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	t.Chdir(townRoot)
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmuxWithSocket(""),
+		bdPath: bdPath,
+	}
+
+	hbPath := filepath.Join(townRoot, ".runtime", "heartbeats", "myr-mycat.json")
+	if err := os.MkdirAll(filepath.Dir(hbPath), 0755); err != nil {
+		t.Fatalf("creating heartbeat dir: %v", err)
+	}
+	data, err := json.Marshal(polecat.SessionHeartbeat{
+		Timestamp: time.Now().UTC().Add(-20 * time.Minute),
+		State:     polecat.HeartbeatWorking,
+	})
+	if err != nil {
+		t.Fatalf("marshaling heartbeat: %v", err)
+	}
+	if err := os.WriteFile(hbPath, data, 0644); err != nil {
+		t.Fatalf("writing heartbeat: %v", err)
+	}
+
+	d.reapIdlePolecat("myr", "mycat", 15*time.Minute, 0)
+
+	if !strings.Contains(logBuf.String(), "working-no-hook") {
+		t.Errorf("expected polecat with no assigned work to be reaped, got: %q", logBuf.String())
 	}
 }

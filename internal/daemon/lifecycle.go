@@ -806,7 +806,6 @@ type AgentBeadInfo struct {
 	ID         string `json:"id"`
 	Type       string `json:"issue_type"`
 	State      string // From description agent_state, fallback to legacy DB column
-	HookBead   string // From DB column (hook_bead)
 	RoleType   string // Parsed from description: role_type
 	Rig        string // Parsed from description: rig
 	LastUpdate string `json:"updated_at"`
@@ -852,7 +851,6 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 		Labels      []string `json:"labels"`
 		Description string   `json:"description"`
 		UpdatedAt   string   `json:"updated_at"`
-		HookBead    string   `json:"hook_bead"`   // Read from database column
 		AgentState  string   `json:"agent_state"` // Read from database column
 	}
 
@@ -884,10 +882,6 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	}
 
 	info.State = beads.ResolveAgentState(issue.Description, issue.AgentState)
-
-	// Use HookBead from database column directly (not from description)
-	// The description may contain stale data - the slot is the source of truth.
-	info.HookBead = issue.HookBead
 
 	return info, nil
 }
@@ -1044,6 +1038,17 @@ func (d *Daemon) listPolecatWork(rigName string) (map[string][]polecatWork, erro
 	return work, nil
 }
 
+// latestWork returns the most recently updated of a non-empty list.
+func latestWork(items []polecatWork) polecatWork {
+	latest := items[0]
+	for _, w := range items[1:] {
+		if w.updated().After(latest.updated()) {
+			latest = w
+		}
+	}
+	return latest
+}
+
 // stillOnHook re-reads a work bead, so that work closed or reassigned since the
 // listing is not reported. A failed read reports false.
 func (d *Daemon) stillOnHook(w polecatWork) bool {
@@ -1073,13 +1078,18 @@ func (d *Daemon) polecatNuked(rigName, polecatName string) bool {
 // alertWitnessOnce calls send unless the same alert was delivered within
 // workAlertRepeat. A failed send is retried on the next heartbeat.
 func (d *Daemon) alertWitnessOnce(key string, send func() error) {
-	if time.Since(d.workAlerts[key]) < workAlertRepeat {
+	d.alertsMu.Lock()
+	sent := d.workAlerts[key]
+	d.alertsMu.Unlock()
+	if time.Since(sent) < workAlertRepeat {
 		return
 	}
 	if err := send(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness (%s): %v", key, err)
 		return
 	}
+	d.alertsMu.Lock()
+	defer d.alertsMu.Unlock()
 	if d.workAlerts == nil {
 		d.workAlerts = make(map[string]time.Time)
 	}
@@ -1108,12 +1118,7 @@ func (d *Daemon) checkRigGUPPViolations(rigName string) {
 	}
 
 	for polecatName, items := range work {
-		latest := items[0]
-		for _, w := range items[1:] {
-			if w.updated().After(latest.updated()) {
-				latest = w
-			}
-		}
+		latest := latestWork(items)
 		progress := latest.updated()
 		if progress.IsZero() {
 			continue
@@ -1176,7 +1181,8 @@ func (d *Daemon) checkOrphanedWork() {
 }
 
 // checkRigOrphanedWork reports hooked work whose polecat session is dead.
-// Liveness comes from tmux, not agent_state.
+// Liveness comes from tmux, not agent_state. A polecat whose latest work has a
+// recently delivered crash alert is skipped.
 func (d *Daemon) checkRigOrphanedWork(rigName string) {
 	work, err := d.listPolecatWork(rigName)
 	if err != nil {
@@ -1187,6 +1193,9 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {
 	for polecatName, items := range work {
 		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 		if d.tmux.IsAgentAlive(sessionName) || d.polecatNuked(rigName, polecatName) {
+			continue
+		}
+		if d.crashReported(latestWork(items)) {
 			continue
 		}
 

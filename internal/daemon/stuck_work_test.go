@@ -17,6 +17,7 @@ import (
 
 type stuckWorkFixture struct {
 	d       *Daemon
+	binDir  string
 	logs    *strings.Builder
 	mailLog string
 }
@@ -31,6 +32,9 @@ func newStuckWorkFixture(t *testing.T, sessionAlive bool, list, show []map[strin
 	}
 	binDir := t.TempDir()
 	townRoot := t.TempDir()
+	// The event log is found from the working directory; keep test events out of
+	// any enclosing town.
+	t.Chdir(townRoot)
 
 	writeScript := func(name, body string) string {
 		path := filepath.Join(binDir, name)
@@ -91,6 +95,7 @@ esac
 
 	logs := &strings.Builder{}
 	return &stuckWorkFixture{
+		binDir: binDir,
 		d: &Daemon{
 			config: &Config{TownRoot: townRoot},
 			logger: log.New(logs, "", 0),
