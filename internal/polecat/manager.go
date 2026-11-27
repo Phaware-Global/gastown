@@ -3578,7 +3578,7 @@ func (m *Manager) probeLocalStaleness(name, clonePath, defaultBranch string) *St
 	polecatGit := git.NewGit(clonePath)
 	info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
 
-	// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
+	// Check for uncommitted work (excluding runtime artifacts Gas Town writes itself)
 	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(clonePath)
 	return info
 }
@@ -3625,9 +3625,12 @@ func worktreeMissing(clonePath string) bool {
 	return errors.Is(err, fs.ErrNotExist)
 }
 
-// probeUncommittedWork reports whether the worktree at clonePath has uncommitted work
-// (excluding .beads/ files). A failed git probe is returned as probeErr rather than
-// read as a clean tree.
+// probeUncommittedWork reports whether the worktree at clonePath has uncommitted work:
+// changed or untracked files other than runtime artifacts, a stash, or unpushed
+// commits. Runtime artifacts (.beads/, .runtime/, .claude/, CLAUDE.local.md, ...) are
+// written into every polecat worktree by Gas Town itself; counting them left every
+// polecat of a repo that does not ignore them permanently "dirty" and unreclaimable.
+// A failed git probe is returned as probeErr rather than read as a clean tree.
 func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	if worktreeMissing(clonePath) {
 		return false, ""
@@ -3636,7 +3639,7 @@ func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	if err != nil {
 		return false, fmt.Sprintf("checking uncommitted work: %v", err)
 	}
-	return !status.CleanExcludingBeads(), ""
+	return !status.CleanExcludingRuntime() || status.StashCount > 0 || status.UnpushedCommits > 0, ""
 }
 
 // ErrNoLongerStale means a polecat chosen for cleanup was re-dispatched (or stopped

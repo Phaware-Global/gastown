@@ -109,6 +109,38 @@ func TestProbeUncommittedWork_RealRepo(t *testing.T) {
 	}
 }
 
+// Gas Town writes these into every polecat worktree. In a repo that does not ignore
+// them they are untracked forever, so counting them as work made every polecat of the
+// rig unreclaimable and left the rig pinned at its directory cap.
+func TestProbeUncommittedWork_IgnoresRuntimeArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	for _, f := range []string{".beads/x.jsonl", ".runtime/state.json", ".claude/commands/done.md", "CLAUDE.local.md"} {
+		path := filepath.Join(dir, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if has, probeErr := probeUncommittedWork(dir); has || probeErr != "" {
+		t.Fatalf("runtime artifacts only = (%v, %q), want (false, \"\")", has, probeErr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if has, probeErr := probeUncommittedWork(dir); !has || probeErr != "" {
+		t.Fatalf("runtime artifacts plus a real file = (%v, %q), want (true, \"\")", has, probeErr)
+	}
+}
+
 // A present but unreadable repository still fails closed.
 func TestProbeUncommittedWork_BrokenRepoFailsClosed(t *testing.T) {
 	dir := t.TempDir()

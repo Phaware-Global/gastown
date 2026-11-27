@@ -3706,7 +3706,7 @@ const capReliefStopGrace = 60 * time.Second
 
 // runCapReliefCleanup reaps via `gt polecat stale --cleanup`. It reaps only polecats
 // assessStaleness deems stale: session-less AND not paused (protected agent states)
-// AND with no uncommitted or unpushed work (CleanExcludingBeads counts unpushed
+// AND with no uncommitted or unpushed work (probeUncommittedWork counts unpushed
 // commits), and nukePolecatFull does a best-effort push and preserves the remote
 // branch for the refinery. So no unpushed work is lost; a fully-pushed idle polecat
 // is reclaimed even if it has an open MR (the MR branch survives on the remote).
