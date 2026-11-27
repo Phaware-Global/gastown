@@ -4,8 +4,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
 // A failed probe means staleness is unknown. Treating it as "clean tree, no agent
@@ -113,5 +117,78 @@ func TestProbeUncommittedWork_BrokenRepoFailsClosed(t *testing.T) {
 	}
 	if _, probeErr := probeUncommittedWork(dir); probeErr == "" {
 		t.Fatal("a .git dir that git cannot read must report a probe error")
+	}
+}
+
+// A polecat with uncommitted work is never stale, whatever its beads say, so the
+// scan must not spend bd calls on it. The daemon rescans a rig stuck at its
+// directory cap on every heartbeat, and such polecats are most of that rig.
+func TestDetectStalePolecats_SkipsBeadLookupsWhenGitRulesOutStaleness(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a sh mock bd")
+	}
+	binDir := t.TempDir()
+	bdLog := filepath.Join(binDir, "bd.log")
+	script := `#!/bin/sh
+echo "$*" >> "` + bdLog + `"
+for arg in "$@"; do
+  case "$arg" in
+    show) printf '[{"id":"x","title":"agent","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle"}]\n'; exit 0 ;;
+  esac
+done
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	rigPath := filepath.Join(t.TempDir(), "testrig")
+	for _, name := range []string{"clean", "dirty"} {
+		dir := filepath.Join(rigPath, "polecats", name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"init", "-q"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"}} {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, "polecats", "dirty", "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewManager(&rig.Rig{Name: "testrig", Path: rigPath}, git.NewGit(rigPath), nil)
+	if err := os.WriteFile(bdLog, nil, 0o644); err != nil { // drop any calls made by setup
+		t.Fatal(err)
+	}
+	infos, err := mgr.DetectStalePolecats(20)
+	if err != nil {
+		t.Fatalf("DetectStalePolecats: %v", err)
+	}
+	if len(infos) != 2 {
+		t.Fatalf("got %d infos, want 2", len(infos))
+	}
+	clean, dirty := infos[0], infos[1]
+
+	if dirty.IsStale || !dirty.HasUncommittedWork || !dirty.BeadsUnchecked {
+		t.Errorf("dirty = %+v, want not stale, uncommitted work, beads unchecked", dirty)
+	}
+	if !clean.IsStale || clean.BeadsUnchecked || clean.AgentState != "idle" {
+		t.Errorf("clean = %+v, want stale with agent state read from its bead", clean)
+	}
+
+	logged, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logged), "dirty") {
+		t.Errorf("bd was called for the dirty polecat:\n%s", logged)
+	}
+	if !strings.Contains(string(logged), "clean") {
+		t.Errorf("bd was not called for the clean polecat:\n%s", logged)
 	}
 }

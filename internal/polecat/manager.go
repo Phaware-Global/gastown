@@ -2641,9 +2641,8 @@ func (m *Manager) PoolStatus() (active int, names []string) {
 	return m.namePool.ActiveCount(), m.namePool.ActiveNames()
 }
 
-// List returns all polecats in the rig.
-// Loads polecat state in parallel to avoid sequential bd subprocess overhead.
-func (m *Manager) List() ([]*Polecat, error) {
+// polecatDirNames returns the names of the rig's polecat directories.
+func (m *Manager) polecatDirNames() ([]string, error) {
 	polecatsDir := filepath.Join(m.rig.Path, "polecats")
 
 	entries, err := os.ReadDir(polecatsDir)
@@ -2654,7 +2653,6 @@ func (m *Manager) List() ([]*Polecat, error) {
 		return nil, fmt.Errorf("reading polecats dir: %w", err)
 	}
 
-	// Filter to valid directories first
 	var names []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -2664,6 +2662,16 @@ func (m *Manager) List() ([]*Polecat, error) {
 			continue
 		}
 		names = append(names, entry.Name())
+	}
+	return names, nil
+}
+
+// List returns all polecats in the rig.
+// Loads polecat state in parallel to avoid sequential bd subprocess overhead.
+func (m *Manager) List() ([]*Polecat, error) {
+	names, err := m.polecatDirNames()
+	if err != nil {
+		return nil, err
 	}
 
 	// Load all polecats in parallel — each loadFromBeads call involves
@@ -3463,6 +3471,7 @@ type StalenessInfo struct {
 	HasUncommittedWork bool   // Whether there's uncommitted or unpushed work
 	AgentState         string // From agent bead (empty if no bead)
 	HookedIssue        string // Issue assigned to the polecat when assessed (empty if none)
+	BeadsUnchecked     bool   // tmux/git already ruled out staleness, so AgentState and HookedIssue were not looked up
 	ProbeError         string // A probe (git status, agent bead) failed; staleness is unknown, never stale
 	IsStale            bool   // Overall assessment: safe to clean up
 	Reason             string // Why it's considered stale (or not)
@@ -3476,12 +3485,12 @@ type StalenessInfo struct {
 //
 // threshold: minimum commits behind main to consider "way behind" (e.g., 20)
 func (m *Manager) DetectStalePolecats(threshold int) ([]*StalenessInfo, error) {
-	polecats, err := m.List()
+	names, err := m.polecatDirNames()
 	if err != nil {
 		return nil, fmt.Errorf("listing polecats: %w", err)
 	}
 
-	if len(polecats) == 0 {
+	if len(names) == 0 {
 		return nil, nil
 	}
 
@@ -3491,52 +3500,93 @@ func (m *Manager) DetectStalePolecats(threshold int) ([]*StalenessInfo, error) {
 		defaultBranch = rigCfg.DefaultBranch
 	}
 
-	// Each polecat costs a tmux probe, two git invocations and an agent-bead lookup
-	// (~3s together), and they are independent, so probe them concurrently. Serial
-	// detection took minutes on a rig near its directory cap, longer than the
-	// daemon's cap-relief reaper was willing to wait. Results keep List() order.
-	results := make([]*StalenessInfo, len(polecats))
+	// Each polecat costs a tmux probe, two git invocations and, for those the local
+	// probes leave as candidates, bead lookups (~3s together), and they are
+	// independent, so probe them concurrently. Serial detection took minutes on a rig
+	// near its directory cap, longer than the daemon's cap-relief reaper was willing
+	// to wait. Results keep directory order.
+	results := make([]*StalenessInfo, len(names))
 	sem := make(chan struct{}, staleDetectConcurrency)
 	var wg sync.WaitGroup
-	for i, p := range polecats {
+	for i, name := range names {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(i int, p *Polecat) {
+		go func(i int, name string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			results[i] = m.assessPolecat(p, defaultBranch, threshold)
-		}(i, p)
+			results[i] = m.detectStale(name, defaultBranch, threshold)
+		}(i, name)
 	}
 	wg.Wait()
 
-	return results, nil
+	infos := make([]*StalenessInfo, 0, len(results))
+	for _, info := range results {
+		if info != nil {
+			infos = append(infos, info)
+		}
+	}
+	return infos, nil
 }
 
 // staleDetectConcurrency bounds how many polecats DetectStalePolecats probes at once.
 const staleDetectConcurrency = 8
 
+// detectStale assesses one polecat directory for DetectStalePolecats. The tmux and
+// git probes run first: when they already rule staleness out (live session,
+// uncommitted work, failed git probe) the bead lookups are skipped, since loading a
+// polecat's bead state costs around ten bd calls and cannot change that verdict. A
+// rig stuck at its directory cap is scanned on every daemon heartbeat, and most of
+// its polecats are ruled out this way. Returns nil if the polecat vanished mid-scan.
+func (m *Manager) detectStale(name, defaultBranch string, threshold int) *StalenessInfo {
+	info := m.probeLocalStaleness(name, m.clonePath(name), defaultBranch)
+	if info.ProbeError != "" || info.HasUncommittedWork || info.HasActiveSession {
+		info.BeadsUnchecked = true
+		info.IsStale, info.Reason = assessStaleness(info, threshold)
+		return info
+	}
+	p, err := m.Get(name)
+	if err != nil {
+		return nil
+	}
+	info.HookedIssue = p.Issue
+	m.probeAgentState(info)
+	info.IsStale, info.Reason = assessStaleness(info, threshold)
+	return info
+}
+
 // assessPolecat gathers the staleness signals for one polecat and assesses them.
 func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int) *StalenessInfo {
-	info := &StalenessInfo{
-		Name:        p.Name,
-		HookedIssue: p.Issue,
-	}
+	info := m.probeLocalStaleness(p.Name, p.ClonePath, defaultBranch)
+	info.HookedIssue = p.Issue
+	m.probeAgentState(info)
+
+	// Determine staleness
+	info.IsStale, info.Reason = assessStaleness(info, threshold)
+	return info
+}
+
+// probeLocalStaleness gathers the staleness signals that need no bead lookup.
+func (m *Manager) probeLocalStaleness(name, clonePath, defaultBranch string) *StalenessInfo {
+	info := &StalenessInfo{Name: name}
 
 	// Check for active tmux session
 	// Session name follows pattern: gt-<rig>-<polecat>
-	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), p.Name)
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
 	info.HasActiveSession = checkTmuxSession(sessionName)
 
 	// Check how far behind main
-	polecatGit := git.NewGit(p.ClonePath)
+	polecatGit := git.NewGit(clonePath)
 	info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
 
 	// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
-	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(p.ClonePath)
+	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(clonePath)
+	return info
+}
 
-	// Check agent bead state. A missing bead comes back as (nil, nil, nil); any
-	// error is a failed probe, not an absent bead.
-	agentID := m.agentBeadID(p.Name)
+// probeAgentState fills info.AgentState from the polecat's agent bead. A missing
+// bead comes back as (nil, nil, nil); any error is a failed probe, not an absent bead.
+func (m *Manager) probeAgentState(info *StalenessInfo) {
+	agentID := m.agentBeadID(info.Name)
 	_, fields, err := m.agentBeads().GetAgentBead(agentID)
 	if err != nil {
 		if info.ProbeError == "" {
@@ -3545,10 +3595,6 @@ func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int)
 	} else if fields != nil {
 		info.AgentState = fields.AgentState
 	}
-
-	// Determine staleness
-	info.IsStale, info.Reason = assessStaleness(info, threshold)
-	return info
 }
 
 // worktreeMissing reports whether clonePath has no usable git worktree: the dir is

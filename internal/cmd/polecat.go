@@ -2120,7 +2120,9 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 		}
 
 		// Agent state
-		if info.AgentState != "" {
+		if info.BeadsUnchecked {
+			fmt.Printf("    Agent state: %s\n", style.Dim.Render("not checked"))
+		} else if info.AgentState != "" {
 			fmt.Printf("    Agent state: %s\n", info.AgentState)
 		} else {
 			fmt.Printf("    Agent state: %s\n", style.Dim.Render("no bead"))
