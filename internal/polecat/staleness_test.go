@@ -50,6 +50,8 @@ func TestApplyRedispatchCheck(t *testing.T) {
 		p         Polecat
 		wantStale bool
 	}{
+		// A crashed session with its issue still hooked is the witness's to restart.
+		{"stalled with work still hooked", "working", "working", Polecat{State: StateStalled, Issue: "gt-x"}, false},
 		{"reused, hook not yet landed", "idle", "spawning", Polecat{State: StateIdle}, false},
 		{"became working since detection", "idle", "working", Polecat{State: StateIdle}, false},
 		{"hooked to a different issue", "idle", "idle", Polecat{State: StateIdle, Issue: "gt-new"}, false},
@@ -67,7 +69,11 @@ func TestApplyRedispatchCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			info := &StalenessInfo{Name: "p1", AgentState: tt.agent, IsStale: true, Reason: "stale"}
-			applyRedispatchCheck(info, &tt.p, &StalenessInfo{Name: "p1", AgentState: tt.prevAgent})
+			prev := &StalenessInfo{Name: "p1", AgentState: tt.prevAgent}
+			if tt.p.State == StateStalled {
+				prev.HookedIssue = tt.p.Issue // same issue as at detection
+			}
+			applyRedispatchCheck(info, &tt.p, prev)
 			if info.IsStale != tt.wantStale {
 				t.Errorf("IsStale = %v, want %v (reason %q)", info.IsStale, tt.wantStale, info.Reason)
 			}

@@ -3730,17 +3730,21 @@ func (m *Manager) reassessLocked(prev *StalenessInfo, threshold int) (*Staleness
 // but the hook bead that moves p.State/p.Issue lands later, outside it, so the agent
 // state is the only signal a completed reuse leaves in that gap.
 //
-// An active agent state counts as that signal only if it is "spawning" or differs
-// from the state seen at detection. A session that died without updating its bead
-// leaves agent_state=working behind for good; it read "working" at detection too,
-// and the polecat still has no session, so nothing has re-dispatched it. Treating
-// that leftover as a reuse made every such polecat permanently unreclaimable.
+// An active agent state counts as that signal only if it is "spawning", differs
+// from the state seen at detection, or the polecat still has work hooked. A session
+// that died without updating its bead leaves agent_state=working behind for good; it
+// read "working" at detection too, and the polecat still has no session, so nothing
+// has re-dispatched it. Treating that leftover as a reuse made every such polecat
+// permanently unreclaimable. With an issue still hooked, though, the polecat is a
+// stalled worker the witness will restart, and nuking it would burn that issue's
+// molecule, so it stays protected.
 func applyRedispatchCheck(info *StalenessInfo, p *Polecat, prev *StalenessInfo) {
 	if !info.IsStale {
 		return
 	}
 	state := beads.AgentState(info.AgentState)
-	reused := state == beads.AgentStateSpawning || (state.IsActive() && info.AgentState != prev.AgentState)
+	reused := state == beads.AgentStateSpawning ||
+		(state.IsActive() && (info.AgentState != prev.AgentState || p.Issue != ""))
 	if p.State == StateWorking || p.Issue != prev.HookedIssue || reused {
 		info.IsStale = false
 		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q, agent_state=%q, was %q)", p.State, p.Issue, prev.HookedIssue, info.AgentState, prev.AgentState)
