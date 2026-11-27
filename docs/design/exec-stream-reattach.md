@@ -56,7 +56,12 @@ to the agent's process group (`exec.go:622-627`) and `SIGKILL` after
    comment states the reason for cancelling: "rather than leave an orphaned
    agent pinning the session with no reattach path".
 3. Liveness prober: every `execProbeInterval`, 30s, it writes a zero-length
-   stdout frame; a failed write cancels (`exec.go:455-473`).
+   stdout frame; a failed write cancels (`exec.go:455-473`). A write proves
+   little: on a half-open TCP connection (partition or peer host crash, no FIN
+   or RST) a few bytes go into the kernel send buffer and the write succeeds.
+   The listener sets no keepalive options of its own
+   (`cmd/gt-worker-client/main.go`), so detection of such a peer is left to
+   the platform's TCP timers and can take minutes.
 
 After cancellation `waitReleasing` reaps the agent, and if the pump has exited
 and the agent is still not reaped after `ptyWaitGrace` (15s) it closes the pty
@@ -91,9 +96,12 @@ exits 1 on any stream error or EOF before an exit frame (`:236-245`). It
 forwards `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` to the agent as signal
 frames, and for the three terminating ones exits 143 after 10s if the agent has
 not ended the stream (`:187-210`, `:267`). `KillSessionWithProcesses` sends the
-pane process `SIGTERM` (`internal/tmux/tmux.go:714-716`), so an intentional
-session kill reaches the agent twice: as a forwarded signal and as a dropped
-stream.
+pane process `SIGTERM` and `SIGKILL` 2s later
+(`internal/tmux/tmux.go:714-716`), so an intentional session kill reaches the
+agent twice: as one forwarded `SIGTERM`, which an agent may ignore, and as a
+dropped stream. The drop is what enforces the kill: it cancels the exec, which
+escalates to `SIGKILL`. `SessionManager.Stop` and `gt polecat nuke`
+(`internal/cmd/polecat.go:1893`) depend on that.
 
 **Orchestrator recovery.** `SessionManager.Start` provisions before it creates
 the pane (`internal/polecat/session_manager.go:535-567`). `provisionOnce`
@@ -138,8 +146,9 @@ a worktree from the checkpoint ref: bring-up resumes from the
 work ref only. Core §9.4's "reset its worktree to the checkpoint ref" is not
 implemented for this provider.
 
-**Worker restart.** `New` loads `sessions.json` and marks every entry orphaned
-(`service.go:1139-1153`). On `SIGTERM`, `Serve` runs `shutdownAll`
+**Worker restart.** `New` calls `loadPersisted` (`service.go:187`), which reads
+`sessions.json` and marks every entry orphaned (`service.go:1139-1153`). On
+`SIGTERM`, `Serve` runs `shutdownAll`
 (`service.go:203-205`, `:1048-1066`), which stops each supervisor; attached
 agents end because their connection contexts descend from the cancelled serve
 context. Socket spec §7 says sessions are re-adopted and container agents keep
@@ -197,14 +206,35 @@ today's coupling in which a stalled launcher stalls the agent for up to
 
 A **stream** belongs to a connection. It copies ring contents to frames from a
 cursor, forwards stdin, resize and signal frames to the exec, and runs the
-liveness probe. Any stream fault (write error, read error, failed probe) ends
-the stream only. The exec moves to `detached` and records the time.
+liveness check (§3.2). Any stream fault (write error, read error, liveness
+timeout) ends the stream only, and the exec moves to `detached`.
 
 Exec states: `attached`, `detached`, `exited` (exit code held, not yet
 delivered). `session.execCancel` becomes a pointer to the exec. The session's
-`ready` state is unchanged; `SessionSummary` gains optional fields `exec`
-(`attached` | `detached` | `exited`), `exec_started_at` and `detached_at`, so
-`discover` and `sessions.json` show what the incident could not.
+`ready` state is unchanged. The session records one timestamp, `idle_since`:
+set when the session becomes `ready` and whenever its last stream ends (the
+exec detaches, or exits with no stream attached), cleared while a stream is
+attached. It is not reset when a detached exec is later dropped, so it always
+means "no launcher since". `SessionSummary` gains optional fields `exec`
+(`attached` | `detached` | `exited`), `exec_started_at` and `idle_since`, so
+`discover` and `sessions.json` show what the incident could not. Every timer
+in §4, on the worker and in the daemon, reads `idle_since`.
+
+**Stopping the exec is the supervisor's `StopWork`.** Every session stop ends
+in the supervisor's shutdown, which calls `StopWork` and then takes the final
+checkpoint (`supervisor.go:162-190`). Native mode wires no `StopWork` today
+(`service.go:779-781`), and `orphanSession` runs only after `Run` has returned
+(`service.go:790-803`), which is after that flush. So the hook is wired in both
+modes and does three things in order: fence the session against new attaches
+(a new flag tested beside `tearingDown` at `exec.go:227-230`; not that flag
+itself, which `orphanSession` reads as "teardown owns the cleanup",
+`service.go:1026-1029`), cancel the exec, and wait until
+the agent is reaped (bounded by `execWaitDelay` plus `ptyWaitGrace`); container
+mode then runs the existing `workEnv.StopWork`. Dead-man, `max_runtime`, the
+idle stop (§4), `shutdown`, `teardown` and `shutdownAll` all reach the agent
+this way, so each final checkpoint captures a tree nobody is writing, and the
+flush may skip its debounce because the stop is proven
+(`supervisor.go:175-184`). `orphanSession` itself does not touch the exec.
 
 The ring holds the most recent 1 MiB of output per session by default
 (`-exec-buffer`), as `(stream, bytes)` chunks so the pipe mode keeps stdout and
@@ -234,19 +264,35 @@ tolerate. The feature is negotiated the way `agent_files` was: a capability.
 - `attach_ack` gains `exec_id` (128-bit random, minted by the worker when the
   agent starts), `resumed` (bool), `offset` (the offset of the first byte this
   stream will send) and `truncated` (bytes between the requested offset and
-  `offset` that the ring no longer holds).
-- `attach` gains `resume` (an `exec_id`) and `offset` (bytes the launcher has
-  already written to its terminal).
+  `offset` that the ring no longer holds; never negative).
+- `attach` gains `resume` (an `exec_id`), `offset` (bytes the launcher has
+  already written to its terminal) and `echo` (the launcher answers pings).
+- Two frame types: `ping` (6, worker → launcher) and `pong` (7, launcher →
+  worker), both with empty payloads. The worker sends `ping` only on a stream
+  whose attach set `echo`.
 
-No new frame type. Both readers already ignore unknown frame types and JSON
-decoding ignores unknown fields, so old peers are unaffected.
+Both frame readers already ignore unknown types (`attach.go:257-259`,
+`exec.go:444-446`) and JSON decoding ignores unknown fields, so old peers are
+unaffected.
+
+**Liveness is round-trip evidence.** A successful write is not evidence
+(§1.2). On an `echo` stream the worker sends `ping` every 10s and the launcher
+answers `pong` at once. Each side records the arrival time of the last inbound
+frame of any type and declares the stream dead after 30s without one; a read
+or write error ends it sooner. The launcher applies the same rule to frames
+from the worker, which is how it notices a silent partition and starts
+redialling instead of sitting on a dead socket. Detection is therefore
+bounded at about 30s on both sides, independent of TCP timers. After a clean
+inbound EOF (a half-close, which stops pongs by design) and on streams without
+`echo` (old launchers) the worker keeps today's write probe and its weaker
+guarantee.
 
 How the worker treats an attach to a session:
 
 | Attach | Exec state | Result |
 |---|---|---|
 | no `resume` | none | start the agent (today) |
-| no `resume` | `attached` | probe the existing stream at once with a 5s write deadline; if it answers, refuse with 125 (today); if not, treat as `detached` |
+| no `resume` | `attached` | `echo` stream: send a `ping` now; an inbound frame within 5s means the stream is alive, refuse with 125 (today); none means it is dead, end it and continue as `detached`. Stream without `echo`: write probe, refuse with 125 unless the write fails (today) |
 | no `resume` | `detached` | **replace**: cancel the old agent with the normal grace, then start the new one |
 | no `resume` | `exited` | log and drop the undelivered code, start the agent |
 | `resume` matches | `attached` | supersede: close the old connection, continue on this one |
@@ -257,9 +303,13 @@ How the worker treats an attach to a session:
 A `resume` attach ignores `argv` and `env`; nothing is executed. "Replace" is
 what an old launcher gets, and its end state equals today's (old agent ended,
 new one in the same worktree). Supersession is safe because only the launcher
-that received the `exec_id` can present it, and it covers the common race in
-which the launcher reconnects before the worker has noticed the old socket is
-dead.
+that received the `exec_id` can present it, and it does not depend on the
+worker having noticed that the old socket is dead.
+
+An `offset` greater than the exec's produced-byte counter cannot come from a
+correct launcher. The worker clamps it to the counter, reports `truncated: 0`,
+logs a warning and forces a repaint (below); it does not fail the resume,
+because the agent is healthy and only the launcher's count is wrong.
 
 **Old worker, new launcher.** An old worker would decode a `resume` attach as a
 fresh one and start a second agent from the original argv. The launcher
@@ -293,7 +343,8 @@ reads, so the pane sees the code once. Exit codes remain diagnostic (socket §5)
 ### 3.3 Who re-attaches
 
 **Recommendation: the launcher.** `gt worker-attach` wraps dial → attach →
-pump in a loop. On a stream fault, if the worker advertised `exec_resume` and
+pump in a loop. On a stream fault (an error, or 30s without an inbound frame,
+§3.2), if the worker advertised `exec_resume` and
 an `exec_id` is known, it keeps the terminal in raw mode, prints a one-line
 status, and redials with backoff (1s doubling to 30s) for up to
 `--reattach-window` (default 10 min). It exits when it reads an exit frame,
@@ -327,9 +378,28 @@ optional phase (§7, §8 Q1).
 
 **Launcher signals.** `SIGHUP` is what a launcher receives when its pane or the
 tmux server goes away. With `exec_resume` it no longer forwards `SIGHUP`; it
-closes the stream and exits, and the exec detaches. `SIGTERM` and `SIGQUIT`
-are still forwarded, so `KillSessionWithProcesses` and `SessionManager.Stop`
-keep ending the agent as they do now. `SIGINT` is unchanged.
+closes the stream and exits, and the exec detaches. `SIGINT` is unchanged.
+
+`SIGTERM` and `SIGQUIT` are still forwarded, but forwarding alone would be
+weaker than today. The kill that `Stop` and `gt polecat nuke` rely on is
+enforced by the dropped stream (§1.2), and under this design a drop only
+detaches: an agent that ignores `SIGTERM` would keep running, with its
+identity and relay live, until the detach timeout. So a forwarded `SIGTERM` or
+`SIGQUIT` also **arms a kill on the worker**: the exec is marked `terminating`
+and, unless the agent has exited, its process group gets `SIGKILL` after
+`execWaitDelay` (in container mode the container's processes are terminated,
+§4). Nothing disarms it: not a detach, not a resume. The bound is 10s from the
+signal frame, tighter than today's (launcher grace, then the drop, then
+`execWaitDelay`).
+
+The armed kill needs the signal frame to arrive. If the launcher is killed
+before it writes the frame, or the path is already partitioned, the agent
+detaches and lives until the detach timeout. Paths that destroy a polecat
+therefore must not rely on signals at all: `gt polecat nuke` and polecat
+removal call `Backend.Teardown` for a remote rig (phase 3; today the worker
+session, its identity and its relay outlive a nuke). `Stop`, which keeps the
+session for a restart, stays signal-based until a session-scoped stop message
+exists (phase 4).
 
 ### 3.4 Security
 
@@ -364,36 +434,43 @@ separate two orchestrators that share a worker. It is not proposed here (§8 Q5)
 
 ## 4. Reclamation
 
-Three timers on the worker, all flags with defaults:
+Two timers on the worker and one in the launcher, all flags with defaults. The
+worker's both count from `idle_since` (§3.1):
 
 - **Detach timeout** (`-detach-timeout`, default 15 min; 0 restores
-  cancel-on-drop and withdraws the capability). An exec detached this long is
-  cancelled: `SIGTERM` to the group, `SIGKILL` after `execWaitDelay`. In
-  container mode cancelling ends only the `docker exec` client
-  (`exec.go:595-598`), so the worker also terminates the container's processes
-  the way the failed-pty path does (`exec.go:279-281`). An `exited` exec is
-  dropped at the same age. The session stays `ready`.
+  cancel-on-drop and withdraws the capability). A detached exec is cancelled
+  when `idle_since` is this old: `SIGTERM` to the group, `SIGKILL` after
+  `execWaitDelay`. In container mode cancelling ends only the `docker exec`
+  client (`exec.go:595-598`), so the worker also terminates the container's
+  processes the way the failed-pty path does (`exec.go:279-281`). An `exited`
+  exec is dropped at the same age. The session stays `ready`.
 - **Idle-session timeout** (`-idle-session-timeout`, default 30 min). A `ready`
-  session with no exec for this long is stopped through the supervisor with a
-  new stop reason, so the final checkpoint flush runs
-  (`supervisor.go:162-190`), and then follows the existing orphan path: relay
-  closed, identity removed, worktree kept, slot freed
+  session whose `idle_since` is this old is stopped through the supervisor
+  with a new stop reason. `StopWork` ends any exec first (§3.1), the final
+  checkpoint flush runs, and the session follows the existing orphan path:
+  relay closed, identity removed, worktree kept, slot freed
   (`service.go:1014-1044`). This is the rule that would have released the
   three sessions in §1.1.
 - **Launcher window** (§3.3, default 10 min), shorter than the detach timeout
   so that a launcher giving up leaves time for a replace or adopt to find the
   agent alive.
 
-The default detach timeout sits below the dead-man window at the default
-checkpoint interval (4 × 5 min), so in a full partition the agent is stopped
-before the session is orphaned.
+`idle_since` starts when the worker *notices* the drop: at once for a closed
+connection, within about 30s for an `echo` stream, and possibly much later for
+an old launcher behind a half-open connection (§3.2). No ordering between
+these timers and the watchdog is relied on. The dead-man switch fires 15 to 20
+minutes after control-plane contact is lost at the default checkpoint interval
+(`supervisor.go:120-130`), which can be before or after the detach timeout;
+either way the agent is stopped before the final checkpoint, because that is
+`StopWork`'s job and not the timer's.
 
-**Paths that must end the exec.** Teardown and shutdown already cancel it
-before touching the worktree (`service.go:856-861`, `:937-939`). Two paths rely
-on the connection today and need an explicit cancel once the exec is
-session-owned: `orphanSession`, which in native mode has no `StopWork`
-(`service.go:779-781`) and does not cancel the exec, and `shutdownAll`, which
-must stop agents before the final flush, as `handleShutdown` does.
+**Session stops.** Every stop of a session goes through `StopWork` (§3.1);
+the detach timeout, a replace and the armed kill (§3.3) end the exec directly
+and leave the session running.
+`handleShutdown` and `teardownSession` cancel the exec themselves today
+(`service.go:856-861`, `:937-939`) and keep their fence; `shutdownAll` and the
+watchdog stops gain the same behaviour through the hook instead of relying on
+the connection.
 
 **Slot accounting.** A session with a detached exec is a session: it counts
 against `MaxSessions` on the worker (`service.go:454`) and in the orchestrator's
@@ -407,12 +484,31 @@ opening.
 the exec, flushes and removes the session whatever the exec state. The idle
 reaper is unchanged for live panes. A remote polecat's heartbeat is touched by
 its proxied `gt` calls (`internal/proxy/exec.go:283-287`), independent of the
-exec stream, so a detached agent that is working does not look idle. New: a
-daemon sweep that calls `Discover` per remote rig and tears down sessions
-whose polecat has no tmux session and whose `detached_at` (or `ready` age with
-no exec) exceeds the idle-session timeout. That is the reaper sweep core §5
-describes; the worker-side timer is the backstop when the orchestrator is the
-thing that is gone.
+exec stream, so a detached agent that is working does not look idle.
+
+New in phase 3: a daemon sweep that calls `Discover` per remote rig and tears
+down a session when its polecat has no tmux session and it is either orphaned
+or has an `idle_since` older than the idle-session timeout. It never uses the
+session's age. That is the reaper sweep core §5 describes; the worker-side
+timer is the backstop when the orchestrator is the thing that is gone.
+
+Both the sweep and the worker's idle timer can race `Start`, which provisions
+first and creates the pane afterwards (`session_manager.go:535-572`); on the
+early-return path `Provision` tells the worker nothing
+(`backend.go:209-215`). Two additions close the gap:
+
+- **`touch`.** On the early-return path `Provision` sends a `touch` for the
+  session (a new control message, sent only to `exec_resume` workers). The
+  worker resets `idle_since` to now, so the pane has a full idle timeout to
+  attach. If the worker answers `no_session`, the session was reclaimed between
+  the handshake and the touch, and `Provision` continues into `session_open`
+  instead of returning an endpoint that no longer exists.
+- **Conditional teardown.** The sweep's `teardown` carries the `idle_since` it
+  observed. The worker refuses with `busy` when a stream is attached or
+  `idle_since` has changed. The sweep also re-checks for the tmux session
+  immediately before sending.
+
+`Teardown` from every other caller stays unconditional.
 
 **Staged worker binary.** `ApplyPendingWorkerClient` applies only when
 `len(s.sessions) == 0` (`push.go:324-346`). That stays: any session, attached
@@ -425,16 +521,18 @@ idle-session timeout the wait is bounded, and the orphan transition should call
 
 | # | Fault | Worker | Orchestrator | Outcome |
 |---|---|---|---|---|
-| 1 | Launcher killed (`SIGKILL`), or pane killed (`SIGHUP`) | Stream ends; exec `detached`, agent keeps running | Pane gone; crash path asks for a restart if work is hooked | New pane **replaces** the agent (or adopts, phase 4). No restart within the detach timeout: agent stopped; later the session is orphaned |
-| 2 | Network partition; the worker notices first | Probe or output write fails within `frameWriteTimeout`; `detached` | Launcher read fails or times out; redials with backoff | Resume with replay when the path returns inside the window |
-| 3 | Network partition; the launcher notices first | Old stream still looks attached until a probe fails | Launcher redials and presents `exec_id` | Supersede: worker closes the stale connection and continues on the new one |
-| 4 | Partition longer than the launcher window | `detached`; detach timeout cancels the agent; dead-man window orphans the session after a final local checkpoint | Launcher exits 75; pane dies; crash path | Restart goes through bring-up; pushed work is resumed from the work ref |
-| 5 | Orchestrator reboot | As 1 | Launchers get `SIGHUP` and/or `SIGTERM` in no fixed order; a forwarded `SIGTERM` ends the agent as today | Detached agents are replaced on restart, or reclaimed by timers. Best effort (§8 Q2) |
+| 1 | Launcher killed (`SIGKILL`), or pane killed (`SIGHUP`) | Connection closes; exec `detached`, agent keeps running | Pane gone; crash path asks for a restart if work is hooked | New pane **replaces** the agent (or adopts, phase 4). No restart within the detach timeout: agent stopped; later the session is orphaned |
+| 1a | Intentional kill (`Stop`, nuke): launcher gets `SIGTERM`, then `SIGKILL` 2s later | Signal frame arms the kill: agent gone within `execWaitDelay` even if it ignores `SIGTERM` and the stream drops. Frame never arrived: as 1 | Nuke also calls `Teardown` (phase 3) | Agent ended within 10s of the frame; without the frame, by `Teardown` or the detach timeout |
+| 2 | Network partition, no FIN or RST | `echo` stream: no inbound frame for 30s, `detached`. Writes may keep succeeding and prove nothing | No inbound frame for 30s; closes the socket and redials with backoff | Resume with replay when the path returns inside the window |
+| 3 | Launcher reconnects before the worker has declared the old stream dead | Old stream still `attached` | Launcher presents `exec_id` | Supersede: worker closes the stale connection and continues on the new one |
+| 4 | Partition longer than the launcher window | `detached`; the detach timeout or the dead-man switch, whichever is first, stops the agent; the dead-man stop takes a final local checkpoint after `StopWork` and orphans the session | Launcher exits 75; pane dies; crash path | Restart goes through bring-up; pushed work is resumed from the work ref |
+| 5 | Orchestrator reboot | As 1 | Launchers get `SIGHUP` and/or `SIGTERM` in no fixed order; a forwarded `SIGTERM` arms the kill and ends the agent | Detached agents are replaced on restart, or reclaimed by timers. Best effort (§8 Q2) |
 | 6 | Worker restart or crash | All agents die with the process; sessions load as orphaned | Launcher's resume gets `no_exec`/`no_session`, or the dial fails for the whole window; exits 75 | Unchanged from today: bring-up again. Out of scope (§5.1) |
 | 7 | Agent exits while detached | Exec `exited`; code and ring kept until delivered or the detach timeout | Launcher resumes, receives remaining output and the exit frame, exits with the code | Pane sees the real exit code once |
-| 8 | Two attaches race | Decided under the session lock: same `exec_id` supersedes; no `resume` against a live stream is refused 125; two fresh attaches, one starts the agent and the other is refused | The refused launcher exits 125 | One agent per session, as today |
+| 8 | Two attaches race | Decided under the session lock: same `exec_id` supersedes; no `resume` against a stream that answers the ping is refused 125, against one that does not it replaces; two fresh attaches, one starts the agent and the other is refused | The refused launcher exits 125 | One agent per session, as today |
 | 9 | Ring overflow while detached | Oldest bytes dropped; counter keeps advancing | Ack reports `truncated`; launcher prints the notice; forced repaint | Screen recovers; lost scrollback is reported |
 | 10 | Launcher attached but too slow | Its cursor falls out of the ring; worker closes that stream | Launcher resumes | Becomes case 9; the agent never blocked |
+| 11 | Old launcher (no `echo`) behind a half-open connection | Write probe keeps succeeding; exec stays `attached` until TCP gives up; a fresh attach meanwhile is refused 125, as today | Old launcher exits on its own read error or never notices | No worse than today for old launchers; the watchdog still stops the agent before its final checkpoint. Upgrading the launcher removes the case |
 
 ### 5.1 Worker restart
 
@@ -475,10 +573,10 @@ worker only when it is idle.
 
 | Phase | Change | Rough size | Tests |
 |---|---|---|---|
-| 1 | Worker: session-owned exec, ring buffer, `detached`/`exited` states, replace-on-fresh-attach, detach timeout (default 0 in this phase, so behaviour is unchanged until phase 2), explicit exec cancel in `orphanSession` and `shutdownAll`, container kill on cancel, summary fields | ~600 lines + tests in `internal/workerclient` | Unit: ring wrap and offsets; agent survives a closed connection and keeps producing; output never blocks with no reader; detach timeout cancels; replace ends the old agent before starting the new; teardown, shutdown and orphan each end a detached exec; existing exec and pty tests unchanged with timeout 0 |
-| 2 | Protocol and launcher: capability, `exec_id`/`offset`/`truncated`, resume and supersede, exit-code retention, launcher retry loop, stdin buffer, `SIGHUP` detaches | ~450 lines in `sockproto`, `socket`, `workerattach`, `workerclient` | Unit: every row of the §3.2 table; byte-exact replay across a cut at arbitrary offsets; exit while detached delivered once; `no_exec` never starts an agent. Launcher: retries only with the capability, backoff, window expiry exits 75, terminal restored on every exit. Compat: new launcher against a capability-less fake worker |
-| 3 | Reclamation: idle-session timeout with flush, orphan triggers `applyPendingIfIdle`, orchestrator gate ignores orphans and reaps its own, daemon sweep for sessions without a pane, detach timeout default 15 min | ~400 lines in `workerclient`, `socket`, `daemon` | Unit: idle session is flushed then orphaned and the slot is free; staged binary applies after reclamation; gate arithmetic with orphans; sweep tears down only sessions with no tmux session past the timeout |
-| 4 (optional) | Adoption by a new pane: `adopt` on attach, `Start` skips beacon and nudges when adopting, forced repaint; explicit stop on intentional kill paths, then stop forwarding `SIGTERM` | ~500 lines, mostly `internal/polecat` | Start-sequence tests with a detached exec present; end-to-end on a real worker |
+| 1 | Worker: session-owned exec, ring buffer, `detached`/`exited` states, replace-on-fresh-attach, `idle_since`, detach timeout (default 0 in this phase, so behaviour is unchanged until phase 2), `StopWork` wired in both modes to fence, cancel and reap the exec, container kill on cancel, summary fields | ~600 lines + tests in `internal/workerclient` | Unit: ring wrap and offsets; agent survives a closed connection and keeps producing; output never blocks with no reader; detach timeout cancels; replace ends the old agent before starting the new; teardown, shutdown, `shutdownAll`, dead-man and `max_runtime` each reap a detached native agent before the final checkpoint is taken, and refuse an attach during the flush; existing exec and pty tests unchanged with timeout 0 |
+| 2 | Protocol and launcher: capability, `exec_id`/`offset`/`truncated`, `ping`/`pong` liveness on both sides, resume and supersede, exit-code retention, launcher retry loop, stdin buffer, `SIGHUP` detaches, armed kill on forwarded `SIGTERM`/`SIGQUIT` | ~550 lines in `sockproto`, `socket`, `workerattach`, `workerclient` | Unit: every row of the §3.2 table; byte-exact replay across a cut at arbitrary offsets; exit while detached delivered once; `no_exec` never starts an agent; an offset beyond the counter is clamped; a peer that stops answering pings while its writes still succeed (a fake connection that accepts and discards) is declared dead in 30s, and a fresh attach then replaces instead of getting 125; a `SIGTERM`-ignoring agent is killed `execWaitDelay` after the signal frame whether the stream then stays, drops or resumes. Launcher: redials after 30s of silence; retries only with the capability, backoff, window expiry exits 75, terminal restored on every exit. Compat: new launcher against a capability-less fake worker |
+| 3 | Reclamation: idle-session timeout with flush, orphan triggers `applyPendingIfIdle`, orchestrator gate ignores orphans and reaps its own, `touch` from `Provision`, daemon sweep with conditional teardown, `Teardown` from nuke and polecat removal, detach timeout default 15 min | ~500 lines in `workerclient`, `sockproto`, `socket`, `daemon`, `cmd` | Unit: idle session is flushed then orphaned and the slot is free; staged binary applies after reclamation; gate arithmetic with orphans; sweep tears down only sessions with no tmux session whose `idle_since` is past the timeout, never by session age; a `touch` or an attach between the sweep's read and its teardown yields `busy`; `Provision` falls through to `session_open` on `no_session`; nuke of a remote polecat leaves no session on the worker |
+| 4 (optional) | Adoption by a new pane: `adopt` on attach, `Start` skips beacon and nudges when adopting, forced repaint; a session-scoped stop message for `Stop`, then stop forwarding `SIGTERM` | ~500 lines, mostly `internal/polecat` | Start-sequence tests with a detached exec present; end-to-end on a real worker |
 
 ### Acceptance criteria
 
@@ -487,7 +585,7 @@ worker only when it is idle.
    the output produced meanwhile appears after the block is lifted, and the
    worker log contains no `canceling the attached agent` line.
 2. `kill -9` the launcher. `discover` shows
-   the session with `exec: detached` and a `detached_at` time; the agent pid is
+   the session with `exec: detached` and an `idle_since` time; the agent pid is
    alive. After the detach timeout the agent is gone and the checkpoint ref has
    advanced; after the idle-session timeout the session is `orphaned` and a new
    `session_open` for another polecat is accepted at `-max-sessions 1`.
@@ -499,6 +597,14 @@ worker only when it is idle.
    launcher against a new worker, pass the existing exec-stream test suite.
 6. A staged worker binary is not applied while a detached session exists and is
    applied within one idle-session timeout of the last stream closing.
+7. Drop all packets between launcher and worker without closing either socket.
+   Within 30s the worker reports `exec: detached` and the launcher prints its
+   reconnecting status.
+8. Run an agent that ignores `SIGTERM` and stop its polecat session. The agent's
+   process group is gone from the worker within `execWaitDelay` of the stop.
+9. With the proxy unreachable for longer than the dead-man window and a native
+   agent writing a tracked file continuously, the final checkpoint commit is
+   taken after the agent's exit is logged.
 
 ## 8. Open questions
 
@@ -513,11 +619,13 @@ worker only when it is idle.
    `SIGHUP` in phase 2; keep forwarding `SIGTERM`/`SIGQUIT` until intentional
    kill paths (`Stop`, nuke, the plugin's `tmux kill-session`) call an explicit
    stop, then drop those too. Until then an orchestrator reboot may still end
-   agents (failure mode 5).
+   agents (failure mode 5). While they are forwarded they arm a worker-side
+   kill (§3.3), so `Stop` keeps a hard bound.
 3. **Timer defaults.** Launcher window 10 min, detach timeout 15 min,
    idle-session timeout 30 min, against a 20 min dead-man window at defaults.
    *Recommendation:* these values, as worker flags; revisit after a week of
-   `detached_at` data.
+   `idle_since` data. The ping interval (10s) and dead-stream threshold (30s)
+   are constants, not flags.
 4. **Replay fidelity for TUIs.** Lossless resume should need no repaint; a gap
    relies on the resize repaint. This is not verified against the agent TUIs
    in use. *Recommendation:* test in phase 2 before fixing the ring size;
