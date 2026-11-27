@@ -724,6 +724,48 @@ func TestSessionOpen_BranchTheCloneIsAlreadyOn(t *testing.T) {
 	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
 }
 
+// TestSessionOpen_OriginTracksTheHostsUpstreamRefs: in the rig repo the
+// up-to-date base branch is the remote-tracking ref refs/remotes/origin/<base>,
+// which host fetches advance; the local head refs/heads/<base> stays where the
+// rig was created. The worker's origin/<base> must be the former, at bring-up
+// and after any later fetch, while the polecat's own branch (a host head,
+// here also present upstream at an older commit) still resolves to the host's.
+func TestSessionOpen_OriginTracksTheHostsUpstreamRefs(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	base := git(t, rigRepo, "symbolic-ref", "--short", "HEAD")
+	stale := git(t, rigRepo, "rev-parse", "refs/heads/"+base)
+	commit := func(msg string) string {
+		return git(t, rigRepo, "commit-tree", "-m", msg, "-p", stale, stale+"^{tree}")
+	}
+	fresh, work := commit("upstream moved on"), commit("polecat branch")
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/"+base, fresh)
+	git(t, rigRepo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+base)
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/feature", fresh)
+	git(t, rigRepo, "update-ref", "refs/heads/"+branch, work)
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/"+branch, stale)
+
+	worktree := provisionOn(t, proxyURL, ca, branch)
+	check := func(when string) {
+		assert.Equal(t, fresh, git(t, worktree, "rev-parse", "origin/"+base), "%s: origin/%s must be the host's origin/%s, not its stale local head", when, base, base)
+		assert.Equal(t, fresh, git(t, worktree, "rev-parse", "origin/feature"), "%s: upstream branches the host has no head for must resolve", when)
+		assert.Equal(t, work, git(t, worktree, "rev-parse", "origin/"+branch), "%s: the polecat's branch must be the host's head", when)
+	}
+	check("after bring-up")
+	assert.Equal(t, work, git(t, worktree, "rev-parse", "HEAD"))
+
+	// Upstream moves again and the host fetches it; a plain fetch on the
+	// worker must follow, not fall back to the host's local head.
+	fresh = git(t, rigRepo, "commit-tree", "-m", "upstream moved again", "-p", fresh, fresh+"^{tree}")
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/"+base, fresh)
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/feature", fresh)
+	git(t, worktree, "fetch", "origin")
+	check("after a later fetch")
+	git(t, worktree, "pull", "--ff-only")
+	check("after a pull")
+}
+
 func TestValidBranch(t *testing.T) {
 	for _, ok := range []string{"polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa-mv3cxv4t", "main"} {
 		assert.True(t, validBranch(ok), "%q must be accepted", ok)

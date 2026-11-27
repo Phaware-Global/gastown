@@ -675,6 +675,14 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 			fail(replyID, "checkout", fmt.Errorf("git checkout %s: %v: %s", open.Branch, err, strings.TrimSpace(string(out))))
 			return
 		}
+	}
+	// After the checkout: git will not set up tracking against a ref that a
+	// negative refspec names.
+	if err := useUpstreamTrackingRefs(buCtx, worktree, open.Branch); err != nil {
+		fail(replyID, "upstream refs", err)
+		return
+	}
+	if open.Branch != "" {
 		if err := useRemoteWorkRef(buCtx, worktree, open.Branch); err != nil {
 			fail(replyID, "work ref", err)
 			return
@@ -1142,6 +1150,42 @@ func (s *Service) loadPersisted() {
 		sum.State = "orphaned"
 		s.orphans[sum.Session] = sum
 	}
+}
+
+// useUpstreamTrackingRefs makes the clone's origin/* the host's own origin/*
+// (refs/remotes/origin/* in the rig repo) instead of the host's local heads.
+//
+// Host fetches keep the rig repo's remote-tracking refs current; nothing
+// advances its local heads, so refs/heads/<default> there is as old as the
+// rig. A plain clone maps those heads to origin/*, and an agent that diffs
+// or rebases against origin/<default> would work against that old commit.
+//
+// The one host head the clone still needs is branch, the polecat's own, which
+// the host creates locally before the session starts. It keeps its place at
+// origin/<branch>; a negative refspec keeps an upstream copy of the same name
+// from being fetched to the same ref, which git refuses. origin/HEAD is
+// left out too: the clone's is a symref, and a fetch would write through it.
+func useUpstreamTrackingRefs(ctx context.Context, worktree, branch string) error {
+	steps := [][]string{
+		{"config", "remote.origin.fetch", "+refs/remotes/origin/*:refs/remotes/origin/*"},
+		{"config", "--add", "remote.origin.fetch", "^refs/remotes/origin/HEAD"},
+	}
+	// After the clone, origin/<branch> exists exactly when the host has the head.
+	if branch != "" && exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch).Run() == nil {
+		steps = append(steps,
+			[]string{"config", "--add", "remote.origin.fetch", "+refs/heads/" + branch + ":refs/remotes/origin/" + branch},
+			[]string{"config", "--add", "remote.origin.fetch", "^refs/remotes/origin/" + branch},
+		)
+	}
+	// --prune drops the origin/* refs the clone made from other host heads,
+	// which no later fetch would update.
+	steps = append(steps, []string{"fetch", "--quiet", "--prune", "origin"})
+	for _, args := range steps {
+		if out, err := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...).CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
 }
 
 // useRemoteWorkRef points the clone's pushes for branch at the host's work ref
