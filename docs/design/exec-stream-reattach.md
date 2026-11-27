@@ -540,7 +540,7 @@ implementation and its review should hold them to.
    (`attach.go:236-260`), so one blocked on terminal output cannot answer a
    ping; the implementation should answer pings from the socket reader without
    waiting on the terminal. The worker's stream reader runs signal delivery
-   inline today (`exec.go:427-428`); it must only queue (clause 4), so it
+   inline today (`exec.go:427-428`); it must only queue (invariant 4), so it
    keeps stamping inbound frames while a `docker exec` blocks.
 3. **One agent per session under concurrent attaches.** Every decision that
    starts, replaces or supersedes is taken under `s.mu`; anything that waits
@@ -589,6 +589,10 @@ right to signal, kill or start.
   when a command is queued. The end routine is queued like anything else, so
   a frame that arrived before it, including the `TERM` that armed it, is
   delivered first; once the routine is queued, later frames are dropped. The
+  queue holds at most 8 signal frames; one that arrives when it is full is
+  dropped and logged. The end routine is not subject to that cap and is
+  always accepted. Because one goroutine runs one command at a time, a hung
+  docker daemon holds at most one docker client per exec. The
   routine marks `ended` as its last act on that goroutine, so **`ended`
   implies that no command for that exec is in flight**. That is the one case
   the container ID cannot separate: a successor in the same container. The
