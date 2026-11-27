@@ -839,7 +839,7 @@ func TestEnsureLocalExcludePatterns_FailsClosedWhenGitCannotResolveInherited(t *
 		t.Fatal(err)
 	}
 	binDir := t.TempDir()
-	wrapper := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --show-scope ] && { echo 'error: unknown option' >&2; exit 129; }; done\nexec \"" + realGit + "\" \"$@\"\n"
+	wrapper := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --show-scope ] && { printf 'error: unknown option\\nusage: git config [<options>]\\n    --global  use global config file\\n' >&2; exit 129; }; done\nexec \"" + realGit + "\" \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(wrapper), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -849,8 +849,8 @@ func TestEnsureLocalExcludePatterns_FailsClosedWhenGitCannotResolveInherited(t *
 	if err == nil {
 		t.Fatal("EnsureLocalExcludePatterns succeeded although the inherited excludes could not be resolved")
 	}
-	if !strings.Contains(err.Error(), "unknown option") || !strings.Contains(err.Error(), "2.26") {
-		t.Errorf("error %q should carry git's stderr and the minimum git version", err)
+	if !strings.Contains(err.Error(), "unknown option") || !strings.Contains(err.Error(), "2.26") || strings.Contains(err.Error(), "\n") {
+		t.Errorf("error %q should be one line carrying git's error and the minimum git version", err)
 	}
 	out, _ := exec.Command(realGit, "-C", wts[0], "config", "--get", "core.excludesFile").Output()
 	if got := strings.TrimSpace(string(out)); got != "" {

@@ -230,8 +230,13 @@ func inheritedExcludes(worktreePath string) (string, error) {
 			return "", fmt.Errorf("resolving inherited core.excludesFile: %w", err)
 		}
 		if exitErr.ExitCode() != 1 { // 1 = key not set
-			return "", fmt.Errorf("resolving inherited core.excludesFile (needs git 2.26+ for --show-scope): %w: %s",
-				err, strings.TrimSpace(string(exitErr.Stderr)))
+			// First line only: on an unknown option git follows it with its whole usage text.
+			msg, _, _ := strings.Cut(strings.TrimSpace(string(exitErr.Stderr)), "\n")
+			hint := ""
+			if exitErr.ExitCode() == 129 { // usage error: git older than 2.26 has no --show-scope
+				hint = " (needs git 2.26+ for --show-scope)"
+			}
+			return "", fmt.Errorf("resolving inherited core.excludesFile%s: %w: %s", hint, err, msg)
 		}
 	}
 	for _, line := range strings.Split(string(out), "\n") {
