@@ -23,6 +23,10 @@
           {
             "type": "command",
             "command": "{{GT_BIN}} tap guard command-substitution"
+          },
+          {
+            "type": "command",
+            "command": "{{GT_BIN}} tap guard memory-write"
           }
         ]
       },

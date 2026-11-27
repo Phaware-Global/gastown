@@ -12,7 +12,7 @@ import (
 
 var tapGuardMemoryWriteCmd = &cobra.Command{
 	Use:   "memory-write",
-	Short: "Block Write/Edit/NotebookEdit to Claude Code memory paths for worker roles",
+	Short: "Block writes to Claude Code memory paths for worker roles",
 	Long: `Block persistent-memory writes from Gas Town worker agents.
 
 Gas Town worker roles (refinery, mayor, deacon, witness, polecat, crew)
@@ -32,8 +32,8 @@ feedback memory, calcifying the correction without any review of
 whether the formula text itself should change.
 
 This guard blocks Write/Edit/NotebookEdit tool calls whose file_path
-targets a Claude Code memory directory, but only when the caller is a
-Gas Town agent. Non-agent Claude Code sessions (a human using Claude
+targets a Claude Code memory directory, and Bash commands that write
+into one, but only when the caller is a Gas Town agent. Non-agent Claude Code sessions (a human using Claude
 Code directly for other work) are unaffected.
 
 Path pattern: any tool_input.file_path / tool_input.notebook_path
@@ -43,14 +43,20 @@ regardless of the specific project hash. Windows (backslash) paths
 are out of scope — gastown is macOS/Linux only; if that changes, add
 a Windows-path case to the classifier test.
 
+In a Bash command the guard follows redirects, tee, sed -i, perl -i,
+cp, mv, ln, install, rsync, touch, truncate and dd, through cd, simple
+variables and sh -c. Reading or removing memory files is allowed. This
+is a check on ordinary shell writes, not a sandbox: a path computed at
+run time, or a write made by a script in another language, is not seen.
+
 Exit codes:
   0 - Operation allowed (not an agent, or path is not a memory file)
   2 - Operation BLOCKED (agent trying to write a memory file)
 
-Hook configuration (applied to Write, Edit, NotebookEdit):
+Hook configuration (applied to Bash, Write, Edit, NotebookEdit):
   {
     "PreToolUse": [{
-      "matcher": "Write|Edit|NotebookEdit",
+      "matcher": "Bash|Write|Edit|NotebookEdit",
       "hooks": [{
         "type": "command",
         "command": "gt tap guard memory-write"
@@ -76,16 +82,27 @@ func runTapGuardMemoryWrite(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return nil
 	}
-	filePath := extractFilePath(input)
-	if filePath == "" {
-		return nil
-	}
-
-	if isClaudeCodeMemoryPath(filePath) {
-		printMemoryWriteBlock(filePath)
+	if target, ok := memoryWriteTarget(input); ok {
+		printMemoryWriteBlock(target)
 		return NewSilentExit(2)
 	}
 	return nil
+}
+
+// memoryWriteTarget returns the memory path the hooked tool call writes.
+func memoryWriteTarget(input []byte) (string, bool) {
+	if filePath := extractFilePath(input); filePath != "" {
+		return filePath, isClaudeCodeMemoryPath(filePath)
+	}
+	command := extractCommand(input)
+	if command == "" {
+		return "", false
+	}
+	var hookInput struct {
+		Cwd string `json:"cwd"`
+	}
+	_ = json.Unmarshal(input, &hookInput)
+	return bashMemoryWrite(command, hookInput.Cwd)
 }
 
 // extractFilePath pulls the target path out of the hook JSON.
@@ -97,8 +114,8 @@ func runTapGuardMemoryWrite(cmd *cobra.Command, args []string) error {
 // We probe both and return the first non-empty value. If Claude Code
 // adds a new file-producing tool with a third field name later, this
 // function needs a new probe — the guard's hook matcher is
-// "Write|Edit|NotebookEdit", so any tool added to the matcher must
-// have its path field represented here too.
+// "Write|Edit|NotebookEdit", so any file tool added to the matcher must
+// have its path field represented here too. A Bash call has neither field.
 func extractFilePath(input []byte) string {
 	if len(input) == 0 {
 		return ""

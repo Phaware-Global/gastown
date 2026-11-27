@@ -1502,6 +1502,11 @@ func DefaultBase() *HooksConfig {
 						Type:    "command",
 						Command: gtCommand("gt tap guard command-substitution"),
 					},
+					// Shell redirects write memory files too.
+					{
+						Type:    "command",
+						Command: gtCommand("gt tap guard memory-write"),
+					},
 				},
 			},
 			// Worker roles must not persist private memory; see

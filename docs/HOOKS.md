@@ -258,9 +258,9 @@ When no base config exists, the system uses sensible defaults:
 - **PreCompact**: PATH setup + `gt prime --hook`
 - **UserPromptSubmit**: PATH setup + `gt mail check --inject`
 - **Stop**: PATH setup + `gt costs record`
-- **PreToolUse**: `pr-workflow` and `command-substitution` on every Bash call,
-  `dangerous-command` on `rm -rf /` and force pushes, `push-main` on pushes,
-  and `memory-write` on Write/Edit/NotebookEdit
+- **PreToolUse**: `pr-workflow`, `command-substitution` and `memory-write` on
+  every Bash call, `dangerous-command` on `rm -rf /` and force pushes,
+  `push-main` on pushes, and `memory-write` on Write/Edit/NotebookEdit
 
 The built-in overrides add `dangerous-command` on `sudo` and system package
 installs for the autonomous roles (polecats, witness, refinery, deacon, boot,
