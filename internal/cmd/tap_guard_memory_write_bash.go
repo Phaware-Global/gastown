@@ -36,10 +36,17 @@ const (
 // paths a substitution reads are not taken for part of the word.
 const substitutionMark = "$()"
 
-// lexShell splits a command line into tokens. Comments are dropped and heredoc
+// lexer reads a command as one family of shells does. Inside $( ), bash and sh
+// end a heredoc at the first line starting delimiter+")" and nest ${ } only on
+// "${", while zsh reads on to a line holding the delimiter alone if there is one
+// and nests on a bare "{" too. Either reading can quote or comment out what the
+// other runs, so a whole command is lexed once per reading.
+type lexer struct{ zsh bool }
+
+// split splits a command line into tokens. Comments are dropped and heredoc
 // bodies are set aside, so text that merely mentions a write is not read as one.
-func lexShell(s string) []shellToken {
-	toks, _ := lexCommands(s, false)
+func (l lexer) split(s string) []shellToken {
+	toks, _ := l.commands(s, false)
 	return toks
 }
 
@@ -49,9 +56,9 @@ type heredoc struct {
 	body   *string
 }
 
-// lexCommands lexes s and returns the tokens and how much of s they cover. When
+// commands lexes s and returns the tokens and how much of s they cover. When
 // nested, s follows a "$(" and lexing stops at the ")" that closes it.
-func lexCommands(s string, nested bool) ([]shellToken, int) {
+func (l lexer) commands(s string, nested bool) ([]shellToken, int) {
 	var (
 		toks     []shellToken
 		word     strings.Builder
@@ -89,7 +96,7 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 	// substitute lexes the substitution at s[i], if there is one, into the
 	// current word and returns the index of its last byte.
 	substitute := func(i int, inQuotes bool) (int, bool) {
-		subs, last, ok := lexSubstitution(s, i, inQuotes)
+		subs, last, ok := l.substitution(s, i, inQuotes)
 		if !ok {
 			return i, false
 		}
@@ -133,11 +140,17 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 			}
 			inWord, quoted = true, true
 		case '$', '`':
+			if c == '$' && at(i+1) == '$' { // the process id: no "${" or "$(" follows
+				word.WriteString("$$")
+				inWord = true
+				i++
+				continue
+			}
 			// A ")" inside ${ } does not close the enclosing "$(".
 			if nested && c == '$' && at(i+1) == '{' {
-				if end := parameterEnd(s, i); end >= 0 {
+				if end := l.parameterEnd(s, i); end >= 0 {
 					inner := s[i+2 : end]
-					if subs := expansions(inner); len(subs) > 0 {
+					if subs := l.expansions(inner); len(subs) > 0 {
 						toks = append(toks, subs...)
 						word.WriteString(substitutionMark)
 					} else {
@@ -166,7 +179,7 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 		case '\n':
 			emit(";")
 			for _, h := range heredocs {
-				body, last, other, ok := heredocBody(s, i, h.tag, nested)
+				body, last, ok := l.heredocBody(s, i, h.tag, nested)
 				if !ok {
 					// No delimiter: the "<<" was most likely a shift, so the
 					// lines after it are still commands.
@@ -175,16 +188,15 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 				*h.body, i = body, last
 				if !h.quoted {
 					*h.body = unescapeHeredoc(body)
-					toks = append(toks, expansions(body)...)
+					toks = append(toks, l.expansions(body)...)
 				}
-				toks = append(toks, subshell(lexShell(other))...)
 			}
 			heredocs = nil
 		case '(':
 			if end := arithmeticEnd(s, i); end >= 0 {
 				// In (( )) the operators < > and << are arithmetic.
 				flush()
-				toks = append(toks, expansions(s[i+2:end-1])...)
+				toks = append(toks, l.expansions(s[i+2:end-1])...)
 				i = end
 				continue
 			}
@@ -262,9 +274,9 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 	return toks, i
 }
 
-// lexSubstitution lexes the $(...), $((...)) or `...` that starts at s[i]. It
+// substitution lexes the $(...), $((...)) or `...` that starts at s[i]. It
 // returns the commands run as sub tokens and the index of the closing byte.
-func lexSubstitution(s string, i int, inQuotes bool) ([]shellToken, int, bool) {
+func (l lexer) substitution(s string, i int, inQuotes bool) ([]shellToken, int, bool) {
 	switch {
 	case s[i] == '`':
 		escapable := "\\`$"
@@ -279,14 +291,14 @@ func lexSubstitution(s string, i int, inQuotes bool) ([]shellToken, int, bool) {
 			}
 			body.WriteByte(s[j])
 		}
-		return subshell(lexShell(body.String())), j, true
+		return subshell(l.split(body.String())), j, true
 	case !strings.HasPrefix(s[i:], "$("):
 		return nil, i, false
 	}
 	if end := arithmeticEnd(s, i+1); end >= 0 {
-		return expansions(s[i+3 : end-1]), end, true
+		return l.expansions(s[i+3 : end-1]), end, true
 	}
-	toks, n := lexCommands(s[i+2:], true)
+	toks, n := l.commands(s[i+2:], true)
 	return subshell(toks), i + 1 + n, true
 }
 
@@ -299,14 +311,14 @@ func subshell(toks []shellToken) []shellToken {
 
 // expansions returns the commands run by substitutions in text that is expanded
 // but not run itself: arithmetic, or an unquoted heredoc body.
-func expansions(text string) []shellToken {
+func (l lexer) expansions(text string) []shellToken {
 	var toks []shellToken
 	for i := 0; i < len(text); i++ {
 		if text[i] == '\\' {
 			i++
 			continue
 		}
-		if subs, last, ok := lexSubstitution(text, i, false); ok {
+		if subs, last, ok := l.substitution(text, i, false); ok {
 			toks = append(toks, subs...)
 			i = last
 		}
@@ -339,13 +351,9 @@ func arithmeticEnd(s string, i int) int {
 }
 
 // heredocBody reads the body that follows the newline at s[i], up to the line
-// holding tag alone. It returns the body and the index of the last byte used.
-//
-// Inside $( ) shells disagree about a line starting tag+")": some end the body
-// there, while zsh reads on to a line holding tag alone if there is one. When
-// both exist the body follows zsh, and other is the text the other reading runs
-// as commands, so that the caller can scan both.
-func heredocBody(s string, i int, tag string, nested bool) (body string, last int, other string, ok bool) {
+// holding tag alone or, inside $( ), a line starting tag+")" as l reads it. It
+// returns the body and the index of the last byte used.
+func (l lexer) heredocBody(s string, i int, tag string, nested bool) (body string, last int, ok bool) {
 	paren := -1 // the first line starting tag+")"
 	var parenLast int
 	for start := i + 1; start < len(s); {
@@ -355,21 +363,20 @@ func heredocBody(s string, i int, tag string, nested bool) (body string, last in
 		}
 		trimmed := strings.TrimLeft(line, "\t")
 		if trimmed == tag {
-			if paren >= 0 {
-				// A quote right after the ")" closes one opened before "$(".
-				other = strings.TrimPrefix(s[parenLast+2:start], `"`)
-			}
-			return s[i+1 : start], start + len(line), other, true
+			return s[i+1 : start], start + len(line), true
 		}
 		if nested && paren < 0 && strings.HasPrefix(trimmed, tag+")") {
 			paren, parenLast = start, start+len(line)-len(trimmed)+len(tag)-1
+			if !l.zsh {
+				break
+			}
 		}
 		start += len(line) + 1
 	}
 	if paren >= 0 {
-		return s[i+1 : paren], parenLast, "", true
+		return s[i+1 : paren], parenLast, true
 	}
-	return "", i, "", false
+	return "", i, false
 }
 
 // unescapeHeredoc returns the text a command reads from an unquoted heredoc,
@@ -379,20 +386,28 @@ func unescapeHeredoc(body string) string {
 }
 
 // parameterEnd returns the index of the "}" closing the "${" at s[i], or -1.
-func parameterEnd(s string, i int) int {
+func (l lexer) parameterEnd(s string, i int) int {
 	depth := 0
 	var quote byte
-	for j := i + 1; j < len(s); j++ {
+	for j := i; j < len(s); j++ {
 		switch c := s[j]; {
 		case c == '\\' && quote != '\'':
 			j++
+		case quote != '\'' && c == '$' && j+1 < len(s) && s[j+1] == '$':
+			j++
+		case quote != '\'' && (c == '`' || c == '$' && j+1 < len(s) && s[j+1] == '('):
+			// A "}" in a substitution's comment or heredoc closes nothing.
+			_, j, _ = l.substitution(s, j, quote == '"')
 		case quote != 0:
 			if c == quote {
 				quote = 0
 			}
 		case c == '\'' || c == '"':
 			quote = c
-		case c == '{':
+		case c == '$' && j+1 < len(s) && s[j+1] == '{':
+			depth++
+			j++
+		case c == '{' && l.zsh:
 			depth++
 		case c == '}':
 			if depth--; depth == 0 {
@@ -405,6 +420,7 @@ func parameterEnd(s string, i int) int {
 
 // shellScope is the state a command inherits from the ones before it.
 type shellScope struct {
+	lex  lexer // how the command and the scripts it runs are read
 	cwd  string
 	vars map[string]string
 }
@@ -414,7 +430,7 @@ func (s shellScope) clone() shellScope {
 	for k, v := range s.vars {
 		vars[k] = v
 	}
-	return shellScope{cwd: s.cwd, vars: vars}
+	return shellScope{lex: s.lex, cwd: s.cwd, vars: vars}
 }
 
 var (
@@ -449,11 +465,16 @@ func (s shellScope) resolve(word string) string {
 // bashMemoryWrite returns the first Claude Code memory path that command,
 // started in cwd, writes.
 func bashMemoryWrite(command, cwd string) (string, bool) {
-	return scanShellWrites(command, shellScope{cwd: cwd, vars: map[string]string{}})
+	for _, lex := range []lexer{{zsh: false}, {zsh: true}} {
+		if p, ok := scanShellWrites(command, shellScope{lex: lex, cwd: cwd, vars: map[string]string{}}); ok {
+			return p, true
+		}
+	}
+	return "", false
 }
 
 func scanShellWrites(command string, scope shellScope) (string, bool) {
-	return scanShellTokens(lexShell(command), scope)
+	return scanShellTokens(scope.lex.split(command), scope)
 }
 
 func scanShellTokens(toks []shellToken, scope shellScope) (string, bool) {
@@ -590,7 +611,8 @@ func (s *shellScope) run(words []string, stdin *string) (string, bool) {
 		for i, a := range args {
 			expanded[i] = s.expand(a)
 		}
-		for _, target := range writtenFiles(name, expanded) {
+		isMemory := func(word string) bool { return isMemoryTarget(s.resolve(word)) }
+		for _, target := range writtenFiles(name, expanded, isMemory) {
 			if p := s.resolve(target); isMemoryTarget(p) {
 				return p, true
 			}
@@ -599,6 +621,9 @@ func (s *shellScope) run(words []string, stdin *string) (string, bool) {
 	return "", false
 }
 
+// stdinPaths name a process's standard input.
+var stdinPaths = []string{"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+
 // readsScriptFromStdin reports whether a shell given args, which hold no -c,
 // runs its standard input rather than a script file.
 func readsScriptFromStdin(args []string) bool {
@@ -606,7 +631,7 @@ func readsScriptFromStdin(args []string) bool {
 		switch a := args[i]; {
 		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
 			i++
-		case a == "/dev/stdin" || a == "/dev/fd/0":
+		case slices.Contains(stdinPaths, path.Clean(a)):
 			return true
 		case a == "-" || strings.HasPrefix(a, "--") && a != "--":
 		case strings.HasPrefix(a, "-") && strings.Contains(a, "s"):
@@ -642,7 +667,8 @@ func (s *shellScope) chdir(args []string) {
 }
 
 // writtenFiles returns the arguments that name files program name writes.
-func writtenFiles(name string, args []string) []string {
+// isMemory reports whether an argument names a memory path.
+func writtenFiles(name string, args []string, isMemory func(string) bool) []string {
 	switch name {
 	case "tee":
 		return operands(args)
@@ -657,7 +683,7 @@ func writtenFiles(name string, args []string) []string {
 			}
 		}
 	case "cp", "mv", "ln", "install", "rsync":
-		return copyTargets(name, args)
+		return copyTargets(name, args, isMemory)
 	case "sed", "gsed", "perl":
 		return inPlaceFiles(name, args)
 	}
@@ -666,7 +692,7 @@ func writtenFiles(name string, args []string) []string {
 
 // copyTargets returns the destination of a copy or move and, because the
 // destination may be a directory, the path each source would take inside it.
-func copyTargets(name string, args []string) []string {
+func copyTargets(name string, args []string, isMemory func(string) bool) []string {
 	var dest string
 	var sources []string
 	intoDir := false     // -t says the destination is a directory
@@ -695,9 +721,10 @@ func copyTargets(name string, args []string) []string {
 		dest, sources = ops[len(ops)-1], ops[:len(ops)-1]
 	}
 	targets := []string{dest}
-	// One source given a sibling's name is a rename, as in "mv memory
-	// memory.bak", not a copy into that sibling.
-	if !intoDir && len(sources) == 1 && !strings.HasSuffix(dest, "/") &&
+	// A memory path given a sibling's name is a rename, as in "mv memory
+	// memory.bak", not a copy into that sibling. Any other source is checked,
+	// since the sibling may be an existing directory it lands in.
+	if !intoDir && len(sources) == 1 && !strings.HasSuffix(dest, "/") && isMemory(sources[0]) &&
 		path.Dir(path.Clean(sources[0])) == path.Dir(path.Clean(dest)) {
 		return targets
 	}
