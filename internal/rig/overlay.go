@@ -1,6 +1,7 @@
 package rig
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -191,7 +192,11 @@ func EnsureLocalExcludePatterns(worktreePath string) error {
 	// switch off the user's global (or repository-configured) ignore here and let `git add -A` stage whatever
 	// it hides (.env, key files). Carry its patterns over; this file is rewritten on
 	// every add or repair, so the copy stays current.
-	content := inheritedExcludes(worktreePath) +
+	inherited, err := inheritedExcludes(worktreePath)
+	if err != nil {
+		return err
+	}
+	content := inherited +
 		"# Gas Town (written by gt; do not edit)\n" + strings.Join(gasTownLocalExcludePatterns(), "\n") + "\n"
 	if err := os.WriteFile(excludePath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("writing local exclude: %w", err)
@@ -210,32 +215,48 @@ func EnsureLocalExcludePatterns(worktreePath string) error {
 // worktreePath without the per-worktree setting: the last core.excludesFile from
 // any other scope (system, global or repository config, with include and includeIf
 // resolved as git resolves them for this worktree), else git's default
-// $XDG_CONFIG_HOME/git/ignore (~/.config/git/ignore). Empty if there is none.
-func inheritedExcludes(worktreePath string) string {
-	var path string
-	out, _ := exec.Command("git", "-C", worktreePath, "config", "--show-scope", "--path", "--get-all", "core.excludesFile").Output()
-	for _, line := range strings.Split(string(out), "\n") {
-		scope, value, ok := strings.Cut(strings.TrimRight(line, "\r"), "\t")
-		if ok && scope != "worktree" && value != "" {
-			path = value // later entries override earlier ones
+// $XDG_CONFIG_HOME/git/ignore (~/.config/git/ignore). An empty last value means the
+// excludes were switched off on purpose, so nothing is inherited.
+//
+// It fails closed: if git cannot answer (for example a git too old for
+// --show-scope), the caller must not install the per-worktree file, because doing
+// so without the inherited patterns would un-ignore files the user hides.
+func inheritedExcludes(worktreePath string) (string, error) {
+	path, set := "", false
+	out, err := exec.Command("git", "-C", worktreePath, "config", "--show-scope", "--path", "--get-all", "core.excludesFile").Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 { // 1 = key not set
+			return "", fmt.Errorf("resolving inherited core.excludesFile: %w", err)
 		}
 	}
-	if path == "" {
+	for _, line := range strings.Split(string(out), "\n") {
+		scope, value, ok := strings.Cut(strings.TrimRight(line, "\r"), "\t")
+		if ok && scope != "worktree" {
+			path, set = value, true // later entries override earlier ones
+		}
+	}
+	switch {
+	case set && path == "":
+		return "", nil
+	case !set:
 		base := os.Getenv("XDG_CONFIG_HOME")
 		if base == "" {
 			home, err := os.UserHomeDir()
 			if err != nil {
-				return ""
+				return "", nil
 			}
 			base = filepath.Join(home, ".config")
 		}
 		path = filepath.Join(base, "git", "ignore")
+	case !filepath.IsAbs(path):
+		path = filepath.Join(worktreePath, path) // git resolves it against the worktree root
 	}
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) == 0 {
-		return ""
+		return "", nil
 	}
-	return "# Copied from " + path + "\n" + strings.TrimRight(string(data), "\n") + "\n\n"
+	return "# Copied from " + path + "\n" + strings.TrimRight(string(data), "\n") + "\n\n", nil
 }
 
 // enableWorktreeConfig turns on extensions.worktreeConfig for the repository that

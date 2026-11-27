@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -757,6 +758,12 @@ func TestEnsureLocalExcludePatterns_KeepsInheritedIgnore(t *testing.T) {
 			}
 		},
 	}
+	tests["relative core.excludesFile in repository config"] = func(t *testing.T, bare string) {
+		isolateGitConfig(t, "")
+		if out, err := exec.Command("git", "--git-dir", bare, "config", "core.excludesFile", ".git-local-ignore").CombinedOutput(); err != nil {
+			t.Fatalf("git config: %v\n%s", err, out)
+		}
+	}
 	for name, setup := range tests {
 		t.Run(name, func(t *testing.T) {
 			isolateGitConfig(t, "") // for the repo setup; the case re-isolates as it needs
@@ -764,6 +771,15 @@ func TestEnsureLocalExcludePatterns_KeepsInheritedIgnore(t *testing.T) {
 			setup(t, bare)
 			for _, f := range []string{".env", "id.pem", "notes.txt"} {
 				if err := os.WriteFile(filepath.Join(wts[0], f), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Target of the relative case; it hides itself so every case sees the same status.
+			if err := os.WriteFile(filepath.Join(wts[0], ".git-local-ignore"), []byte(".env\n*.pem\n.git-local-ignore\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(name, "relative") {
+				if err := os.Remove(filepath.Join(wts[0], ".git-local-ignore")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -786,6 +802,55 @@ func TestEnsureLocalExcludePatterns_KeepsInheritedIgnore(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A repository can switch the global ignore off with an empty core.excludesFile.
+// Files it left visible on purpose must not be hidden again by a copied-in ignore.
+func TestEnsureLocalExcludePatterns_EmptyExcludesFileInheritsNothing(t *testing.T) {
+	isolateGitConfig(t, ".env\n")
+	bare, wts := bareRepoWithWorktrees(t, 1)
+	if out, err := exec.Command("git", "--git-dir", bare, "config", "core.excludesFile", "").CombinedOutput(); err != nil {
+		t.Fatalf("git config: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(wts[0], ".env"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureLocalExcludePatterns(wts[0]); err != nil {
+		t.Fatalf("EnsureLocalExcludePatterns: %v", err)
+	}
+	out, _ := exec.Command("git", "-C", wts[0], "status", "--porcelain", "-uall").CombinedOutput()
+	if got := strings.TrimSpace(string(out)); got != "?? .env" {
+		t.Errorf("status = %q, want .env still visible", got)
+	}
+}
+
+// If git cannot report the inherited excludes file (git older than 2.26 rejects
+// --show-scope), installing the per-worktree file anyway would un-ignore whatever
+// the user's own ignore hides. The setup must fail and leave the worktree alone.
+func TestEnsureLocalExcludePatterns_FailsClosedWhenGitCannotResolveInherited(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a sh git wrapper")
+	}
+	isolateGitConfig(t, "")
+	_, wts := bareRepoWithWorktrees(t, 1)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	wrapper := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --show-scope ] && { echo 'error: unknown option' >&2; exit 129; }; done\nexec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := EnsureLocalExcludePatterns(wts[0]); err == nil {
+		t.Fatal("EnsureLocalExcludePatterns succeeded although the inherited excludes could not be resolved")
+	}
+	out, _ := exec.Command(realGit, "-C", wts[0], "config", "--get", "core.excludesFile").Output()
+	if got := strings.TrimSpace(string(out)); got != "" {
+		t.Errorf("core.excludesFile = %q, want unset after a failed setup", got)
 	}
 }
 
