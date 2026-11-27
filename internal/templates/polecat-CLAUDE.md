@@ -235,7 +235,7 @@ When your work is done, follow this checklist — **step 4 is REQUIRED**:
 ```
 [ ] 1. Run quality gates (ALL must pass):
        - npm projects: npm run lint && npm run format && npm test
-       - Go projects:  go test ./... && go vet ./...
+       - Go projects:  go test -p 2 ./... && go vet ./...
 [ ] 2. Stage changes:     git add <files>
 [ ] 3. Commit changes:    git commit -m "msg (issue-id)"
 [ ] 4. Self-clean:        gt done   ← MANDATORY FINAL STEP
