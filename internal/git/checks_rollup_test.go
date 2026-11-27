@@ -114,6 +114,11 @@ func TestGhPrChecksRollup(t *testing.T) {
 				rules:     `{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"build","integration_id":99}]}}`,
 				checkRuns: passed("build"),
 			}, "PENDING", false},
+		{"commit status for an app-pinned check",
+			checksFixture{
+				rules:    `{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"build","integration_id":99}]}}`,
+				statuses: `{"context":"build","state":"success"}`,
+			}, "PENDING", false},
 		{"required by classic branch protection",
 			checksFixture{
 				branch:    `{"protection":{"required_status_checks":{"enforcement_level":"everyone","checks":[{"context":"build","app_id":null}]}}}`,

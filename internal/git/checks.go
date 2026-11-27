@@ -32,8 +32,11 @@ type requiredCheck struct {
 	appID   int64 // 0 or negative when any app may report it
 }
 
+// A commit status does not report which app sent it, so it never satisfies a
+// requirement pinned to an app.
+
 func (r requiredCheck) satisfiedBy(c headCheck) bool {
-	return c.name == r.context && (r.appID <= 0 || c.appID == 0 || c.appID == r.appID)
+	return c.name == r.context && (r.appID <= 0 || c.appID == r.appID)
 }
 
 // GhPrChecksRollup returns the CI status of the PR's current head commit:
