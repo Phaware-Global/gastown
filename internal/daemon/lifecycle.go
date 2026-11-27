@@ -1181,8 +1181,8 @@ func (d *Daemon) checkOrphanedWork() {
 }
 
 // checkRigOrphanedWork reports hooked work whose polecat session is dead.
-// Liveness comes from tmux, not agent_state. A polecat whose latest work was
-// reported as a crash is skipped.
+// Liveness comes from tmux, not agent_state. A polecat whose latest work has a
+// recently delivered crash alert is skipped.
 func (d *Daemon) checkRigOrphanedWork(rigName string) {
 	work, err := d.listPolecatWork(rigName)
 	if err != nil {
@@ -1195,7 +1195,7 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {
 		if d.tmux.IsAgentAlive(sessionName) || d.polecatNuked(rigName, polecatName) {
 			continue
 		}
-		if d.crashReported(sessionName, latestWork(items)) {
+		if d.crashReported(latestWork(items)) {
 			continue
 		}
 

@@ -3101,8 +3101,8 @@ func KillOrphanedDaemons(townRoot string) (int, error) {
 }
 
 // checkStrandedWork reports hooked work whose agent cannot finish it. Crash
-// detection runs first and owns what it reports; the orphaned work check covers
-// the rest. Crash detection is the owner because it honors agent_state and
+// detection runs first and owns what it has recently mailed; the orphaned work
+// check covers the rest. Crash detection is the owner because it honors agent_state and
 // leaves the restart to stuck-agent-dog, while ORPHANED_WORK asks the witness to
 // restart or reassign.
 func (d *Daemon) checkStrandedWork() {
@@ -3184,10 +3184,12 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string, work []polecatW
 		return
 	}
 
+	assignee := rigName + "/polecats/" + polecatName
 	if sessionAlive {
-		d.forgetCrash(sessionName)
+		d.forgetCrashes(sessionName, assignee, nil)
 		return
 	}
+	d.forgetCrashes(sessionName, assignee, work)
 
 	// No work on the hook: a dead session needs no recovery. The Witness handles
 	// orphan cleanup during patrol.
@@ -3273,11 +3275,12 @@ func crashKey(w polecatWork) string {
 	return "crash|" + w.Assignee + "|" + w.ID
 }
 
-// crashReported reports whether crash detection has taken on this work.
-func (d *Daemon) crashReported(sessionName string, w polecatWork) bool {
+// crashReported reports whether a crash alert for this work was delivered
+// within workAlertRepeat. An undelivered or aged-out alert does not count.
+func (d *Daemon) crashReported(w polecatWork) bool {
 	d.alertsMu.Lock()
 	defer d.alertsMu.Unlock()
-	return d.crashedSessions[sessionName] == crashKey(w)
+	return time.Since(d.workAlerts[crashKey(w)]) < workAlertRepeat
 }
 
 // noteCrash remembers a dead session's crash and reports whether it is new.
@@ -3295,13 +3298,25 @@ func (d *Daemon) noteCrash(sessionName, key string) bool {
 	return true
 }
 
-// forgetCrash is called for a live session, so that its next death is reported.
-func (d *Daemon) forgetCrash(sessionName string) {
+// forgetCrashes drops the polecat's crash records except those for work in
+// keep, so that a later crash is recorded and mailed again. A live session keeps
+// none; a dead one keeps only work still on its hook.
+func (d *Daemon) forgetCrashes(sessionName, assignee string, keep []polecatWork) {
+	kept := make(map[string]bool, len(keep))
+	for _, w := range keep {
+		kept[crashKey(w)] = true
+	}
+	prefix := crashKey(polecatWork{Assignee: assignee})
+
 	d.alertsMu.Lock()
 	defer d.alertsMu.Unlock()
 
-	if key, ok := d.crashedSessions[sessionName]; ok {
-		delete(d.workAlerts, key)
+	for key := range d.workAlerts {
+		if strings.HasPrefix(key, prefix) && !kept[key] {
+			delete(d.workAlerts, key)
+		}
+	}
+	if key, ok := d.crashedSessions[sessionName]; ok && !kept[key] {
 		delete(d.crashedSessions, sessionName)
 	}
 }
