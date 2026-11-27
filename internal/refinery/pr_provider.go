@@ -32,6 +32,8 @@ type ReviewThread struct {
 	// LastReplyAuthor is who wrote the newest reply; empty when the thread has
 	// no reply or the provider does not report it.
 	LastReplyAuthor string
+	// LastReplyAt is when that reply was written; zero when unknown.
+	LastReplyAt time.Time
 }
 
 // HeadApprovalChecker is implemented by providers that can tie an approval to a
@@ -42,9 +44,9 @@ type HeadApprovalChecker interface {
 	// are spelled.
 	PRAuthor(prNumber int) (string, error)
 
-	// IsPRApprovedAtSHA reports whether user's newest verdict is an approval of
-	// commit sha.
-	IsPRApprovedAtSHA(prNumber int, user, sha string) (bool, error)
+	// HeadApprovalTime returns when user's newest verdict was submitted, if
+	// that verdict is an approval of commit sha; zero otherwise.
+	HeadApprovalTime(prNumber int, user, sha string) (time.Time, error)
 }
 
 // PRProvider abstracts VCS-specific PR operations for the merge queue.
@@ -219,6 +221,7 @@ func gitReviewThreadsToProvider(in []git.GhReviewThread) []ReviewThread {
 			Body:            t.Body,
 			URL:             t.URL,
 			LastReplyAuthor: t.LastReplyAuthor,
+			LastReplyAt:     t.LastReplyAt,
 		})
 	}
 	return out

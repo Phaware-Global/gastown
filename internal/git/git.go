@@ -1932,6 +1932,8 @@ type GhReviewThread struct {
 	// LastReplyAuthor is who wrote the newest reply; empty when the thread has
 	// no reply.
 	LastReplyAuthor string `json:"lastReplyAuthor,omitempty"`
+	// LastReplyAt is when that reply was written; zero when there is none.
+	LastReplyAt time.Time `json:"lastReplyAt,omitzero"`
 }
 
 // GhPrReviewThreads returns every review thread on a PR.
@@ -1939,7 +1941,7 @@ type GhReviewThread struct {
 // and paginates so the full thread set is returned rather than the first 100.
 // Each thread's Body/Path/Line/Author/URL reflect the *first* comment on that
 // thread (consistent with how review bots post their top-level remarks), and
-// LastReplyAuthor comes from its newest.
+// LastReplyAuthor and LastReplyAt come from its newest.
 func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 	owner, repo, err := g.ghRepoOwnerName()
 	if err != nil {
@@ -1970,6 +1972,7 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 									Author struct {
 										Login string `json:"login"`
 									} `json:"author"`
+									CreatedAt time.Time `json:"createdAt"`
 								} `json:"nodes"`
 							} `json:"latest"`
 							Comments struct {
@@ -2012,7 +2015,7 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 										author{login}
 									}
 								}
-								latest: comments(last:1){ totalCount nodes{ author{login} } }
+								latest: comments(last:1){ totalCount nodes{ author{login} createdAt } }
 							}
 						}
 					}
@@ -2032,7 +2035,7 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 										author{login}
 									}
 								}
-								latest: comments(last:1){ totalCount nodes{ author{login} } }
+								latest: comments(last:1){ totalCount nodes{ author{login} createdAt } }
 							}
 						}
 					}
@@ -2077,6 +2080,7 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 			}
 			if n.Latest.TotalCount > 1 && len(n.Latest.Nodes) > 0 {
 				t.LastReplyAuthor = n.Latest.Nodes[0].Author.Login
+				t.LastReplyAt = n.Latest.Nodes[0].CreatedAt
 			}
 			threads = append(threads, t)
 		}
@@ -2640,26 +2644,31 @@ func (g *Git) GhPrApprovedBy(prNumber int, user string) (bool, error) {
 	return false, nil
 }
 
-// GhPrApprovedAtSHA reports whether user's newest verdict on the PR is an
-// approval of commit sha.
-func (g *Git) GhPrApprovedAtSHA(prNumber int, user, sha string) (bool, error) {
+// GhPrApprovalTimeAtSHA returns when user's newest verdict on the PR was
+// submitted, if that verdict is an approval of commit sha; zero otherwise.
+func (g *Git) GhPrApprovalTimeAtSHA(prNumber int, user, sha string) (time.Time, error) {
 	reviews, err := g.ghFetchReviews(prNumber)
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
-	approved := false
+	var latest ghReview
 	for _, r := range reviews {
 		if !strings.EqualFold(r.Author.Login, user) {
 			continue
 		}
 		switch r.State {
-		case "APPROVED":
-			approved = strings.EqualFold(r.Commit.OID, sha)
-		case "CHANGES_REQUESTED", "DISMISSED":
-			approved = false
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest = r
 		}
 	}
-	return approved, nil
+	if latest.State != "APPROVED" || !strings.EqualFold(latest.Commit.OID, sha) {
+		return time.Time{}, nil
+	}
+	at, err := time.Parse(time.RFC3339, latest.SubmittedAt)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing approval time on PR #%d: %w", prNumber, err)
+	}
+	return at, nil
 }
 
 // GhPrAuthor returns the login of the PR's author, spelled as review thread

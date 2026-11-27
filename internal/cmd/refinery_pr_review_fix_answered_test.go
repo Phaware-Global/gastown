@@ -93,7 +93,7 @@ func TestReviewFixAnsweredGate(t *testing.T) {
 func TestReviewFixAnsweredGate_LookupFailureIsOperational(t *testing.T) {
 	p := answeredProvider{author: "worker", err: errors.New("boom")}
 	err := reviewFixAnsweredGate(p, &refinery.MergeQueueConfig{PRReviewer: "reviewer"}, holderState(), "gt-mr-1",
-		[]refinery.ReviewThread{{ID: "t1", LastReplyAuthor: "worker"}}, ignoreEscalation)
+		[]refinery.ReviewThread{{ID: "t1", LastReplyAuthor: "worker", LastReplyAt: repliedOn}}, ignoreEscalation)
 	if code, ok := IsSilentExit(err); !ok || code != 4 {
 		t.Fatalf("err = %v, want silent exit 4", err)
 	}

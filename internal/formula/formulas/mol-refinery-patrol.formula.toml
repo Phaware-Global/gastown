@@ -1166,9 +1166,10 @@ possible:
 4. An answer covers one PR head. Ask again for a new head.
 
 The subcommand also skips a dispatch (exit 1) when a live polecat already holds a
-bead for the PR, or when the head is approved and the author replied last on
-every unresolved thread. In the second case the open threads still block the
-merge: nudge the mayor once to get them resolved.
+bead for the PR, or when the author replied last on every unresolved thread and
+the head was approved after those replies. In the second case the open threads
+still block the merge, and the subcommand itself escalates to get them
+resolved.
 
 ```bash
 {{ cmd }} refinery pr dispatch-review-fix $PR --mr $MR
