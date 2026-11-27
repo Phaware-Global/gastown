@@ -45,21 +45,29 @@ func TestAssessStaleness_NoProbeErrorStillStale(t *testing.T) {
 func TestApplyRedispatchCheck(t *testing.T) {
 	tests := []struct {
 		name      string
+		prevAgent string
 		agent     string
 		p         Polecat
 		wantStale bool
 	}{
-		{"reused, hook not yet landed", "spawning", Polecat{State: StateIdle}, false},
-		{"working agent state", "working", Polecat{State: StateIdle}, false},
-		{"hooked to a different issue", "idle", Polecat{State: StateIdle, Issue: "gt-new"}, false},
-		{"state working", "idle", Polecat{State: StateWorking}, false},
-		{"still idle and unchanged", "idle", Polecat{State: StateIdle}, true},
-		{"no agent bead", "", Polecat{State: StateIdle}, true},
+		{"reused, hook not yet landed", "idle", "spawning", Polecat{State: StateIdle}, false},
+		{"became working since detection", "idle", "working", Polecat{State: StateIdle}, false},
+		{"hooked to a different issue", "idle", "idle", Polecat{State: StateIdle, Issue: "gt-new"}, false},
+		{"state working", "idle", "idle", Polecat{State: StateWorking}, false},
+		{"still idle and unchanged", "idle", "idle", Polecat{State: StateIdle}, true},
+		{"no agent bead", "", "", Polecat{State: StateIdle}, true},
+		// A dead session leaves agent_state=working behind; it is not a reuse.
+		{"working left behind by a dead session", "working", "working", Polecat{State: StateIdle}, true},
+		{"running left behind by a dead session", "running", "running", Polecat{State: StateIdle}, true},
+		// Reuse writes spawning before anything else changes, so it always protects,
+		// even when the stale leftover state was already spawning.
+		{"leftover working, then reused", "working", "spawning", Polecat{State: StateIdle}, false},
+		{"spawning at detection and now", "spawning", "spawning", Polecat{State: StateIdle}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			info := &StalenessInfo{Name: "p1", AgentState: tt.agent, IsStale: true, Reason: "stale"}
-			applyRedispatchCheck(info, &tt.p, &StalenessInfo{Name: "p1"})
+			applyRedispatchCheck(info, &tt.p, &StalenessInfo{Name: "p1", AgentState: tt.prevAgent})
 			if info.IsStale != tt.wantStale {
 				t.Errorf("IsStale = %v, want %v (reason %q)", info.IsStale, tt.wantStale, info.Reason)
 			}
