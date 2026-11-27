@@ -1,14 +1,18 @@
 package rig
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/templates/commands"
 )
 
 func gasTownIgnorePatterns() []string {
@@ -146,100 +150,213 @@ func EnsureGitignorePatterns(worktreePath string) error {
 	return nil
 }
 
-// gasTownLocalExcludePatterns returns the patterns to write to the worktree-local
-// .git/info/exclude file. This is a superset of gasTownIgnorePatterns() and
-// includes .beads/ — which is safe here because .git/info/exclude is per-worktree
-// and never committed to the repo (unlike .gitignore, where .beads/ must NOT appear
-// because Beads manages its own .beads/.gitignore via bd init).
+// gasTownLocalExcludePatterns returns the patterns for a worktree's own exclude
+// file: only the paths Gas Town itself writes into a polecat worktree, anchored at
+// the worktree root. It is deliberately narrower than gasTownIgnorePatterns(): an
+// exclude hides untracked files from git status and git add, so a broad pattern
+// such as .claude/ would make a polecat's new skill or CLAUDE.md silently
+// uncommittable. .beads/ is safe here (unlike in .gitignore, where it breaks bd
+// sync) because this file is per-worktree and never committed.
 func gasTownLocalExcludePatterns() []string {
-	patterns := gasTownIgnorePatterns()
-	// .beads/ is excluded from gasTownIgnorePatterns() to avoid breaking bd sync
-	// (see EnsureGitignorePatterns comment). The local exclude file is safe to
-	// include it — it's per-worktree and invisible to `git status` without affecting
-	// the tracked .gitignore (gas-7vg defense-in-depth).
-	return append(patterns, ".beads/")
+	patterns := []string{"/.runtime/", "/.beads/", "/CLAUDE.local.md"}
+	for _, name := range commands.Names() {
+		patterns = append(patterns, "/.claude/commands/"+name+".md")
+	}
+	return patterns
 }
 
-// EnsureLocalExcludePatterns writes the standard Gas Town ignore patterns to the
-// worktree-local git exclude file so the worktree stays clean without mutating a
-// tracked .gitignore.
+// localExcludeFileName is the per-worktree exclude file, kept in the worktree's own
+// git dir. It is not info/exclude: git reads info/exclude only from the common
+// (shared) git dir, so the copy Gas Town used to write into a linked worktree's git
+// dir was never read.
+const localExcludeFileName = "gt-exclude"
+
+// EnsureLocalExcludePatterns makes git ignore the files Gas Town provisions in this
+// worktree only, without touching a tracked .gitignore or the exclude file shared
+// by every worktree of the repository. It writes the patterns to a file in the
+// worktree's own git dir and points the worktree's core.excludesFile at it, which
+// needs git's per-worktree config (extensions.worktreeConfig).
+//
+// A per-worktree core.excludesFile takes the place of the user's global one inside
+// this worktree, so the global file's patterns are copied into it.
 func EnsureLocalExcludePatterns(worktreePath string) error {
-	excludePath, err := gitLocalExcludePath(worktreePath)
+	gitDir, err := gitRevParse(worktreePath, "--absolute-git-dir")
 	if err != nil {
 		return err
 	}
-
+	excludePath := filepath.Join(gitDir, "info", localExcludeFileName)
 	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
 		return fmt.Errorf("creating local exclude dir: %w", err)
 	}
-
-	var existingContent string
-	if data, err := os.ReadFile(excludePath); err == nil {
-		existingContent = string(data)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("reading local exclude: %w", err)
-	}
-
-	var missing []string
-	for _, pattern := range gasTownLocalExcludePatterns() {
-		found := false
-		for _, line := range strings.Split(existingContent, "\n") {
-			line = strings.TrimSpace(line)
-			if matchesGitignorePattern(line, pattern) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, pattern)
-		}
-	}
-
-	if len(missing) == 0 {
-		return nil
-	}
-
-	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// git reads a single excludes file, so the per-worktree one would otherwise
+	// switch off the user's global (or repository-configured) ignore here and let `git add -A` stage whatever
+	// it hides (.env, key files). Carry its patterns over; this file is rewritten on
+	// every add or repair, so the copy stays current.
+	inherited, err := inheritedExcludes(worktreePath)
 	if err != nil {
-		return fmt.Errorf("opening local exclude: %w", err)
+		return err
 	}
-	defer f.Close()
-
-	if existingContent != "" && !strings.HasSuffix(existingContent, "\n") {
-		if _, err := f.WriteString("\n"); err != nil {
-			return err
-		}
-	}
-	if existingContent != "" {
-		if _, err := f.WriteString("\n# Gas Town (added by gt)\n"); err != nil {
-			return err
-		}
+	content := inherited +
+		"# Gas Town (written by gt; do not edit)\n" + strings.Join(gasTownLocalExcludePatterns(), "\n") + "\n"
+	if err := os.WriteFile(excludePath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("writing local exclude: %w", err)
 	}
 
-	for _, pattern := range missing {
-		if _, err := f.WriteString(pattern + "\n"); err != nil {
-			return err
-		}
+	if err := enableWorktreeConfig(worktreePath); err != nil {
+		return err
 	}
-
+	if out, err := exec.Command("git", "-C", worktreePath, "config", "--worktree", "core.excludesFile", excludePath).CombinedOutput(); err != nil {
+		return fmt.Errorf("setting worktree core.excludesFile: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 
-func gitLocalExcludePath(worktreePath string) (string, error) {
-	cmd := exec.Command("git", "-C", worktreePath, "rev-parse", "--git-dir")
-	out, err := cmd.CombinedOutput()
+// inheritedExcludes returns the contents of the excludes file git would apply in
+// worktreePath without the per-worktree setting: the last core.excludesFile from
+// any other scope (system, global or repository config, with include and includeIf
+// resolved as git resolves them for this worktree), else git's default
+// $XDG_CONFIG_HOME/git/ignore (~/.config/git/ignore). An empty last value means the
+// excludes were switched off on purpose, so nothing is inherited.
+//
+// It fails closed: if git cannot answer (for example a git too old for
+// --show-scope), the caller must not install the per-worktree file, because doing
+// so without the inherited patterns would un-ignore files the user hides.
+func inheritedExcludes(worktreePath string) (string, error) {
+	path, set := "", false
+	out, err := exec.Command("git", "-C", worktreePath, "config", "--show-scope", "--path", "--get-all", "core.excludesFile").Output()
 	if err != nil {
-		return "", fmt.Errorf("resolving git dir: %w: %s", err, strings.TrimSpace(string(out)))
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return "", fmt.Errorf("resolving inherited core.excludesFile: %w", err)
+		}
+		if exitErr.ExitCode() != 1 { // 1 = key not set
+			// First line only: on an unknown option git follows it with its whole usage text.
+			msg, _, _ := strings.Cut(strings.TrimSpace(string(exitErr.Stderr)), "\n")
+			hint := ""
+			if exitErr.ExitCode() == 129 { // usage error: git older than 2.26 has no --show-scope
+				hint = " (needs git 2.26+ for --show-scope)"
+			}
+			return "", fmt.Errorf("resolving inherited core.excludesFile%s: %w: %s", hint, err, msg)
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		scope, value, ok := strings.Cut(strings.TrimRight(line, "\r"), "\t")
+		if ok && scope != "worktree" {
+			path, set = value, true // later entries override earlier ones
+		}
+	}
+	switch {
+	case set && path == "":
+		return "", nil
+	case !set:
+		base := os.Getenv("XDG_CONFIG_HOME")
+		if base == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", nil
+			}
+			base = filepath.Join(home, ".config")
+		}
+		path = filepath.Join(base, "git", "ignore")
+	case !filepath.IsAbs(path):
+		path = filepath.Join(worktreePath, path) // git resolves it against the worktree root
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return "", nil
+	}
+	return "# Copied from " + path + "\n" + strings.TrimRight(string(data), "\n") + "\n\n", nil
+}
+
+// enableWorktreeConfig turns on extensions.worktreeConfig for the repository that
+// worktreePath belongs to. Once the extension is on, every linked worktree reads
+// the common config as its own, so a core.bare=true left there makes all of them
+// fail with "this operation must be run in a work tree". As git's own
+// sparse-checkout does, core.bare is therefore moved to the main worktree's
+// config.worktree first; each step leaves linked worktrees usable.
+//
+// Sibling polecats are set up concurrently, so the migration runs under a file lock
+// in the common git dir, and each write retries while another git process holds
+// config.lock. If the extension still cannot be enabled, core.bare is put back so
+// the repository is not left reading as non-bare.
+func enableWorktreeConfig(worktreePath string) error {
+	commonDir, err := gitRevParse(worktreePath, "--git-common-dir")
+	if err != nil {
+		return err
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
+	}
+	commonConfig := filepath.Join(commonDir, "config")
+	get := func(key string) string {
+		out, _ := exec.Command("git", "config", "--file", commonConfig, "--get", key).Output()
+		return strings.TrimSpace(string(out))
+	}
+	if get("extensions.worktreeConfig") == "true" {
+		return nil
 	}
 
-	gitDir := strings.TrimSpace(string(out))
-	if gitDir == "" {
-		return "", fmt.Errorf("empty git dir for %s", worktreePath)
+	lock := flock.New(filepath.Join(commonDir, "gt-worktree-config.lock"))
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("locking %s: %w", commonDir, err)
 	}
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(worktreePath, gitDir)
+	defer func() { _ = lock.Unlock() }()
+	if get("extensions.worktreeConfig") == "true" {
+		return nil // a sibling finished the migration while we waited
 	}
-	return filepath.Join(gitDir, "info", "exclude"), nil
+
+	if get("core.worktree") != "" {
+		return fmt.Errorf("not enabling per-worktree git config: %s sets core.worktree", commonConfig)
+	}
+	set := func(file string, args ...string) error {
+		var out []byte
+		var err error
+		for attempt := 0; attempt < gitConfigLockRetries; attempt++ {
+			out, err = exec.Command("git", append([]string{"config", "--file", file}, args...)...).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "could not lock config file") {
+				break
+			}
+			time.Sleep(gitConfigLockBackoff)
+		}
+		if err != nil {
+			return fmt.Errorf("git config %s in %s: %w: %s", strings.Join(args, " "), file, err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	bare := get("core.bare")
+	if bare != "" {
+		if err := set(filepath.Join(commonDir, "config.worktree"), "core.bare", bare); err != nil {
+			return err
+		}
+		if err := set(commonConfig, "--unset", "core.bare"); err != nil {
+			return err
+		}
+	}
+	if err := set(commonConfig, "extensions.worktreeConfig", "true"); err != nil {
+		if bare != "" {
+			_ = set(commonConfig, "core.bare", bare)
+		}
+		return err
+	}
+	return nil
+}
+
+// git holds config.lock only for the duration of one write, so a short wait clears it.
+const (
+	gitConfigLockRetries = 20
+	gitConfigLockBackoff = 50 * time.Millisecond
+)
+
+func gitRevParse(worktreePath, arg string) (string, error) {
+	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", arg).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse %s: %w: %s", arg, err, strings.TrimSpace(string(out)))
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return "", fmt.Errorf("git rev-parse %s: empty result for %s", arg, worktreePath)
+	}
+	return dir, nil
 }
 
 // matchesGitignorePattern checks if a gitignore line covers the required pattern.
