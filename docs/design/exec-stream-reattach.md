@@ -643,7 +643,8 @@ one whose agent exited by itself, so `ended` means the target has been swept.
 
 So in container mode the bound from an arming frame is: one command already
 in flight (30s at most), `execWaitDelay`, the kill step (30s at most); or,
-on an unknown outcome, the container stop (`docker stop -t 30`) instead.
+on an unknown outcome, the container stop (`docker stop -t 30`) instead,
+which holds while the daemon still answers `docker stop`.
 
 The same ID rule applies to session-level commands: `StopWork` and teardown
 address the container by ID, and an orphan record keeps the ID so that orphan
@@ -661,7 +662,8 @@ section that inserts the session, refuses a container session whose
 container name is held by any entry in `s.sessions`. Whatever holds the name
 at `Prepare` is then stale. Bring-up must run that removal before it replaces
 the worktree (today the clone comes first, `service.go:658-663`, `:722-752`),
-so a container whose stop failed cannot write into the new clone.
+so a container whose stop failed cannot write into the new clone, and must
+abort when the removal fails (`workenv.go:260` ignores that error today).
 
 | Trigger | Acts on | Dropped or cancelled when |
 |---|---|---|
@@ -825,7 +827,7 @@ staged binary still waits for the worker to be idle (§4).
 
 | Phase | Change | Rough size | Tests |
 |---|---|---|---|
-| 1 | Worker: session-owned exec, ring buffer, `detached`/`exited` states, replace-on-fresh-attach, `idle_since`, detach timeout (default 0 in this phase, so behaviour is unchanged until phase 2), `StopWork` wired in both modes to fence, end and reap the exec (error on reap timeout), the §3.5 ownership invariant and end routine in both modes (container addressed by ID, per-exec command queue, session stop on a failed routine, prototype of holding the leader), stale-container removal before the worktree is replaced, container-name guard in `session_open`, summary fields | ~600 lines + tests in `internal/workerclient` | Unit: ring wrap and offsets; agent survives a closed connection and keeps producing; output never blocks with no reader; detach timeout cancels; replace ends the old agent before starting the new; teardown, shutdown, `shutdownAll`, dead-man and `max_runtime` each reap a detached native agent before the final checkpoint is taken, and refuse an attach during the flush; a second container session whose rig/polecat pair maps to a live session's container name is refused and the first container is untouched, while a colliding orphan's stopped container is removed; a stale container that is still running is removed before bring-up touches the worktree; existing exec and pty tests unchanged with timeout 0 |
+| 1 | Worker: session-owned exec, ring buffer, `detached`/`exited` states, replace-on-fresh-attach, `idle_since`, detach timeout (default 0 in this phase, so behaviour is unchanged until phase 2), `StopWork` wired in both modes to fence, end and reap the exec (error on reap timeout), the §3.5 ownership invariant and end routine in both modes (container addressed by ID, per-exec command queue, session stop on a failed routine, prototype of holding the leader), stale-container removal before the worktree is replaced (bring-up aborts if it fails), container-name guard in `session_open`, summary fields | ~600 lines + tests in `internal/workerclient` | Unit: ring wrap and offsets; agent survives a closed connection and keeps producing; output never blocks with no reader; detach timeout cancels; replace ends the old agent before starting the new; teardown, shutdown, `shutdownAll`, dead-man and `max_runtime` each reap a detached native agent before the final checkpoint is taken, and refuse an attach during the flush; a second container session whose rig/polecat pair maps to a live session's container name is refused and the first container is untouched, while a colliding orphan's stopped container is removed; a stale container that is still running is removed before bring-up touches the worktree, and bring-up aborts with the worktree untouched when that removal fails; existing exec and pty tests unchanged with timeout 0 |
 | 2 | Protocol and launcher: capability, `exec_id`/`offset`/`truncated`, `ping`/`pong` liveness on both sides, resume and supersede, exit-code retention, launcher retry loop, stdin buffer, `SIGHUP` detaches (and the stuck-agent-dog plugin stops using a bare `tmux kill-session`), in-container signal delivery, armed kill on forwarded `SIGTERM`/`SIGQUIT` | ~600 lines in `sockproto`, `socket`, `workerattach`, `workerclient` | Unit: every row of the §3.2 table; byte-exact replay across a cut at arbitrary offsets; exit while detached delivered once; `no_exec` never starts an agent; an offset beyond the counter is clamped; a peer that stops answering pings while its writes still succeed (a fake connection that accepts and discards) is declared dead in 30s, and a fresh attach then replaces instead of getting 125; two concurrent fresh attaches against a dead `echo` stream produce one replace and one 125, and the worker serves other connections during the probe; a `SIGTERM`-ignoring agent is killed `execWaitDelay` after the signal frame whether the stream then stays, drops or resumes, in both modes; a `SIGTERM`-ignoring child of an agent that exited is killed in container mode and, only on a platform where the leader is held, in native mode (on other platforms the test asserts that no group signal is sent after the reap); a signal frame or timer for an exec that is no longer the session's exec, or whose session was torn down or orphaned, does nothing, including when a new session of the same polecat has a container under the same name; with `-detach-timeout 0` a container `TERM` still goes to PID 1; container mode: a forwarded `TERM` leaves the container running and a restart after `Stop` attaches and runs; `QUIT` then a fresh attach within 10s, in both modes, and the new agent is still alive after the old deadline; a fresh attach on an `exited` exec sweeps before it starts; a container signal delivery stalled in `docker exec` while a fresh attach replaces: the new agent does not start until the delivery has returned; a fake docker that times out, or that errors after the start without the nonce, gets the session stopped and its container stopped by ID, and the attach is refused; after a timed-out `INT`, a forwarded `TERM` still ends a `TERM`-ignoring container agent within the stop bound; a `TERM` dropped at the queue cap still arms the routine, which then sends its own `TERM` before the kill; at a non-zero detach timeout a forwarded `TERM` reaches a cooperative container agent, which exits before the kill step; the stream reader keeps stamping inbound frames while a delivery is blocked. Launcher: redials after 30s of silence on an `echo` stream; against an old fake worker with an idle agent it stays attached for more than 60s; retries only with the capability, backoff, window expiry exits 75, terminal restored on every exit. Compat: new launcher against a capability-less fake worker |
 | 3 | Reclamation: idle-session timeout with flush, orphan triggers `applyPendingIfIdle`, `idle_reclaim` capability, orchestrator gate ignores orphans and reaps its own, `touch` from `Provision`, daemon sweep with conditional teardown, `Teardown` from nuke and polecat removal, detach timeout default 15 min | ~500 lines in `workerclient`, `sockproto`, `socket`, `daemon`, `cmd` | Unit: idle session is flushed then orphaned and the slot is free; staged binary applies after reclamation; gate arithmetic with orphans; sweep tears down only sessions with no tmux session whose `idle_since` is past the timeout, never by session age and never for another rig; a `touch` on a session being stopped answers `no_session` after the stop; a `touch` or an attach between the sweep's read and its teardown yields `busy`; `Provision` falls through to `session_open` on `no_session`; nuke of a remote polecat leaves no session on the worker |
 | 4 (optional) | Adoption by a new pane: `adopt` on attach, `Start` skips beacon and nudges when adopting, forced repaint; a session-scoped stop message for `Stop`, then stop forwarding `SIGTERM` | ~500 lines, mostly `internal/polecat` | Start-sequence tests with a detached exec present; end-to-end on a real worker |
@@ -857,11 +859,12 @@ staged binary still waits for the worker to be idle (§4).
    mode, with docker answering promptly: within `execWaitDelay` the work
    container has no process left but PID 1 and is still running; with a
    docker command that stalls, the container is stopped within the §3.5 bound
-   instead. Native mode: within `execWaitDelay` the agent's own process is
+   or, if `docker stop` also fails, removed before anything else runs under
+   that name. Native mode: within `execWaitDelay` the agent's own process is
    gone, and on a platform where the worker holds the leader its whole
-   process group is gone (elsewhere this part is not claimed). When the
-   container was not stopped, start the polecat again within those 10s: the
-   new agent starts and is still running a minute later.
+   process group is gone (elsewhere this part is not claimed). With docker
+   answering promptly, start the polecat again within those 10s: the new
+   agent starts and is still running a minute later.
 9. With the proxy unreachable for longer than the dead-man window and a native
    agent writing a tracked file continuously, the final checkpoint commit is
    taken after the agent's exit is logged.
@@ -914,7 +917,10 @@ staged binary still waits for the worker to be idle (§4).
 9. **Unknown docker outcome stops the session (§3.5).** No retry, so a single
    30s stall on one signal delivery ends the session and forces a fresh
    bring-up. *Recommendation:* keep it; if stalls prove common in practice,
-   the tunable is the 30s command timeout, not a retry.
+   the tunable is the 30s command timeout, not a retry. A possible follow-up
+   for native mode, not designed here: refuse a polecat's bring-up while its
+   orphan still holds an unreaped leader, instead of today's unprotected
+   worktree replace.
 10. **Could not determine from the code:** how the witness carries out
    `RESTART_POLECAT` (it is an agent acting on mail), and so whether any
    restart path tears the worker session down first; and whether the dead-man
