@@ -80,9 +80,9 @@ func runTapList(cmd *cobra.Command, args []string) error {
 		{
 			name:        "memory-write",
 			kind:        "guard",
-			description: "Block Write/Edit/NotebookEdit to Claude Code memory paths for worker roles",
+			description: "Block writes to Claude Code memory paths for worker roles",
 			event:       "PreToolUse",
-			matchers:    []string{"Write|Edit|NotebookEdit"},
+			matchers:    []string{"Bash", "Write|Edit|NotebookEdit"},
 			implemented: true,
 		},
 	}
