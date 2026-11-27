@@ -1171,7 +1171,24 @@ func (s *Service) loadPersisted() {
 // origin/<default> and set to track it, so `git rebase <default>` or a pull
 // on it uses the same commit as origin/<default>. When the polecat's branch
 // is the default branch it tracks the host's head and is left alone.
+//
+// All of this depends on the host having refs/remotes/origin/<default>. A rig
+// repo without it (one re-cloned and not fetched since) has only its heads to
+// offer, so the clone is left exactly as git made it. So is one whose default
+// branch cannot be read or has a name that is unsafe in git's argv.
 func useUpstreamTrackingRefs(ctx context.Context, worktree, branch string) error {
+	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output()
+	def := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/")
+	if err != nil || !validBranch(def) {
+		return nil
+	}
+	if out, err := exec.CommandContext(ctx, "git", "-C", worktree, "ls-remote", "--quiet", "--exit-code", "origin", "refs/remotes/origin/"+def).CombinedOutput(); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 2 { // no such ref
+			return nil
+		}
+		return fmt.Errorf("git ls-remote: %v: %s", err, strings.TrimSpace(string(out)))
+	}
 	steps := [][]string{
 		{"config", "remote.origin.fetch", "+refs/remotes/origin/*:refs/remotes/origin/*"},
 		{"config", "--add", "remote.origin.fetch", "^refs/remotes/origin/HEAD"},
@@ -1191,14 +1208,8 @@ func useUpstreamTrackingRefs(ctx context.Context, worktree, branch string) error
 			return fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
 		}
 	}
-	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output()
-	def := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/")
-	// def is the host's name for its default branch and goes into git's argv.
-	if err != nil || def == branch || !validBranch(def) {
+	if def == branch {
 		return nil
-	}
-	if exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+def).Run() != nil {
-		return nil // the host has no upstream ref for it; keep the clone's
 	}
 	args := []string{"branch", "--quiet", "--force", "--track", def, "origin/" + def}
 	if branch == "" { // no polecat branch: the worktree is on the default branch

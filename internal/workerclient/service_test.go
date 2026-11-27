@@ -789,6 +789,27 @@ func TestSessionOpen_DefaultBranchFollowsTheHostsUpstreamRef(t *testing.T) {
 	assert.Empty(t, git(t, worktree, "status", "--porcelain"))
 }
 
+// A rig repo with no refs/remotes/origin/<default> (re-cloned, not fetched
+// since) has only its heads to offer. The clone must stay as git made it:
+// origin/<default> and origin/HEAD resolve and the default branch has its
+// upstream, so `git rebase origin/<default>` still has a base.
+func TestSessionOpen_HostWithoutUpstreamRefsKeepsThePlainClone(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	base := git(t, rigRepo, "symbolic-ref", "--short", "HEAD")
+	head := git(t, rigRepo, "rev-parse", "HEAD")
+	git(t, rigRepo, "branch", branch, "HEAD")
+
+	worktree := provisionOn(t, proxyURL, ca, branch)
+	assert.Equal(t, head, git(t, worktree, "rev-parse", "origin/"+base))
+	assert.Equal(t, "origin/"+base, git(t, worktree, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"))
+	assert.Equal(t, "origin/"+base, git(t, worktree, "rev-parse", "--abbrev-ref", base+"@{upstream}"))
+	assert.Equal(t, "origin/"+branch, git(t, worktree, "rev-parse", "--abbrev-ref", "@{upstream}"))
+	git(t, worktree, "fetch", "origin")
+	git(t, worktree, "rebase", "origin/"+base)
+}
+
 // The default branch's name comes from the host. One that git would read as
 // an option (`git branch ... -m origin/-m` renames the current branch) must
 // not reach git's argv: bring-up succeeds and leaves that branch alone.
