@@ -160,3 +160,31 @@ func TestAgentStateKeepsLabelsSharingAPrefix(t *testing.T) {
 		t.Errorf("labels = %v, want %v", got, want)
 	}
 }
+
+// A change to the "gt" key removes its other labels but never gt:agent.
+func TestAgentStateGtKeyChangesKeepGtAgent(t *testing.T) {
+	labels := []string{"gt:agent", "gt:other", "idle:1"}
+
+	tests := []struct {
+		name     string
+		set, del []string
+		want     []string
+	}{
+		{name: "delete", del: []string{"gt"}, want: []string{"gt:agent", "idle:1"}},
+		{name: "set", set: []string{"gt=x"}, want: []string{"gt:agent", "gt:x", "idle:1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := installLabelBD(t, labels, labels)
+			agentStateSet, agentStateDel = tt.set, tt.del
+			defer func() { agentStateSet, agentStateDel = nil, nil }()
+			if err := modifyAgentState("x-refinery", t.TempDir(), false); err != nil {
+				t.Fatal(err)
+			}
+			if got := storedLabels(t, store); !slices.Equal(got, tt.want) {
+				t.Errorf("labels = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
