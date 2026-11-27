@@ -146,3 +146,13 @@ func TestGoCacheTrim_RefusesDirectoryThatIsNotAGoCache(t *testing.T) {
 	}
 	f.assert(true, "00/old-d")
 }
+
+func TestGoCacheTrim_RejectsCapTooLargeForShellArithmetic(t *testing.T) {
+	f := newGoCacheFixture(t)
+	f.write("00/old-d", 2, 100*time.Hour)
+
+	if out, err := f.run("99999999999999999999"); err == nil {
+		t.Errorf("run.sh accepted an overflowing cap:\n%s", out)
+	}
+	f.assert(true, "00/old-d")
+}

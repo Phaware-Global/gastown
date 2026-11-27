@@ -46,8 +46,8 @@ size_mb() {
   echo $(( ${out%%[!0-9]*} / 1024 ))
 }
 
-if ! [[ "$CAP_MB" =~ ^[1-9][0-9]*$ ]]; then
-  log "GT_GOCACHE_CAP_MB must be a positive integer, got '$CAP_MB'"
+if ! [[ "$CAP_MB" =~ ^[1-9][0-9]{0,8}$ ]]; then
+  log "GT_GOCACHE_CAP_MB must be a positive integer of at most 9 digits, got '$CAP_MB'"
   exit 1
 fi
 
