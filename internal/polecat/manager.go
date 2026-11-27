@@ -3578,7 +3578,7 @@ func (m *Manager) probeLocalStaleness(name, clonePath, defaultBranch string) *St
 	polecatGit := git.NewGit(clonePath)
 	info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
 
-	// Check for uncommitted work (excluding runtime artifacts Gas Town writes itself)
+	// Check for uncommitted work (excluding .beads/ and files Gas Town provisions itself)
 	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(clonePath)
 	return info
 }
@@ -3626,11 +3626,10 @@ func worktreeMissing(clonePath string) bool {
 }
 
 // probeUncommittedWork reports whether the worktree at clonePath has uncommitted work:
-// changed or untracked files other than runtime artifacts, a stash, or unpushed
-// commits. Runtime artifacts (.beads/, .runtime/, .claude/, CLAUDE.local.md, ...) are
-// written into every polecat worktree by Gas Town itself; counting them left every
-// polecat of a repo that does not ignore them permanently "dirty" and unreclaimable.
-// A failed git probe is returned as probeErr rather than read as a clean tree.
+// a stash, unpushed commits, unmerged files, any changed tracked file outside
+// .beads/, or any untracked file Gas Town did not put there itself (see
+// isProvisionedPath). A failed git probe is returned as probeErr rather than read as
+// a clean tree.
 func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	if worktreeMissing(clonePath) {
 		return false, ""
@@ -3639,7 +3638,38 @@ func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	if err != nil {
 		return false, fmt.Sprintf("checking uncommitted work: %v", err)
 	}
-	return !status.CleanExcludingRuntime() || status.StashCount > 0 || status.UnpushedCommits > 0, ""
+	var work []string
+	for _, f := range status.UntrackedFiles {
+		if !isProvisionedPath(f) {
+			work = append(work, f)
+		}
+	}
+	status.UntrackedFiles = work
+	return !status.CleanExcludingBeads(), ""
+}
+
+// isProvisionedPath reports whether an untracked path (relative to the worktree
+// root) is one Gas Town writes into every polecat worktree: .runtime/, the root
+// CLAUDE.local.md, and the slash commands it provisions under .claude/commands/. In
+// a repository that does not git-ignore them they stay untracked forever; counting
+// them as work left every polecat of such a rig unreclaimable and the rig pinned at
+// its directory cap. The list is deliberately narrower than gt done's
+// runtime-artifact policy: that one decides what not to commit, this one decides
+// what may be deleted with the worktree, so anything else under .claude/, coverage/
+// and the like still counts as work.
+func isProvisionedPath(path string) bool {
+	path = filepath.ToSlash(path)
+	if path == "CLAUDE.local.md" || strings.HasPrefix(path, ".runtime/") {
+		return true
+	}
+	if name, ok := strings.CutPrefix(path, ".claude/commands/"); ok {
+		for _, cmd := range templates.CommandNames() {
+			if name == cmd+".md" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ErrNoLongerStale means a polecat chosen for cleanup was re-dispatched (or stopped
