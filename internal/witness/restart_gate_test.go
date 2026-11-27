@@ -18,9 +18,13 @@ import (
 func stubRestartSeams(t *testing.T, hooked []*beads.Issue, lookupErr error) (restarts, stops *int) {
 	t.Helper()
 	oldList, oldRestart, oldStop, oldVerify := listAssignedWork, restartPolecatSession, stopPolecatSession, verifyBranchAlreadyMerged
+	oldIdle, oldReplaced := setPolecatIdle, stopTargetReplaced
 	t.Cleanup(func() {
 		listAssignedWork, restartPolecatSession, stopPolecatSession, verifyBranchAlreadyMerged = oldList, oldRestart, oldStop, oldVerify
+		setPolecatIdle, stopTargetReplaced = oldIdle, oldReplaced
 	})
+	setPolecatIdle = func(_, _, _, _ string) error { return nil }
+	stopTargetReplaced = func(*tmux.Tmux, string, time.Time) bool { return false }
 	restarts, stops = new(int), new(int)
 	listAssignedWork = func(_, _, _, status string) ([]*beads.Issue, error) {
 		if status != beads.StatusHooked {
@@ -84,6 +88,8 @@ func TestDetectZombieDeadSession_RestartsOnlyWithWork(t *testing.T) {
 				if tt.dirty {
 					dirtyPolecatWorktree(t, townRoot)
 				}
+				idled := 0
+				setPolecatIdle = func(_, _, _, _ string) error { idled++; return nil }
 				bd, _ := mockBd(
 					func([]string) (string, error) { return "[]", nil },
 					func([]string) error { return nil },
@@ -102,6 +108,9 @@ func TestDetectZombieDeadSession_RestartsOnlyWithWork(t *testing.T) {
 				if *stops != 0 {
 					t.Errorf("stops = %d, want 0 for an already dead session", *stops)
 				}
+				if idled != 1-tt.want {
+					t.Errorf("idle writes = %d, want %d", idled, 1-tt.want)
+				}
 			})
 		}
 	}
@@ -112,27 +121,40 @@ func TestDetectZombieDeadSession_RestartsOnlyWithWork(t *testing.T) {
 // Not parallel: overrides package-level seams.
 func TestRestartOrStop(t *testing.T) {
 	for _, tt := range []struct {
-		name                    string
-		hooked                  []*beads.Issue
-		wantRestarts, wantStops int
-		wantActive              bool
+		name                               string
+		hooked                             []*beads.Issue
+		hookStatus                         string // status of the agent bead's hook bead, if it has one
+		replaced                           bool
+		wantRestarts, wantStops, wantIdled int
+		wantActive                         bool
 	}{
-		{name: "empty hook", wantStops: 1},
-		{name: "hooked bead", hooked: []*beads.Issue{{ID: "tr-1"}}, wantRestarts: 1, wantActive: true},
+		{name: "empty hook", wantStops: 1, wantIdled: 1},
+		{name: "assigned bead", hooked: []*beads.Issue{{ID: "tr-1"}}, wantRestarts: 1, wantActive: true},
+		{name: "open hook bead", hookStatus: "hooked", wantRestarts: 1, wantActive: true},
+		{name: "closed hook bead", hookStatus: "closed", wantStops: 1, wantIdled: 1},
+		{name: "session recreated", replaced: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			restarts, stops := stubRestartSeams(t, tt.hooked, nil)
+			idled := 0
+			setPolecatIdle = func(_, _, _, _ string) error { idled++; return nil }
+			stopTargetReplaced = func(*tmux.Tmux, string, time.Time) bool { return tt.replaced }
 			bd, _ := mockBd(
-				func([]string) (string, error) { return "[]", nil },
+				func([]string) (string, error) { return `[{"status":"` + tt.hookStatus + `"}]`, nil },
 				func([]string) error { return nil },
 			)
 			townRoot := t.TempDir()
 			z := &ZombieResult{PolecatName: "scavenger", WasActive: true, Classification: ZombieAgentDeadInSession}
+			if tt.hookStatus != "" {
+				z.HookBead = "tr-hook"
+			}
 
-			restartOrStop(bd, townRoot, townRoot, "testrig", "scavenger", z, DetectZombieOptions{})
+			restartOrStop(bd, townRoot, townRoot, "testrig", "scavenger", "tr-scavenger",
+				tmux.NewTmux(), time.Now(), nil, z, DetectZombieOptions{})
 
-			if *restarts != tt.wantRestarts || *stops != tt.wantStops {
-				t.Errorf("restarts, stops = %d, %d; want %d, %d", *restarts, *stops, tt.wantRestarts, tt.wantStops)
+			if *restarts != tt.wantRestarts || *stops != tt.wantStops || idled != tt.wantIdled {
+				t.Errorf("restarts, stops, idled = %d, %d, %d; want %d, %d, %d",
+					*restarts, *stops, idled, tt.wantRestarts, tt.wantStops, tt.wantIdled)
 			}
 			if z.WasActive != tt.wantActive {
 				t.Errorf("WasActive = %v, want %v", z.WasActive, tt.wantActive)

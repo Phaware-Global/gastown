@@ -6,9 +6,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -39,6 +41,38 @@ var stopPolecatSession = func(workDir, rigName, polecatName string) error {
 		return fmt.Errorf("session stop failed: %w", err)
 	}
 	return nil
+}
+
+// setPolecatIdle records agent_state=idle on a polecat's agent bead.
+// A var so tests can observe the write.
+var setPolecatIdle = func(workDir, townRoot, rigName, polecatName string) error {
+	agentBeadID := beads.PolecatBeadIDWithPrefix(beads.GetPrefixForRig(townRoot, rigName), rigName, polecatName)
+	return beads.New(workDir).UpdateAgentState(agentBeadID, string(AgentStateIdle))
+}
+
+// stopTargetReplaced is the guard against stopping a session that was created
+// after the zombie was detected. A var so tests can simulate that race.
+var stopTargetReplaced = sessionRecreated
+
+// retireIdlePolecat marks a polecat with no work as idle and drops its
+// done-intent labels, so later patrols do not evaluate it again. A failed write
+// leaves both in place and the next patrol retries.
+func retireIdlePolecat(bd *BdCli, workDir, townRoot, rigName, polecatName string, snap *agentBeadSnapshot) {
+	if err := setPolecatIdle(workDir, townRoot, rigName, polecatName); err != nil {
+		fmt.Fprintf(os.Stderr, "witness: marking %s/%s idle: %v\n", rigName, polecatName, err)
+		return
+	}
+	if snap == nil {
+		return
+	}
+	var intents []string
+	for _, e := range parseDoneIntentLabels(snap.Labels) {
+		intents = append(intents, e.label)
+	}
+	if len(intents) > 0 {
+		agentBeadID := beads.PolecatBeadIDWithPrefix(beads.GetPrefixForRig(townRoot, rigName), rigName, polecatName)
+		clearDoneIntentLabels(bd, workDir, agentBeadID, intents)
+	}
 }
 
 // polecatNeedsSession reports whether a polecat has anything a new session would
@@ -82,7 +116,7 @@ func hasUnsavedWork(townRoot, rigName, polecatName string) bool {
 
 // restartOrStop handles a zombie whose session is still up: restart it if the
 // polecat has work for a new session, otherwise stop it.
-func restartOrStop(bd *BdCli, workDir, townRoot, rigName, polecatName string, zombie *ZombieResult, opts DetectZombieOptions) {
+func restartOrStop(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, detectedAt time.Time, snap *agentBeadSnapshot, zombie *ZombieResult, opts DetectZombieOptions) {
 	if opts.NoRestart {
 		zombie.Action = restartSuppressedAction(zombie.Classification)
 		return
@@ -96,9 +130,17 @@ func restartOrStop(bd *BdCli, workDir, townRoot, rigName, polecatName string, zo
 	}
 	// Not active work: there is nothing to report as lost or to re-dispatch.
 	zombie.WasActive = false
+	// The work check takes seconds, long enough for a sling to start a new
+	// session under the same name.
+	if stopTargetReplaced(t, sessionName, detectedAt) {
+		zombie.Action = "stop-skipped (session recreated)"
+		return
+	}
 	zombie.Action = "stopped-session (no hooked or unsaved work)"
 	if err := stopPolecatSession(workDir, rigName, polecatName); err != nil {
 		zombie.Error = err
 		zombie.Action = fmt.Sprintf("stop-failed (%s): %v", zombie.Classification, err)
+		return
 	}
+	retireIdlePolecat(bd, workDir, townRoot, rigName, polecatName, snap)
 }
