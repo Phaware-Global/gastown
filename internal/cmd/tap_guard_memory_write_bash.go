@@ -133,6 +133,20 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 			}
 			inWord, quoted = true, true
 		case '$', '`':
+			// A ")" inside ${ } does not close the enclosing "$(".
+			if nested && c == '$' && at(i+1) == '{' {
+				if end := parameterEnd(s, i); end >= 0 {
+					inner := s[i+2 : end]
+					if subs := expansions(inner); len(subs) > 0 {
+						toks = append(toks, subs...)
+						word.WriteString(substitutionMark)
+					} else {
+						word.WriteString(s[i : end+1])
+					}
+					inWord, i = true, end
+					continue
+				}
+			}
 			if last, ok := substitute(i, false); ok {
 				i = last
 				continue
@@ -152,7 +166,7 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 		case '\n':
 			emit(";")
 			for _, h := range heredocs {
-				body, last, ok := heredocBody(s, i, h.tag, nested)
+				body, last, other, ok := heredocBody(s, i, h.tag, nested)
 				if !ok {
 					// No delimiter: the "<<" was most likely a shift, so the
 					// lines after it are still commands.
@@ -160,8 +174,10 @@ func lexCommands(s string, nested bool) ([]shellToken, int) {
 				}
 				*h.body, i = body, last
 				if !h.quoted {
+					*h.body = unescapeHeredoc(body)
 					toks = append(toks, expansions(body)...)
 				}
+				toks = append(toks, subshell(lexShell(other))...)
 			}
 			heredocs = nil
 		case '(':
@@ -324,7 +340,14 @@ func arithmeticEnd(s string, i int) int {
 
 // heredocBody reads the body that follows the newline at s[i], up to the line
 // holding tag alone. It returns the body and the index of the last byte used.
-func heredocBody(s string, i int, tag string, nested bool) (string, int, bool) {
+//
+// Inside $( ) shells disagree about a line starting tag+")": some end the body
+// there, while zsh reads on to a line holding tag alone if there is one. When
+// both exist the body follows zsh, and other is the text the other reading runs
+// as commands, so that the caller can scan both.
+func heredocBody(s string, i int, tag string, nested bool) (body string, last int, other string, ok bool) {
+	paren := -1 // the first line starting tag+")"
+	var parenLast int
 	for start := i + 1; start < len(s); {
 		line := s[start:]
 		if end := strings.IndexByte(line, '\n'); end >= 0 {
@@ -332,15 +355,52 @@ func heredocBody(s string, i int, tag string, nested bool) (string, int, bool) {
 		}
 		trimmed := strings.TrimLeft(line, "\t")
 		if trimmed == tag {
-			return s[i+1 : start], start + len(line), true
+			if paren >= 0 {
+				// A quote right after the ")" closes one opened before "$(".
+				other = strings.TrimPrefix(s[parenLast+2:start], `"`)
+			}
+			return s[i+1 : start], start + len(line), other, true
 		}
-		// Inside $( ) the ")" may share the delimiter's line.
-		if nested && strings.HasPrefix(trimmed, tag+")") {
-			return s[i+1 : start], start + len(line) - len(trimmed) + len(tag) - 1, true
+		if nested && paren < 0 && strings.HasPrefix(trimmed, tag+")") {
+			paren, parenLast = start, start+len(line)-len(trimmed)+len(tag)-1
 		}
 		start += len(line) + 1
 	}
-	return "", i, false
+	if paren >= 0 {
+		return s[i+1 : paren], parenLast, "", true
+	}
+	return "", i, "", false
+}
+
+// unescapeHeredoc returns the text a command reads from an unquoted heredoc,
+// where a backslash escapes only another backslash, "$", "`" and a newline.
+func unescapeHeredoc(body string) string {
+	return strings.NewReplacer(`\\`, `\`, `\$`, `$`, "\\`", "`", "\\\n", "").Replace(body)
+}
+
+// parameterEnd returns the index of the "}" closing the "${" at s[i], or -1.
+func parameterEnd(s string, i int) int {
+	depth := 0
+	var quote byte
+	for j := i + 1; j < len(s); j++ {
+		switch c := s[j]; {
+		case c == '\\' && quote != '\'':
+			j++
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '{':
+			depth++
+		case c == '}':
+			if depth--; depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 // shellScope is the state a command inherits from the ones before it.
@@ -546,6 +606,8 @@ func readsScriptFromStdin(args []string) bool {
 		switch a := args[i]; {
 		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
 			i++
+		case a == "/dev/stdin" || a == "/dev/fd/0":
+			return true
 		case a == "-" || strings.HasPrefix(a, "--") && a != "--":
 		case strings.HasPrefix(a, "-") && strings.Contains(a, "s"):
 			return true
@@ -607,15 +669,19 @@ func writtenFiles(name string, args []string) []string {
 func copyTargets(name string, args []string) []string {
 	var dest string
 	var sources []string
+	intoDir := false     // -t says the destination is a directory
 	if name != "rsync" { // rsync -t preserves times
 		for i, a := range args {
+			if a == "--" { // what follows are operands, whatever they look like
+				break
+			}
 			if dir, ok := strings.CutPrefix(a, "--target-directory="); ok {
-				dest, sources = dir, operands(args)
+				dest, sources, intoDir = dir, operands(args), true
 				break
 			}
 			short := len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.HasSuffix(a, "t")
 			if (short || a == "--target-directory") && i+1 < len(args) {
-				dest = args[i+1]
+				dest, intoDir = args[i+1], true
 				sources = operands(append(append([]string{}, args[:i]...), args[i+2:]...))
 				break
 			}
@@ -629,6 +695,12 @@ func copyTargets(name string, args []string) []string {
 		dest, sources = ops[len(ops)-1], ops[:len(ops)-1]
 	}
 	targets := []string{dest}
+	// One source given a sibling's name is a rename, as in "mv memory
+	// memory.bak", not a copy into that sibling.
+	if !intoDir && len(sources) == 1 && !strings.HasSuffix(dest, "/") &&
+		path.Dir(path.Clean(sources[0])) == path.Dir(path.Clean(dest)) {
+		return targets
+	}
 	for _, src := range sources {
 		// rsync copies a directory's contents, not the directory, after "src/".
 		if name == "rsync" && strings.HasSuffix(src, "/") {

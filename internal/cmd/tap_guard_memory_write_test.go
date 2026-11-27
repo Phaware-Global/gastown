@@ -79,6 +79,11 @@ func TestIsClaudeCodeMemoryPath(t *testing.T) {
 			false,
 		},
 		{
+			"Unicode case folding: long s folds to s",
+			"/Users/agent/.claude/project\u017f/x/memory/a.md",
+			true,
+		},
+		{
 			"substring collision — 'memory' in filename but not directory",
 			"/Users/agent/.claude/projects/x/notes-memory.md",
 			false,

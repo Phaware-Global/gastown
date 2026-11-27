@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/text/cases"
 )
 
 var tapGuardMemoryWriteCmd = &cobra.Command{
@@ -165,7 +166,7 @@ func isClaudeCodeMemoryPath(filePath string) bool {
 	if filePath == "" {
 		return false
 	}
-	filePath = strings.ToLower(filePath)
+	filePath = cases.Fold().String(filePath)
 	const needle = ".claude/projects/"
 	// Walk through every occurrence of needle; accept the first one that
 	// sits at a path-segment boundary.
