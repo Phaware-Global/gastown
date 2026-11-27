@@ -622,9 +622,11 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
 	// Query issues table first. Issues include labels and type metadata used by
 	// doctor checks (for example, validating gt:agent labels).
-	// Agent beads are type=agent (infrastructure), hidden by bd list default filter.
-	// Use --include-infra so they appear in results.
-	out, err := b.run("list", "--label=gt:agent", "--include-infra", "--json", "--flat", "--no-pager", "--limit=0")
+	args := []string{"list", "--label=gt:agent", "--json", "--flat", "--no-pager", "--limit=0"}
+	if b.agentListNeedsInfra() {
+		args = append(args, "--include-infra")
+	}
+	out, err := b.run(args...)
 	if err != nil {
 		return nil, err
 	}
@@ -643,6 +645,38 @@ func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
 	wispBeads, _ := b.ListAgentBeadsFromWisps()
 
 	return mergeAgentBeadSources(issuesByID, wispBeads), nil
+}
+
+// hiddenAgentBeadsQuery counts the open gt:agent records that a bd list without
+// --include-infra can omit: any in the wisps table, and any durable one of a
+// type other than task, which covers every infrastructure type.
+const hiddenAgentBeadsQuery = "SELECT " +
+	"(SELECT COUNT(*) FROM wisps w JOIN wisp_labels l ON l.issue_id = w.id " +
+	"WHERE l.label = 'gt:agent' AND w.status <> 'closed') + " +
+	"(SELECT COUNT(*) FROM issues i JOIN labels l ON l.issue_id = i.id " +
+	"WHERE l.label = 'gt:agent' AND i.status <> 'closed' AND i.issue_type <> 'task') AS hidden"
+
+// agentListNeedsInfra reports whether the agent bead list must pass
+// --include-infra. The flag makes bd search the whole wisps table, which on the
+// town database is large enough to time out under load, so the town query
+// passes it only when an indexed probe finds a record it would add, or when the
+// probe cannot tell. Rig databases keep type=agent records and always pass it.
+func (b *Beads) agentListNeedsInfra() bool {
+	townRoot := b.getTownRoot()
+	if townRoot == "" || filepath.Clean(b.getResolvedBeadsDir()) != filepath.Clean(ResolveBeadsDir(townRoot)) {
+		return true
+	}
+	out, err := b.run("sql", "--json", hiddenAgentBeadsQuery)
+	if err != nil {
+		return true
+	}
+	var rows []struct {
+		Hidden *int `json:"hidden"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil || len(rows) != 1 || rows[0].Hidden == nil {
+		return true
+	}
+	return *rows[0].Hidden > 0
 }
 
 // mergeAgentBeadSources merges issue-backed and wisp-backed agent bead maps.

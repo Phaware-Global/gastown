@@ -152,20 +152,15 @@ func queryAgentState(agentBead, beadsDir string) error {
 	return nil
 }
 
-// modifyAgentState modifies labels on an agent bead.
-// Uses read-modify-write pattern: read current labels, apply changes, write back all.
+// modifyAgentState applies the --incr, --set and --del operations to an agent
+// bead. Only the keys named by those operations are written.
 func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
-	// Read current labels
 	labels, err := getAgentLabels(agentBead, beadsDir)
 	if err != nil {
 		return err
 	}
 
-	// Also get non-state labels (ones without : separator) to preserve them
-	allLabels, err := getAllAgentLabels(agentBead, beadsDir)
-	if err != nil {
-		return err
-	}
+	changes := make(map[string]*string)
 
 	// Apply increment operation
 	if hasIncr {
@@ -175,66 +170,84 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 				currentValue = v
 			}
 		}
-		labels[agentStateIncr] = strconv.Itoa(currentValue + 1)
+		next := strconv.Itoa(currentValue + 1)
+		changes[agentStateIncr] = &next
 	}
 
 	// Apply set operations
 	for _, setOp := range agentStateSet {
-		parts := strings.SplitN(setOp, "=", 2)
-		if len(parts) != 2 {
+		key, value, ok := strings.Cut(setOp, "=")
+		if !ok {
 			return fmt.Errorf("invalid set format: %s (expected key=value)", setOp)
 		}
-		labels[parts[0]] = parts[1]
+		changes[key] = &value
 	}
 
 	// Apply delete operations
 	for _, delKey := range agentStateDel {
-		delete(labels, delKey)
+		changes[delKey] = nil
 	}
 
-	// Build final label list: non-state labels + state labels (key:value format)
-	var finalLabels []string
+	if err := writeAgentStateLabels(agentBead, beadsDir, changes); err != nil {
+		return fmt.Errorf("updating agent state: %w", err)
+	}
 
-	// First, keep non-state labels (those without : separator)
-	for _, label := range allLabels {
-		if !strings.Contains(label, ":") {
-			finalLabels = append(finalLabels, label)
+	fmt.Printf("%s Updated agent state for %s\n", style.Bold.Render("✓"), agentBead)
+
+	return nil
+}
+
+// writeAgentStateLabels sets each key's key:value label on an agent bead, or
+// removes the key when its value is nil.
+//
+// It never uses bd's --set-labels: that removes every label and re-adds them one
+// at a time, so a concurrent reader can see a partial set and writing that back
+// drops identity labels such as gt:agent. For the same reason gt:agent is never
+// removed here, even by a change to the "gt" key.
+func writeAgentStateLabels(agentBead, beadsDir string, changes map[string]*string) error {
+	current, err := getAllAgentLabels(agentBead, beadsDir)
+	if err != nil {
+		return err
+	}
+
+	var edits []string
+	for key, value := range changes {
+		var want string
+		if value != nil {
+			want = key + ":" + *value
+		}
+		present := false
+		for _, label := range current {
+			switch {
+			case label == want:
+				present = true
+			case label != "gt:agent" && strings.HasPrefix(label, key+":"):
+				edits = append(edits, "--remove-label="+label)
+			}
+		}
+		if value != nil && !present {
+			edits = append(edits, "--add-label="+want)
 		}
 	}
-
-	// Add state labels from modified map
-	for key, value := range labels {
-		finalLabels = append(finalLabels, key+":"+value)
+	if len(edits) == 0 {
+		return nil
 	}
 
-	// Build update command with --set-labels to replace all
-	args := []string{"update", agentBead}
-	for _, label := range finalLabels {
-		args = append(args, "--set-labels="+label)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
 
-	// If no labels, clear all
-	if len(finalLabels) == 0 {
-		args = append(args, "--set-labels=")
-	}
-
-	// Execute bd update
-	cmd := exec.Command("bd", args...)
+	cmd := exec.CommandContext(ctx, "bd", append([]string{"update", agentBead}, edits...)...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
-		if errMsg != "" {
+		if errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String())); errMsg != "" {
 			return fmt.Errorf("%s", errMsg)
 		}
-		return fmt.Errorf("updating agent state: %w", err)
+		return err
 	}
-
-	fmt.Printf("%s Updated agent state for %s\n", style.Bold.Render("✓"), agentBead)
-
 	return nil
 }
 
