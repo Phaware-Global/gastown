@@ -2,7 +2,9 @@ package rig
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -532,13 +534,13 @@ func TestGasTownLocalExcludePatterns_IncludesBeads(t *testing.T) {
 	localPatterns := gasTownLocalExcludePatterns()
 	found := false
 	for _, p := range localPatterns {
-		if p == ".beads/" {
+		if p == "/.beads/" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("gasTownLocalExcludePatterns() must include .beads/ (gas-7vg defense-in-depth)")
+		t.Error("gasTownLocalExcludePatterns() must include /.beads/ (gas-7vg defense-in-depth)")
 	}
 
 	// Regression guard: .gitignore patterns must NOT include .beads/
@@ -584,4 +586,83 @@ func splitLines(content string) []string {
 		lines = append(lines, content[start:])
 	}
 	return lines
+}
+
+// Polecat worktrees are linked worktrees of a shared bare repo. git reads
+// info/exclude only from the shared git dir, so the excludes must reach git through
+// a per-worktree core.excludesFile, and enabling per-worktree config must not break
+// the bare repo or the sibling worktrees that share it.
+func TestEnsureLocalExcludePatterns_LinkedWorktreeOfBareRepo(t *testing.T) {
+	root := t.TempDir()
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git -C %s %v: %v\n%s", dir, args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(src, "init", "-q")
+	git(src, "commit", "-q", "--allow-empty", "-m", "init")
+	bare := filepath.Join(root, "repo.git")
+	git(root, "clone", "-q", "--bare", src, bare)
+	polecat := filepath.Join(root, "polecat")
+	sibling := filepath.Join(root, "sibling")
+	git(bare, "worktree", "add", "-q", polecat, "-b", "p")
+	git(bare, "worktree", "add", "-q", sibling, "-b", "s")
+
+	provisioned := []string{".runtime/session_id", ".beads/x.jsonl", "CLAUDE.local.md", ".claude/commands/" + gasTownCommandName(t) + ".md"}
+	work := []string{"notes.txt", ".claude/skills/new/SKILL.md", "CLAUDE.md", "docs/CLAUDE.local.md"}
+	for _, wt := range []string{polecat, sibling} {
+		for _, rel := range append(append([]string{}, provisioned...), work...) {
+			path := filepath.Join(wt, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	for i := 0; i < 2; i++ { // second call must be a no-op
+		if err := EnsureLocalExcludePatterns(polecat); err != nil {
+			t.Fatalf("EnsureLocalExcludePatterns (call %d): %v", i+1, err)
+		}
+	}
+
+	untracked := func(wt string) string {
+		return strings.Join(strings.Fields(strings.ReplaceAll(git(wt, "status", "--porcelain", "-uall"), "?? ", "")), " ")
+	}
+	if got, want := untracked(polecat), ".claude/skills/new/SKILL.md CLAUDE.md docs/CLAUDE.local.md notes.txt"; got != want {
+		t.Errorf("polecat worktree untracked = %q, want only real work %q", got, want)
+	}
+	// The sibling shares the repo but was not set up: nothing may be hidden there.
+	for _, rel := range provisioned {
+		if !strings.Contains(untracked(sibling), rel) {
+			t.Errorf("sibling worktree lost %s from git status; excludes leaked across worktrees", rel)
+		}
+	}
+	// The shared bare repo must still be bare and usable.
+	if got := git(bare, "rev-parse", "--is-bare-repository"); got != "true" {
+		t.Errorf("bare repo is-bare = %q, want true", got)
+	}
+	git(bare, "worktree", "add", "-q", filepath.Join(root, "third"), "-b", "t")
+	git(sibling, "commit", "-q", "--allow-empty", "-m", "still works")
+}
+
+func gasTownCommandName(t *testing.T) string {
+	t.Helper()
+	for _, p := range gasTownLocalExcludePatterns() {
+		if name, ok := strings.CutPrefix(p, "/.claude/commands/"); ok {
+			return strings.TrimSuffix(name, ".md")
+		}
+	}
+	t.Fatal("no provisioned command pattern")
+	return ""
 }
