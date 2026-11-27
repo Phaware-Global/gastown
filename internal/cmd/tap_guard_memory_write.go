@@ -37,7 +37,8 @@ into one, but only when the caller is a Gas Town agent. Non-agent Claude Code se
 Code directly for other work) are unaffected.
 
 Path pattern: any tool_input.file_path / tool_input.notebook_path
-containing "/.claude/projects/" followed later by "/memory/". That
+containing "/.claude/projects/" followed later by "/memory/", ignoring
+case, as the default macOS filesystem does. That
 covers all the current Claude Code memory layouts on macOS/Linux
 regardless of the specific project hash. Windows (backslash) paths
 are out of scope — gastown is macOS/Linux only; if that changes, add
@@ -45,9 +46,12 @@ a Windows-path case to the classifier test.
 
 In a Bash command the guard follows redirects, tee, sed -i, perl -i,
 cp, mv, ln, install, rsync, touch, truncate and dd, through cd, simple
-variables and sh -c. Reading or removing memory files is allowed. This
-is a check on ordinary shell writes, not a sandbox: a path computed at
-run time, or a write made by a script in another language, is not seen.
+variables, command substitutions, sh -c and heredocs fed to a shell.
+Reading or removing memory files is allowed. This is a check on ordinary
+shell writes, not a sandbox. It does not see a path computed at run time
+or reached through a symlink, a write made by a script in another
+language or piped into a shell, or other writers such as curl -o,
+wget -O, tar -C, unzip -d, gawk -i inplace and find -exec.
 
 Exit codes:
   0 - Operation allowed (not an agent, or path is not a memory file)
@@ -153,11 +157,15 @@ func extractFilePath(input []byte) string {
 // boundary: either the start of the string, or immediately after a
 // path separator.
 //
+// Case is ignored because on a case-insensitive filesystem MEMORY/ and
+// memory/ are the same directory.
+//
 // Exported-lowercase for testability from the cmd package's tests.
 func isClaudeCodeMemoryPath(filePath string) bool {
 	if filePath == "" {
 		return false
 	}
+	filePath = strings.ToLower(filePath)
 	const needle = ".claude/projects/"
 	// Walk through every occurrence of needle; accept the first one that
 	// sits at a path-segment boundary.
