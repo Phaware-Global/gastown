@@ -210,20 +210,24 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 	// Reattach if the handshake already reports this session live (daemon
 	// restarted, worker did not) — no new session, idempotent per core §9.4.
 	//
-	// Only when it is on the branch asked for. The session id names the
-	// polecat, not its work: a polecat that finished one bead and is started
-	// on the next has a new branch, while the worker still holds the session,
-	// worktree and branch of the old one. That session is torn down (which
-	// flushes it) and a fresh one opened below. A worker that predates the
-	// summary's branch reports none, so its session cannot be told apart from
-	// a stale one and is replaced too: reusing it unseen is the failure this
-	// guards against, and such a worker only takes its upgrade once the
-	// session is gone.
+	// Not when the provision names a branch and the session is not on it.
+	// The session id names the polecat, not its work: a polecat that finished
+	// one bead and is started on the next has a new branch, while the worker
+	// still holds the session, worktree and branch of the old one. That
+	// session is torn down (which flushes it) and a fresh one opened below.
+	//
+	// A provision with no branch (the host worktree is detached, or its
+	// branch could not be read) says nothing about the session being stale,
+	// so it reattaches whatever the session is on. A worker that predates the
+	// summary's branch reports none; when a branch is asked for, its session
+	// cannot be told apart from a stale one and is replaced too. Reusing it
+	// unseen is the failure this guards against, and such a worker only takes
+	// its upgrade once the session is gone.
 	for i, sess := range c.ack.Sessions {
 		if sess.Session != spec.Session || sess.State == "orphaned" {
 			continue
 		}
-		if sess.Branch == spec.Branch {
+		if spec.Branch == "" || sess.Branch == spec.Branch {
 			return b.endpointFor(spec), nil
 		}
 		slog.Default().Info("socket: replacing a live session that is on another branch",
@@ -242,7 +246,9 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 		if errors.Is(err, errNoReply) && !timedOut {
 			return execution.Endpoint{}, fmt.Errorf("replacing the session on branch %q: %w: %w", sess.Branch, errUpgradeStaged, err)
 		}
-		if err != nil {
+		// errNoSession: it ended between the handshake and here, which is
+		// the outcome wanted.
+		if err != nil && !errors.Is(err, errNoSession) {
 			return execution.Endpoint{}, fmt.Errorf("replacing the session on branch %q: %w", sess.Branch, err)
 		}
 		c.ack.Sessions = append(c.ack.Sessions[:i:i], c.ack.Sessions[i+1:]...)
@@ -394,6 +400,10 @@ func (b *SocketBackend) Teardown(ctx context.Context, ep execution.Endpoint) err
 // dropped or timed out, as opposed to a refusal.
 var errNoReply = errors.New("no reply from the worker")
 
+// errNoSession marks a teardown the worker refused because it has no such
+// session.
+var errNoSession = errors.New("no such session on the worker")
+
 // teardownOn ends session on an open control connection.
 func teardownOn(ctx context.Context, c *conn, session string) error {
 	// Graceful stop first (§6 step 1-2): best-effort — a worker that already
@@ -407,6 +417,9 @@ func teardownOn(ctx context.Context, c *conn, session string) error {
 	resp, err := c.request(ctx, &sockproto.Message{Type: sockproto.TypeTeardown, Session: session})
 	if err != nil {
 		return fmt.Errorf("socket: teardown: %w: %w", errNoReply, err)
+	}
+	if resp.Type == sockproto.TypeError && resp.Code == "no_session" {
+		return fmt.Errorf("socket: teardown %s: %w: %s", session, errNoSession, resp.Msg)
 	}
 	if resp.Type == sockproto.TypeError {
 		return fmt.Errorf("socket: teardown %s: %s: %s", session, resp.Code, resp.Msg)

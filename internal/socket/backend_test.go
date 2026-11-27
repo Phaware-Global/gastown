@@ -69,6 +69,8 @@ type fakeWorker struct {
 	// connection unanswered, as a worker does when it exits to apply a staged
 	// binary once its last session is gone.
 	exitOnTeardown bool
+	// teardownGone: the session ended on its own before the teardown arrived.
+	teardownGone bool
 }
 
 // pushedBinary is a completed push_binaries transfer as the fake worker saw it.
@@ -284,6 +286,10 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				return
 			}
 			w.removeSession(m.Session)
+			if w.teardownGone {
+				reply(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no such session"})
+				continue
+			}
 			if w.exitOnTeardown {
 				w.mu.Lock()
 				w.upgraded = true
@@ -418,6 +424,39 @@ func TestProvision_LiveSessionOnTheSameBranchIsReused(t *testing.T) {
 	_, err := b.Provision(context.Background(), s)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"auth", "hello"}, w.got())
+}
+
+// A provision with no branch does not know the host's branch (detached
+// worktree, or it could not be read). That is not a reason to take the agent's
+// worktree away: the session is reattached whatever it is on.
+func TestProvision_NoBranchAskedForReattaches(t *testing.T) {
+	for name, held := range map[string]string{"session on a branch": "polecat/furiosa/gt-a", "session without one": ""} {
+		t.Run(name, func(t *testing.T) {
+			w := newFakeWorker(t)
+			w.preload(sockproto.SessionSummary{Session: "gt-MyRig-furiosa", Rig: "MyRig", Polecat: "furiosa", State: "ready", Branch: held})
+			b, _ := testBackend(t, w)
+
+			_, err := b.Provision(context.Background(), spec())
+			require.NoError(t, err)
+			assert.Equal(t, []string{"auth", "hello"}, w.got())
+		})
+	}
+}
+
+// The stale session can end on its own between the handshake and the
+// teardown. The worker then has no session to tear down, which is what the
+// replacement wanted: the new one is opened.
+func TestProvision_ReplacementOfASessionAlreadyGone(t *testing.T) {
+	w := newFakeWorker(t)
+	w.preload(sockproto.SessionSummary{Session: "gt-MyRig-furiosa", Rig: "MyRig", Polecat: "furiosa", State: "ready", Branch: "polecat/furiosa/gt-a"})
+	w.teardownGone = true
+	b, _ := testBackend(t, w)
+
+	s := spec()
+	s.Branch = "polecat/furiosa/gt-b"
+	_, err := b.Provision(context.Background(), s)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"auth", "hello", "shutdown", "teardown", "session_open", "cert"}, w.got())
 }
 
 func TestProvision_LiveSessionOnAnotherBranchIsReplaced(t *testing.T) {
