@@ -266,6 +266,9 @@ func TestCheckStrandedWork_OneMailForADeadPolecat(t *testing.T) {
 			if got := f.mail(t); strings.Count(got, "mail send") != 1 {
 				t.Fatalf("expected 1 mail in one heartbeat, got %q (log: %s)", got, f.logs)
 			}
+			if got := f.mail(t); !strings.Contains(got, "CRASHED_POLECAT") {
+				t.Errorf("expected the mail to come from crash detection, got %q", got)
+			}
 
 			f.d.checkStrandedWork()
 
@@ -273,6 +276,46 @@ func TestCheckStrandedWork_OneMailForADeadPolecat(t *testing.T) {
 				t.Errorf("expected no further mail on the next heartbeat, got %q", got)
 			}
 		})
+	}
+}
+
+func TestCheckStrandedWork_OrphanedWorkCoversWhatCrashDetectionSkips(t *testing.T) {
+	bead := workBead("hooked", "myr/polecats/mycat", time.Hour)
+	f := newCrashFixture(t, false, bead, bead)
+	f.useStrandedWorkCheck(t)
+	f.setAgent(t, "idle", "idle", time.Minute)
+
+	f.d.checkStrandedWork()
+
+	got := f.mail(t)
+	if strings.Count(got, "mail send") != 1 || !strings.Contains(got, "ORPHANED_WORK") {
+		t.Errorf("expected 1 ORPHANED_WORK mail, got %q (log: %s)", got, f.logs)
+	}
+}
+
+func TestCheckStrandedWork_ReportsNewWorkAfterAnEarlierCrash(t *testing.T) {
+	first := workBead("hooked", "myr/polecats/mycat", 2*time.Hour)
+	f := newCrashFixture(t, false, first, first)
+	f.useStrandedWorkCheck(t)
+	f.d.checkStrandedWork()
+
+	// Newer work lands on the dead polecat, which crash detection now skips.
+	second, err := json.Marshal([]map[string]string{{
+		"id": "gt-work2", "status": "hooked", "assignee": "myr/polecats/mycat", "updated_at": ago(time.Hour),
+	}})
+	if err != nil {
+		t.Fatalf("marshaling work bead: %v", err)
+	}
+	for _, name := range []string{"hooked.json", "show.json"} {
+		if err := os.WriteFile(filepath.Join(f.binDir, name), second, 0644); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+	}
+	f.setAgent(t, "idle", "idle", time.Minute)
+	f.d.checkStrandedWork()
+
+	if got := f.mail(t); !strings.Contains(got, "ORPHANED_WORK") || !strings.Contains(got, "gt-work2") {
+		t.Errorf("expected ORPHANED_WORK naming gt-work2, got %q (log: %s)", got, f.logs)
 	}
 }
 

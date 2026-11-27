@@ -3100,10 +3100,14 @@ func KillOrphanedDaemons(townRoot string) (int, error) {
 	return killed, nil
 }
 
-// checkStrandedWork reports hooked work whose agent cannot finish it.
+// checkStrandedWork reports hooked work whose agent cannot finish it. Crash
+// detection runs first and owns what it reports; the orphaned work check covers
+// the rest. Crash detection is the owner because it honors agent_state and
+// leaves the restart to stuck-agent-dog, while ORPHANED_WORK asks the witness to
+// restart or reassign.
 func (d *Daemon) checkStrandedWork() {
-	d.checkOrphanedWork()
 	d.checkPolecatSessionHealth()
+	d.checkOrphanedWork()
 }
 
 // checkPolecatSessionHealth proactively validates polecat tmux sessions.
@@ -3246,7 +3250,7 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string, work []polecatW
 		return // Session came back - no restart needed
 	}
 
-	key := "crash|" + latest.Assignee + "|" + latest.ID
+	key := crashKey(latest)
 	if d.noteCrash(sessionName, key) {
 		d.logger.Printf("CRASH DETECTED: polecat %s/%s has hooked work %s but session %s is dead",
 			rigName, polecatName, latest.ID, sessionName)
@@ -3263,6 +3267,17 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string, work []polecatW
 	d.alertWitnessOnce(key, func() error {
 		return d.notifyWitnessOfCrashedPolecat(rigName, polecatName, latest.ID)
 	})
+}
+
+func crashKey(w polecatWork) string {
+	return "crash|" + w.Assignee + "|" + w.ID
+}
+
+// crashReported reports whether crash detection has taken on this work.
+func (d *Daemon) crashReported(sessionName string, w polecatWork) bool {
+	d.alertsMu.Lock()
+	defer d.alertsMu.Unlock()
+	return d.crashedSessions[sessionName] == crashKey(w)
 }
 
 // noteCrash remembers a dead session's crash and reports whether it is new.
