@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -229,7 +230,8 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 			"session", spec.Session, "branch", sess.Branch, "want", spec.Branch)
 		tdCtx, cancel := context.WithTimeout(ctx, controlTimeout)
 		err := teardownOn(tdCtx, c, spec.Session)
-		timedOut := tdCtx.Err() != nil
+		// The connection's deadline is the context's, and can fire first.
+		timedOut := tdCtx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded)
 		cancel()
 		// A teardown that empties the worker is also when it applies a staged
 		// binary: it exits for its supervisor before it can answer. So a

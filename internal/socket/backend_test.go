@@ -493,6 +493,15 @@ func TestProvision_FailedReplacementFailsTheProvision(t *testing.T) {
 	_, err := b.Provision(context.Background(), s)
 	require.ErrorContains(t, err, "replacing the session")
 	assert.NotContains(t, w.got(), "session_open")
+	// A worker that hangs is not one that is restarting: no second attempt.
+	// (The fake hangs on the shutdown, so that is the request to count.)
+	shutdowns := 0
+	for _, typ := range w.got() {
+		if typ == "shutdown" {
+			shutdowns++
+		}
+	}
+	assert.Equal(t, 1, shutdowns)
 }
 
 func TestProvision_OrphanedSessionIsNotReattached(t *testing.T) {
