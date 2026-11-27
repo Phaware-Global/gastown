@@ -63,6 +63,8 @@ type fakeWorker struct {
 	refuseHello  bool
 	chatty       bool // interleave ping + empty-id stray messages before each reply
 	hang         bool // accept + handshake, then never answer a request
+
+	openBranch string // branch of the last session_open
 }
 
 // pushedBinary is a completed push_binaries transfer as the fake worker saw it.
@@ -221,6 +223,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 		case sockproto.TypeSessionOpen:
 			w.mu.Lock()
 			w.openAttempts++
+			w.openBranch = m.Branch
 			restarting := w.openAttempts <= w.restartingUntilAttempt
 			w.mu.Unlock()
 			if restarting {
@@ -390,6 +393,62 @@ func TestProvision_Reattach(t *testing.T) {
 	// Reattach: no session_open, no CSR signing.
 	assert.Equal(t, "", signer.gotCN)
 	assert.Equal(t, []string{"auth", "hello"}, w.got())
+}
+
+// The session id names the polecat, so a polecat started on its next bead
+// finds the session of the previous one still live on the worker. Reattaching
+// would leave the agent in the old worktree on the old branch.
+func TestProvision_LiveSessionOnTheSameBranchIsReused(t *testing.T) {
+	w := newFakeWorker(t)
+	w.preload(sockproto.SessionSummary{Session: "gt-MyRig-furiosa", Rig: "MyRig", Polecat: "furiosa", State: "ready", Branch: "polecat/furiosa/gt-a"})
+	b, _ := testBackend(t, w)
+
+	s := spec()
+	s.Branch = "polecat/furiosa/gt-a"
+	_, err := b.Provision(context.Background(), s)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"auth", "hello"}, w.got())
+}
+
+func TestProvision_LiveSessionOnAnotherBranchIsReplaced(t *testing.T) {
+	for name, held := range map[string]string{
+		"another branch":              "polecat/furiosa/gt-a",
+		"no branch (an older worker)": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newFakeWorker(t) // maxSessions 1: the replaced session must not count
+			w.preload(sockproto.SessionSummary{Session: "gt-MyRig-furiosa", Rig: "MyRig", Polecat: "furiosa", State: "ready", Branch: held})
+			b, _ := testBackend(t, w)
+
+			s := spec()
+			s.Branch = "polecat/furiosa/gt-b"
+			_, err := b.Provision(context.Background(), s)
+			require.NoError(t, err)
+			// Flushed and torn down first, then opened afresh on the new branch.
+			assert.Equal(t, []string{"auth", "hello", "shutdown", "teardown", "session_open", "cert"}, w.got())
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			assert.Equal(t, "polecat/furiosa/gt-b", w.openBranch)
+		})
+	}
+}
+
+// A stale session that cannot be torn down fails the provision: opening over
+// it would be refused, and reattaching to it is the bug.
+func TestProvision_FailedReplacementFailsTheProvision(t *testing.T) {
+	w := newFakeWorker(t)
+	w.preload(sockproto.SessionSummary{Session: "gt-MyRig-furiosa", Rig: "MyRig", Polecat: "furiosa", State: "ready", Branch: "polecat/furiosa/gt-a"})
+	w.hang = true
+	b, _ := testBackend(t, w)
+	old := controlTimeout
+	controlTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { controlTimeout = old })
+
+	s := spec()
+	s.Branch = "polecat/furiosa/gt-b"
+	_, err := b.Provision(context.Background(), s)
+	require.ErrorContains(t, err, "replacing the session")
+	assert.NotContains(t, w.got(), "session_open")
 }
 
 func TestProvision_OrphanedSessionIsNotReattached(t *testing.T) {

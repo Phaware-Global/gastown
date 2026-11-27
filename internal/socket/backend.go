@@ -208,10 +208,33 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 
 	// Reattach if the handshake already reports this session live (daemon
 	// restarted, worker did not) — no new session, idempotent per core §9.4.
-	for _, sess := range c.ack.Sessions {
-		if sess.Session == spec.Session && sess.State != "orphaned" {
+	//
+	// Only when it is on the branch asked for. The session id names the
+	// polecat, not its work: a polecat that finished one bead and is started
+	// on the next has a new branch, while the worker still holds the session,
+	// worktree and branch of the old one. That session is torn down (which
+	// flushes it) and a fresh one opened below. A worker that predates the
+	// summary's branch reports none, so its session cannot be told apart from
+	// a stale one and is replaced too: reusing it unseen is the failure this
+	// guards against, and such a worker only takes its upgrade once the
+	// session is gone.
+	for i, sess := range c.ack.Sessions {
+		if sess.Session != spec.Session || sess.State == "orphaned" {
+			continue
+		}
+		if sess.Branch == spec.Branch {
 			return b.endpointFor(spec), nil
 		}
+		slog.Default().Info("socket: replacing a live session that is on another branch",
+			"session", spec.Session, "branch", sess.Branch, "want", spec.Branch)
+		tdCtx, cancel := context.WithTimeout(ctx, controlTimeout)
+		err := teardownOn(tdCtx, c, spec.Session)
+		cancel()
+		if err != nil {
+			return execution.Endpoint{}, fmt.Errorf("replacing the session on branch %q: %w", sess.Branch, err)
+		}
+		c.ack.Sessions = append(c.ack.Sessions[:i:i], c.ack.Sessions[i+1:]...)
+		break
 	}
 
 	// max_sessions gate (§12 decision 1): the worker also enforces this, but
@@ -352,21 +375,25 @@ func (b *SocketBackend) Teardown(ctx context.Context, ep execution.Endpoint) err
 		return err
 	}
 	defer func() { _ = c.close() }()
+	return teardownOn(ctx, c, ep.ID)
+}
 
+// teardownOn ends session on an open control connection.
+func teardownOn(ctx context.Context, c *conn, session string) error {
 	// Graceful stop first (§6 step 1-2): best-effort — a worker that already
 	// tore the session down answers with an error we tolerate.
 	_, _ = c.request(ctx, &sockproto.Message{
 		Type:         sockproto.TypeShutdown,
-		Session:      ep.ID,
+		Session:      session,
 		Reason:       "teardown",
 		GraceSeconds: 60,
 	})
-	resp, err := c.request(ctx, &sockproto.Message{Type: sockproto.TypeTeardown, Session: ep.ID})
+	resp, err := c.request(ctx, &sockproto.Message{Type: sockproto.TypeTeardown, Session: session})
 	if err != nil {
 		return fmt.Errorf("socket: teardown: %w", err)
 	}
 	if resp.Type == sockproto.TypeError {
-		return fmt.Errorf("socket: teardown %s: %s: %s", ep.ID, resp.Code, resp.Msg)
+		return fmt.Errorf("socket: teardown %s: %s: %s", session, resp.Code, resp.Msg)
 	}
 	return nil
 }
