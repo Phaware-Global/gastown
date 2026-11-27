@@ -40,7 +40,7 @@ fails. They are identified by:
 | Tests fail after resolve | Fix them before pushing |
 | Resolution unclear | Read original issue for context |"""
 formula = "mol-polecat-conflict-resolve"
-version = 2
+version = 3
 
 [[steps]]
 id = "load-task"
@@ -225,7 +225,7 @@ Verify the resolution doesn't break anything.
 
 **1. Run the test suite:**
 ```bash
-go test ./...               # Or appropriate test command
+go test -p 2 ./...          # Or appropriate test command
 ```
 
 **ALL TESTS MUST PASS.** Do not push with failures.
@@ -239,7 +239,7 @@ go test ./...               # Or appropriate test command
 # Quick check: does {{base_branch}} pass?
 git stash
 git checkout origin/{{base_branch}}
-go test ./...
+go test -p 2 ./...
 git checkout temp-resolve
 git stash pop
 ```

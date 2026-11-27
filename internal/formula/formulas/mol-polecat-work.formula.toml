@@ -52,7 +52,7 @@ stale, the refinery falls through to normal gate execution.
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work"
-version = 11
+version = 12
 
 [[steps]]
 id = "load-context"
@@ -476,8 +476,12 @@ If lint_command is set:
 ```
 
 If test_command is set:
+
+If the test command is a whole-repository Go run (such as `go test ./...`), limit
+package parallelism: run `go test -p 2 ./...` with the configured flags.
+
 ```bash
-{{test_command}}
+{{test_command}}            # Add -p 2 to a whole-repo go test
 ```
 
 Empty commands mean "not configured" — skip silently.
