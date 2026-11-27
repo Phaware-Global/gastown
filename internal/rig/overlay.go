@@ -226,8 +226,12 @@ func inheritedExcludes(worktreePath string) (string, error) {
 	out, err := exec.Command("git", "-C", worktreePath, "config", "--show-scope", "--path", "--get-all", "core.excludesFile").Output()
 	if err != nil {
 		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 { // 1 = key not set
+		if !errors.As(err, &exitErr) {
 			return "", fmt.Errorf("resolving inherited core.excludesFile: %w", err)
+		}
+		if exitErr.ExitCode() != 1 { // 1 = key not set
+			return "", fmt.Errorf("resolving inherited core.excludesFile (needs git 2.26+ for --show-scope): %w: %s",
+				err, strings.TrimSpace(string(exitErr.Stderr)))
 		}
 	}
 	for _, line := range strings.Split(string(out), "\n") {

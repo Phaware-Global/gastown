@@ -845,8 +845,12 @@ func TestEnsureLocalExcludePatterns_FailsClosedWhenGitCannotResolveInherited(t *
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	if err := EnsureLocalExcludePatterns(wts[0]); err == nil {
+	err = EnsureLocalExcludePatterns(wts[0])
+	if err == nil {
 		t.Fatal("EnsureLocalExcludePatterns succeeded although the inherited excludes could not be resolved")
+	}
+	if !strings.Contains(err.Error(), "unknown option") || !strings.Contains(err.Error(), "2.26") {
+		t.Errorf("error %q should carry git's stderr and the minimum git version", err)
 	}
 	out, _ := exec.Command(realGit, "-C", wts[0], "config", "--get", "core.excludesFile").Output()
 	if got := strings.TrimSpace(string(out)); got != "" {
