@@ -20,10 +20,11 @@ launchd job only.
 | `git` | operator-provisioned | the worktree is cloned through the session relay |
 | Docker | only for `exec_mode: container` | Docker Desktop on macOS |
 
-The orchestrator additionally needs `gt-worker-attach` and `gt-proxy-server`,
-which `make install` places next to `gt`. `gt-worker-attach` is the process the
-tmux pane runs in place of the agent. `gt-proxy-server` is what a worker's `gt`
-and `bd` call (`docs/proxy-server.md`).
+The orchestrator additionally needs `gt-proxy-server`, which `make install`
+places next to `gt`: it is what a worker's `gt` and `bd` call
+(`docs/proxy-server.md`). The tmux pane runs `gt worker-attach` in place of the
+agent, so on macOS only `gt` needs Local Network access on the orchestrator.
+(`gt-worker-attach` is the same launcher as a standalone binary.)
 
 ## 0. Run the proxy on the orchestrator
 
@@ -158,7 +159,7 @@ In the rig's `settings/config.json`:
 ```
 
 `gt polecat start` in that rig now provisions a session on the worker, and the
-pane runs `gt-worker-attach` against it.
+pane runs `gt worker-attach` against it.
 
 ## Binaries
 

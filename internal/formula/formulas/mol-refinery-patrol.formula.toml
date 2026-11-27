@@ -108,7 +108,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 16
+version = 17
 
 [vars]
 [vars.wisp_type]
@@ -656,8 +656,16 @@ Proceed to handle-failures step. Track which specific check failed
 
 **3. Run the test suite:**
 
+Never run more than one full test suite at once. Unbounded runs load the host and
+slow the shared beads server. Wait for a running suite to finish before starting
+another, including one started for a different MR.
+
+If the test command is a whole-repository Go run (such as `go test ./...`), limit
+package parallelism: run `go test -p 2 ./...` with the configured flags, or test
+one package at a time.
+
 ```bash
-{{test_command}}            # Run tests (configured per-rig)
+{{test_command}}            # Run tests (configured per-rig; add -p 2 to a whole-repo go test)
 ```
 
 Track results: pass count, fail count, specific failures."""
@@ -1100,7 +1108,8 @@ regression test in `pr_workflow_integration_test.go`):
    in-town Reviewer, gemini, a human, any bot. Never filter by author. Never park the
    MR "waiting for <specific reviewer>'s response" while other
    unresolved threads exist. If `gt refinery pr threads $PR --unresolved`
-   returns N > 0, dispatch (unless the cap is hit).
+   returns N > 0, dispatch (unless the cap is hit, the mayor has not said
+   to dispatch, or the subcommand skips it).
 
 2. **Reply AND RESOLVE, always.** The dispatch-args string handed to
    the review-fix polecat MUST tell the polecat to both reply to and
@@ -1132,6 +1141,35 @@ formula calls **`gt refinery pr dispatch-review-fix $PR --mr $MR`** instead
 — that subcommand consolidates the logic into Go, returning the same exit
 codes (0 advance / 1 wait / 3 escalate / 4 error) and the LLM has no prose
 to optimize away into "do it myself".
+
+**Ask the mayor before dispatching.** The mayor often hooks the fix bead
+themselves, and the two dispatches can start seconds apart, so no bead check
+alone can prevent a duplicate. A call to the subcommand can dispatch only when
+the MR bead records no `review_fix_polecat` AND the PR has unresolved threads:
+
+```bash
+bd show $MR --json | jq -r 'if type == "array" then .[0] else . end | .description // ""' | grep '^review_fix_polecat:'
+{{ cmd }} refinery pr threads $PR --unresolved --json | jq 'length'
+```
+
+In every other case run the subcommand below without asking. When a dispatch is
+possible:
+
+1. If the MR notes hold no question for this PR head, nudge the mayor ("PR #<n>
+   at <head> has <count> unresolved threads: dispatch a review-fix, or do you
+   have one?"), append that question to the MR notes, and skip to loop-check.
+2. Wait for the answer. Silence is not a yes: do not call the subcommand until
+   the mayor says to dispatch. If a later patrol still finds no answer, send the
+   question once more as mail (`gt mail send mayor/`), because
+   a nudge can sit unsent.
+3. If the mayor says they have a fix bead, do not dispatch. Skip to loop-check.
+4. An answer covers one PR head. Ask again for a new head.
+
+The subcommand also skips a dispatch (exit 1) when a live polecat already holds a
+bead for the PR, or when the author replied last on every unresolved thread and
+the head was approved after those replies. In the second case the open threads
+still block the merge, and the subcommand itself escalates to get them
+resolved.
 
 ```bash
 {{ cmd }} refinery pr dispatch-review-fix $PR --mr $MR
@@ -1869,7 +1907,7 @@ This command:
 **On event received** (refinery-specific activity):
 Reset the idle counter and start next patrol cycle:
 ```bash
-gt agent state YOUR_AGENT_BEAD --set idle=0
+gt agents state YOUR_AGENT_BEAD --set idle=0
 ```
 
 **On timeout** (no events):

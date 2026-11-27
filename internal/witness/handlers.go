@@ -1113,8 +1113,8 @@ func UpdateCleanupWispState(bd *BdCli, workDir, wispID, newState string) error {
 		polecatName = "unknown"
 	}
 
-	// Update with new state — pass one --set-labels=<label> per label,
-	// matching the pattern used in agent_state.go and molecule_await_signal.go.
+	// Update with new state — pass one --set-labels=<label> per label. A cleanup
+	// wisp's labels are exactly the set CleanupWispLabels returns.
 	labels := CleanupWispLabels(polecatName, newState)
 	args := []string{"update", wispID}
 	for _, l := range labels {

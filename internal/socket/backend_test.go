@@ -620,7 +620,7 @@ func TestWrapCommand_LauncherArgv(t *testing.T) {
 	argv, err := b.WrapCommand(ep, []string{"claude", "--model", "opus", "do it"}, map[string]string{"GT_ROLE": "polecat"})
 	require.NoError(t, err)
 	assert.Equal(t, []string{
-		"gt-worker-attach", "--address", w.addr, "--session", "gt-MyRig-furiosa",
+		"gt", "worker-attach", "--address", w.addr, "--session", "gt-MyRig-furiosa",
 		"--", "claude", "--model", "opus", "do it",
 	}, argv)
 }

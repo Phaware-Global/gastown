@@ -53,6 +53,12 @@ State machine (read from MR bead, write to MR bead via gt mq set-review-state):
                                                   (next patrol re-enters PR.4
                                                    for the new HEAD)
   - threads clean (count = 0)                   → exit 0 (advance to PR.6)
+  - threads dirty, head approved by pr_reviewer
+    or pr_approver, no changes requested, the
+    author replied last on every thread and the
+    approval is newer than those replies        → no dispatch, escalate once,
+                                                  exit 1 (the threads need
+                                                  resolving)
   - threads dirty + iter < pr_review_loop_max   → dispatch polecat, set
                                                   review_fix_polecat +
                                                   review_loop_iter on the bead,
@@ -223,7 +229,9 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 			func(name string) (bool, error) { return isReviewFixPolecatAlive(rigName, name) },
 			rigName, state, refPrDispatchReviewFixMR)
 	}
-	step, err := nextReviewFixStep(len(threads), state.ReviewLoopIter, maxIter, holderGate)
+	step, err := nextReviewFixStep(len(threads), state.ReviewLoopIter, maxIter,
+		reviewFixDispatchGate(provider, cfg, state, refPrDispatchReviewFixMR, threads,
+			holderGate, escalateReviewLoopCap))
 	if err != nil {
 		return err
 	}
