@@ -2,9 +2,13 @@ package cmd
 
 import (
 	"path"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/memwritebaseline"
+	"golang.org/x/text/cases"
 )
 
 // This file finds the files a Bash command writes, so the memory-write guard
@@ -13,6 +17,11 @@ import (
 // commands, including through cd, simple variables, command substitutions and
 // scripts fed to a shell. It is not a shell: a path computed at run time, or a
 // write made by another program (a Python or Node script, say), is not seen.
+//
+// The verdict only ever adds to that of the frozen detector in
+// memwritebaseline. Where text goes to another shell it is read both as bash
+// and as zsh reads it, and a command that names a memory path is blocked if
+// any of it cannot be read for certain.
 
 // shellToken is one word, after quote removal, or one operator. It may instead
 // carry something the command around it runs or reads.
@@ -40,8 +49,13 @@ const substitutionMark = "$()"
 // end a heredoc at the first line starting delimiter+")" and nest ${ } only on
 // "${", while zsh reads on to a line holding the delimiter alone if there is one
 // and nests on a bare "{" too. Either reading can quote or comment out what the
-// other runs, so a whole command is lexed once per reading.
-type lexer struct{ zsh bool }
+// other runs, so every text a shell reads is lexed both ways.
+type lexer struct {
+	zsh     bool
+	unclear *bool // set on text this reading cannot be sure of
+}
+
+func (l lexer) doubt() { *l.unclear = true }
 
 // split splits a command line into tokens. Comments are dropped and heredoc
 // bodies are set aside, so text that merely mentions a write is not read as one.
@@ -120,6 +134,7 @@ func (l lexer) commands(s string, nested bool) ([]shellToken, int) {
 		case '\'':
 			end := strings.IndexByte(s[i+1:], '\'')
 			if end < 0 {
+				l.doubt()
 				end = len(s) - i - 1
 			}
 			word.WriteString(s[i+1 : i+1+end])
@@ -138,6 +153,9 @@ func (l lexer) commands(s string, nested bool) ([]shellToken, int) {
 					word.WriteByte(s[i])
 				}
 			}
+			if i >= len(s) {
+				l.doubt()
+			}
 			inWord, quoted = true, true
 		case '$', '`':
 			if c == '$' && at(i+1) == '$' { // the process id: no "${" or "$(" follows
@@ -148,7 +166,10 @@ func (l lexer) commands(s string, nested bool) ([]shellToken, int) {
 			}
 			// A ")" inside ${ } does not close the enclosing "$(".
 			if nested && c == '$' && at(i+1) == '{' {
-				if end := l.parameterEnd(s, i); end >= 0 {
+				end := l.parameterEnd(s, i)
+				if end < 0 {
+					l.doubt()
+				} else {
 					inner := s[i+2 : end]
 					if subs := l.expansions(inner); len(subs) > 0 {
 						toks = append(toks, subs...)
@@ -183,6 +204,7 @@ func (l lexer) commands(s string, nested bool) ([]shellToken, int) {
 				if !ok {
 					// No delimiter: the "<<" was most likely a shift, so the
 					// lines after it are still commands.
+					l.doubt()
 					break
 				}
 				*h.body, i = body, last
@@ -271,6 +293,9 @@ func (l lexer) commands(s string, nested bool) ([]shellToken, int) {
 		}
 	}
 	flush()
+	if nested {
+		l.doubt() // no ")" closed the "$("
+	}
 	return toks, i
 }
 
@@ -290,6 +315,9 @@ func (l lexer) substitution(s string, i int, inQuotes bool) ([]shellToken, int, 
 				j++
 			}
 			body.WriteByte(s[j])
+		}
+		if j >= len(s) {
+			l.doubt()
 		}
 		return subshell(l.split(body.String())), j, true
 	case !strings.HasPrefix(s[i:], "$("):
@@ -420,9 +448,10 @@ func (l lexer) parameterEnd(s string, i int) int {
 
 // shellScope is the state a command inherits from the ones before it.
 type shellScope struct {
-	lex  lexer // how the command and the scripts it runs are read
-	cwd  string
-	vars map[string]string
+	scan  *shellScan
+	depth int // how many shells deep the command is
+	cwd   string
+	vars  map[string]string
 }
 
 func (s shellScope) clone() shellScope {
@@ -430,8 +459,18 @@ func (s shellScope) clone() shellScope {
 	for k, v := range s.vars {
 		vars[k] = v
 	}
-	return shellScope{lex: s.lex, cwd: s.cwd, vars: vars}
+	return shellScope{scan: s.scan, depth: s.depth, cwd: s.cwd, vars: vars}
 }
+
+// shellScan is what one command line shares across all the shells it starts.
+type shellScan struct {
+	unclear bool            // some text could not be read for certain
+	written map[string]bool // files the command writes
+}
+
+// maxShellDepth bounds the shells inside shells that are followed, since each
+// level whose readings differ doubles the work.
+const maxShellDepth = 6
 
 var (
 	shellVarRef     = regexp.MustCompile(`\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)`)
@@ -462,19 +501,56 @@ func (s shellScope) resolve(word string) string {
 	return path.Clean(p)
 }
 
+// unreadableMemoryCommand stands for the path when a command is blocked because
+// it names a memory path and cannot be read for certain.
+const unreadableMemoryCommand = "(unclear shell syntax naming a memory path)"
+
 // bashMemoryWrite returns the first Claude Code memory path that command,
-// started in cwd, writes.
+// started in cwd, writes. It blocks whatever the baseline detector blocks.
 func bashMemoryWrite(command, cwd string) (string, bool) {
-	for _, lex := range []lexer{{zsh: false}, {zsh: true}} {
-		if p, ok := scanShellWrites(command, shellScope{lex: lex, cwd: cwd, vars: map[string]string{}}); ok {
-			return p, true
-		}
+	// The baseline answers first, so nothing below can lose one of its blocks.
+	if p, ok := memwritebaseline.Write(command, cwd); ok {
+		return p, true
+	}
+	scan := &shellScan{written: map[string]bool{}}
+	if p, ok := scanShellWrites(command, shellScope{scan: scan, cwd: cwd, vars: map[string]string{}}); ok {
+		return p, true
+	}
+	if scan.unclear && namesMemoryPath(command, cwd) {
+		return unreadableMemoryCommand, true
 	}
 	return "", false
 }
 
-func scanShellWrites(command string, scope shellScope) (string, bool) {
-	return scanShellTokens(scope.lex.split(command), scope)
+// namesMemoryPath reports whether the command or its directory mentions a
+// memory path, however it is quoted.
+func namesMemoryPath(command, cwd string) bool {
+	text := strings.NewReplacer(`'`, "", `"`, "", `\`, "").Replace(command + "\n" + cwd)
+	text = cases.Fold().String(text)
+	return strings.Contains(text, ".claude/projects") && strings.Contains(text, "memory")
+}
+
+// scanShellWrites scans text a shell reads, under both the bash and the zsh
+// reading. Readings that differ leave the text unclear.
+func scanShellWrites(text string, scope shellScope) (string, bool) {
+	if scope.depth > maxShellDepth {
+		scope.scan.unclear = true
+		return "", false
+	}
+	scope.depth++
+	bash := lexer{unclear: &scope.scan.unclear}.split(text)
+	zsh := lexer{zsh: true, unclear: &scope.scan.unclear}.split(text)
+	readings := [][]shellToken{bash}
+	if !reflect.DeepEqual(bash, zsh) {
+		scope.scan.unclear = true
+		readings = append(readings, zsh)
+	}
+	for _, toks := range readings {
+		if p, ok := scanShellTokens(toks, scope.clone()); ok {
+			return p, true
+		}
+	}
+	return "", false
 }
 
 func scanShellTokens(toks []shellToken, scope shellScope) (string, bool) {
@@ -484,16 +560,27 @@ func scanShellTokens(toks []shellToken, scope shellScope) (string, bool) {
 		redir []string     // files the current command redirects into
 		stdin *string      // text the current command is fed
 		op    string       // redirect operator awaiting its target
+		piped bool         // the current command reads a pipe
+		input []string     // files the current command reads from
 	)
 	end := func() (string, bool) {
-		defer func() { words, redir, stdin, op = nil, nil, nil, "" }()
+		defer func() { words, redir, input, stdin, op = nil, nil, nil, nil, "" }()
 		// The shell opens redirects before the command runs.
 		for _, r := range redir {
-			if p := scope.resolve(r); isMemoryTarget(p) {
+			p := scope.resolve(r)
+			if isMemoryTarget(p) {
 				return p, true
 			}
+			scope.scan.written[p] = true
 		}
-		return scope.run(words, stdin)
+		if name, _ := scope.commandName(words); isShell(name) {
+			for _, f := range input {
+				if scope.scan.written[scope.resolve(f)] {
+					scope.scan.unclear = true
+				}
+			}
+		}
+		return scope.run(words, stdin, piped)
 	}
 
 	for _, t := range toks {
@@ -512,6 +599,7 @@ func scanShellTokens(toks []shellToken, scope shellScope) (string, bool) {
 				text := t.text
 				stdin = &text
 			case opRedirect:
+				input = append(input, t.text)
 			default:
 				words = append(words, t.text)
 			}
@@ -519,8 +607,19 @@ func scanShellTokens(toks []shellToken, scope shellScope) (string, bool) {
 		case t.text == opWrite || t.text == opRedirect || t.text == opHereString:
 			op = t.text
 		default:
+			// "<(" and ">(" hand the command a file made as it runs.
+			if t.text == "(" && op != "" {
+				if name, _ := scope.commandName(words); isShell(name) || isSource(name) {
+					scope.scan.unclear = true
+				}
+			}
+			ran := len(words) > 0
 			if p, ok := end(); ok {
 				return p, true
+			}
+			// A pipe carries over the line breaks that may follow it.
+			if t.text == "|" || ran || t.text != ";" && t.text != "(" {
+				piped = t.text == "|"
 			}
 			switch t.text {
 			case "(":
@@ -584,27 +683,41 @@ func (s shellScope) commandName(words []string) (string, []string) {
 	return "", nil
 }
 
-// run applies one simple command, fed stdin if non-nil, to the scope and reports
-// a memory write.
-func (s *shellScope) run(words []string, stdin *string) (string, bool) {
-	name, args := s.commandName(words)
+func isShell(name string) bool {
 	switch name {
-	case "": // assignments with no command set variables
-		s.assign(words)
-	case "export", "local", "declare", "typeset", "readonly":
-		s.assign(args)
-	case "cd", "pushd":
-		s.chdir(args)
 	case "bash", "sh", "zsh", "dash", "ksh":
+		return true
+	}
+	return false
+}
+
+func isSource(name string) bool { return name == "source" || name == "." }
+
+// run applies one simple command, fed stdin if non-nil or else a pipe if piped,
+// to the scope and reports a memory write.
+func (s *shellScope) run(words []string, stdin *string, piped bool) (string, bool) {
+	name, args := s.commandName(words)
+	switch {
+	case name == "": // assignments with no command set variables
+		s.assign(words)
+	case name == "export" || name == "local" || name == "declare" || name == "typeset" || name == "readonly":
+		s.assign(args)
+	case name == "cd" || name == "pushd":
+		s.chdir(args)
+	case isShell(name):
 		for i := 0; i+1 < len(args); i++ {
 			if f := args[i]; strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "--") && strings.HasSuffix(f, "c") {
 				return scanShellWrites(args[i+1], s.clone())
 			}
 		}
-		if stdin != nil && readsScriptFromStdin(args) {
-			return scanShellWrites(*stdin, s.clone())
+		script, fromStdin := s.shellInput(args)
+		return s.runScript(script, fromStdin, stdin, piped)
+	case isSource(name):
+		if len(args) == 0 {
+			return "", false
 		}
-	case "eval":
+		return s.runScript(args[0], s.isStdin(args[0]), stdin, piped)
+	case name == "eval":
 		return scanShellWrites(strings.Join(args, " "), s.clone())
 	default:
 		expanded := make([]string, len(args))
@@ -613,10 +726,29 @@ func (s *shellScope) run(words []string, stdin *string) (string, bool) {
 		}
 		isMemory := func(word string) bool { return isMemoryTarget(s.resolve(word)) }
 		for _, target := range writtenFiles(name, expanded, isMemory) {
-			if p := s.resolve(target); isMemoryTarget(p) {
+			p := s.resolve(target)
+			if isMemoryTarget(p) {
 				return p, true
 			}
+			s.scan.written[p] = true
 		}
+	}
+	return "", false
+}
+
+// runScript follows a shell, or source, that runs the file script or else its
+// standard input.
+func (s *shellScope) runScript(script string, fromStdin bool, stdin *string, piped bool) (string, bool) {
+	// A script named at run time may be the standard input too.
+	unknown := strings.Contains(s.expand(script), "$")
+	if (fromStdin || unknown) && stdin != nil {
+		if p, ok := scanShellWrites(*stdin, s.clone()); ok {
+			return p, true
+		}
+	}
+	// What a pipe carries, or a file this command wrote holds, is not read.
+	if unknown || fromStdin && stdin == nil && piped || !fromStdin && s.scan.written[s.resolve(script)] {
+		s.scan.unclear = true
 	}
 	return "", false
 }
@@ -624,24 +756,26 @@ func (s *shellScope) run(words []string, stdin *string) (string, bool) {
 // stdinPaths name a process's standard input.
 var stdinPaths = []string{"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
 
-// readsScriptFromStdin reports whether a shell given args, which hold no -c,
-// runs its standard input rather than a script file.
-func readsScriptFromStdin(args []string) bool {
+func (s shellScope) isStdin(word string) bool {
+	return slices.Contains(stdinPaths, s.resolve(word))
+}
+
+// shellInput reports what a shell given args, which hold no -c, runs: the
+// script file named, or its standard input.
+func (s shellScope) shellInput(args []string) (script string, fromStdin bool) {
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
 		case a == "-o" || a == "+o" || a == "-O" || a == "+O" || a == "--rcfile" || a == "--init-file":
 			i++
-		case slices.Contains(stdinPaths, path.Clean(a)):
-			return true
 		case a == "-" || strings.HasPrefix(a, "--") && a != "--":
 		case strings.HasPrefix(a, "-") && strings.Contains(a, "s"):
-			return true
+			return "", true
 		case strings.HasPrefix(a, "-") || strings.HasPrefix(a, "+"):
 		default:
-			return false
+			return a, s.isStdin(a)
 		}
 	}
-	return true
+	return "", true
 }
 
 func (s *shellScope) assign(words []string) {
@@ -670,12 +804,8 @@ func (s *shellScope) chdir(args []string) {
 // isMemory reports whether an argument names a memory path.
 func writtenFiles(name string, args []string, isMemory func(string) bool) []string {
 	switch name {
-	case "tee":
+	case "tee", "touch", "truncate":
 		return operands(args)
-	case "touch": // -r, -d, -t and -A take a value that is not written
-		return operands(dropFlagValues(args, "rdtA", "--reference", "--date"))
-	case "truncate":
-		return operands(dropFlagValues(args, "rs", "--reference", "--size"))
 	case "dd":
 		for _, a := range args {
 			if of, ok := strings.CutPrefix(a, "of="); ok {
@@ -736,29 +866,6 @@ func copyTargets(name string, args []string, isMemory func(string) bool) []strin
 		targets = append(targets, dest+"/"+path.Base(src))
 	}
 	return targets
-}
-
-// dropFlagValues removes the separate-word values of the short flags in letters
-// and of the long flags named.
-func dropFlagValues(args []string, letters string, long ...string) []string {
-	var kept []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--" {
-			return append(kept, args[i:]...)
-		}
-		kept = append(kept, a)
-		switch {
-		case slices.Contains(long, a):
-			i++
-		case len(a) > 1 && a[0] == '-' && a[1] != '-':
-			// The rest of the word after a value flag is its value.
-			if at := strings.IndexAny(a[1:], letters); at == len(a)-2 {
-				i++
-			}
-		}
-	}
-	return kept
 }
 
 func operands(args []string) []string {

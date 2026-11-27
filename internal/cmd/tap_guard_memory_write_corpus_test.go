@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/memwritebaseline"
@@ -62,6 +63,9 @@ var memoryWriteCorpus = []memoryCommand{
 	// Scripts the command generates and then runs.
 	{name: "source a generated file", command: "echo 'touch " + corpusFile + "' > /tmp/s\nsource /tmp/s"},
 	{name: "run a generated script", command: "cat > /tmp/s <<'EOF'\ntouch " + corpusFile + "\nEOF\nbash /tmp/s"},
+	{name: "generated script fed to bash", command: "echo 'touch " + corpusFile + "' > /tmp/s; bash < /tmp/s"},
+	{name: "pipe into a subshell holding a shell", command: "cat <<EOF |\necho x >> " + corpusFile + "\nEOF\n(bash)"},
+	{name: "shells nested past the depth followed", command: strings.Repeat("eval ", 8) + "'x=${y:-{}; echo' " + corpusDir},
 	{name: "source a process substitution", command: "source <(echo 'touch " + corpusFile + "')"},
 
 	// Text no shell reading can be sure of.

@@ -54,6 +54,11 @@ or reached through a symlink, a write made by a script in another
 language or piped into a shell, or other writers such as curl -o,
 wget -O, tar -C, unzip -d, gawk -i inplace and find -exec.
 
+A command that names a memory path is also blocked when the shell syntax
+cannot be read for certain: bash and zsh would read it differently,
+something is left unclosed, or a shell runs a pipe or a script that the
+same command produces.
+
 Exit codes:
   0 - Operation allowed (not an agent, or path is not a memory file)
   2 - Operation BLOCKED (agent trying to write a memory file)
