@@ -29,6 +29,24 @@ type ReviewThread struct {
 	Author     string
 	Body       string
 	URL        string
+	// LastReplyAuthor is who wrote the newest reply; empty when the thread has
+	// no reply or the provider does not report it.
+	LastReplyAuthor string
+	// LastReplyAt is when that reply was written; zero when unknown.
+	LastReplyAt time.Time
+}
+
+// HeadApprovalChecker is implemented by providers that can tie an approval to a
+// commit and name the PR's author. It is optional: without it, review-fix
+// dispatch treats every unresolved thread as needing work.
+type HeadApprovalChecker interface {
+	// PRAuthor returns the login of the PR's author, as ReviewThread logins
+	// are spelled.
+	PRAuthor(prNumber int) (string, error)
+
+	// HeadApprovalTime returns when user's newest verdict was submitted, if
+	// that verdict is an approval of commit sha; zero otherwise.
+	HeadApprovalTime(prNumber int, user, sha string) (time.Time, error)
 }
 
 // PRProvider abstracts VCS-specific PR operations for the merge queue.
@@ -194,14 +212,16 @@ func gitReviewThreadsToProvider(in []git.GhReviewThread) []ReviewThread {
 	out := make([]ReviewThread, 0, len(in))
 	for _, t := range in {
 		out = append(out, ReviewThread{
-			ID:         t.ID,
-			IsResolved: t.IsResolved,
-			IsOutdated: t.IsOutdated,
-			Path:       t.Path,
-			Line:       t.Line,
-			Author:     t.Author,
-			Body:       t.Body,
-			URL:        t.URL,
+			ID:              t.ID,
+			IsResolved:      t.IsResolved,
+			IsOutdated:      t.IsOutdated,
+			Path:            t.Path,
+			Line:            t.Line,
+			Author:          t.Author,
+			Body:            t.Body,
+			URL:             t.URL,
+			LastReplyAuthor: t.LastReplyAuthor,
+			LastReplyAt:     t.LastReplyAt,
 		})
 	}
 	return out
