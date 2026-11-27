@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/polecat"
 )
@@ -151,5 +152,30 @@ func TestRunCapReliefCleanup_CancelSendsSIGTERM(t *testing.T) {
 	<-done
 	if _, err := os.Stat(termed); err != nil {
 		t.Error("gt was not sent SIGTERM on cancel (killed outright instead)")
+	}
+}
+
+// A cleanup exits 0 even when it reclaims nothing, so the log entry must carry what
+// it actually did, minus the per-polecat listing.
+func TestCapReliefOutcome(t *testing.T) {
+	out := "Detecting stale polecats in myrig...\n\n○ alpha (stale)\n    Reason: no active session\n\n" +
+		"Summary: 1 stale, 4 active\n\nCleaning up 1 stale polecat(s)...\nNuking alpha...\n  failed (worktree removal failed: busy)\n"
+	got := capReliefOutcome(out)
+	want := "Summary: 1 stale, 4 active\n\nCleaning up 1 stale polecat(s)...\nNuking alpha...\n  failed (worktree removal failed: busy)"
+	if got != want {
+		t.Errorf("capReliefOutcome = %q, want %q", got, want)
+	}
+
+	if got := capReliefOutcome("No polecats found.\n"); got != "No polecats found." {
+		t.Errorf("no Summary line: got %q, want the whole output", got)
+	}
+
+	long := "listing\nSummary: 20 stale, 0 active\n" + strings.Repeat("Nuking x...\n  ✓ deleted worktree\n", 200) + "\n✓ Nuked 20 stale polecat(s).\n"
+	got = capReliefOutcome(long)
+	if !strings.HasPrefix(got, "Summary: 20 stale, 0 active\n... (") || !strings.HasSuffix(got, "✓ Nuked 20 stale polecat(s).") {
+		t.Errorf("long output must keep the Summary line and the final tally, got:\n%s", got)
+	}
+	if len(got) > capReliefOutcomeTailBytes+100 || !utf8.ValidString(got) {
+		t.Errorf("long output: %d bytes, valid UTF-8 = %v", len(got), utf8.ValidString(got))
 	}
 }
