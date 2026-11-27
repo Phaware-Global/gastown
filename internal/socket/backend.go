@@ -305,7 +305,9 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 }
 
 // WrapCommand returns the launcher argv for the exec stream (§5): a thin
-// gt-worker-attach that opens an exec stream to the worker and pipes stdio.
+// `gt worker-attach` that opens an exec stream to the worker and pipes stdio.
+// It is gt rather than the standalone gt-worker-attach so that only one
+// executable on the orchestrator needs to be allowed to reach the worker.
 // The launcher — not this argv — carries the agent command + non-secret env
 // to the worker in the exec payload (core §7.4); secret env is delivered
 // worker-side via the agent env file (§8), never here.
@@ -331,7 +333,7 @@ func (b *SocketBackend) WrapCommand(ep execution.Endpoint, agentArgv []string, e
 		}
 	}
 	argv := []string{
-		"gt-worker-attach",
+		"gt", "worker-attach",
 		"--address", ep.Address,
 		"--session", ep.ID,
 		"--",

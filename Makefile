@@ -236,9 +236,8 @@ safe-install: check-up-to-date check-forward-only build
 
 # install-remote-execution-binaries: the remote-execution companions.
 #
-# gt-worker-attach is NOT optional for a socket rig: WrapCommand emits a bare
-# `gt-worker-attach` as the pane command, so a missing binary means the pane
-# dies with command-not-found the first time a remote polecat starts.
+# gt-worker-attach is the standalone form of the pane launcher; the pane itself
+# runs `gt worker-attach`, so a socket rig no longer depends on it.
 # gt-worker-client is the worker service itself, installed here so a machine
 # that acts as both orchestrator and worker (the single-box setup) is complete
 # after one `make install`. gt-proxy-client comes too: on a worker it IS `gt` and
