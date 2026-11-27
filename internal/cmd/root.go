@@ -77,22 +77,24 @@ var beadsExemptCommands = map[string]bool{
 	"health":        true, // Health check doesn't require beads
 	"upgrade":       true, // Post-install migration orchestrator
 	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
+	"worker-attach": true, // Pane launcher for a remote polecat; needs only the worker
 }
 
 // Commands exempt from the town root branch warning.
 // These are commands that help fix the problem or are diagnostic.
 var branchCheckExemptCommands = map[string]bool{
-	"version":     true,
-	"help":        true,
-	"completion":  true,
-	"doctor":      true, // Used to fix the problem
-	"status-line": true, // tmux hot path; never run git freshness checks here
-	"estop":       true, // Emergency stop must always work
-	"thaw":        true, // Thaw must always work
-	"install":     true, // Initial setup
-	"git-init":    true, // Git setup
-	"upgrade":     true, // Post-install migration
-	"scheduler":   true, // Daemon hot path; scheduler handles beads internally
+	"version":       true,
+	"help":          true,
+	"completion":    true,
+	"doctor":        true, // Used to fix the problem
+	"status-line":   true, // tmux hot path; never run git freshness checks here
+	"estop":         true, // Emergency stop must always work
+	"thaw":          true, // Thaw must always work
+	"install":       true, // Initial setup
+	"git-init":      true, // Git setup
+	"upgrade":       true, // Post-install migration
+	"scheduler":     true, // Daemon hot path; scheduler handles beads internally
+	"worker-attach": true, // Pane launcher for a remote polecat; the town root is not its concern
 }
 
 // persistentPreRun runs before every command.

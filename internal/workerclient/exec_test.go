@@ -340,7 +340,7 @@ func TestWrapCommandEnv_KeepsCredentialOffArgv(t *testing.T) {
 	joined := strings.Join(argv, " ")
 	assert.NotContains(t, joined, "t0k", "the worker token must not appear in argv")
 	assert.Equal(t, "t0k", env["GT_WORKER_TOKEN"], "it must be delivered via the session env")
-	assert.Contains(t, joined, "gt-worker-attach")
+	assert.Contains(t, joined, "gt worker-attach")
 	assert.Contains(t, joined, "-- claude --model opus")
 }
 

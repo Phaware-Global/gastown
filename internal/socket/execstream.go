@@ -25,8 +25,8 @@ type ExecStreamOptions struct {
 // WRITES) and the codec (whose buffered reader must be used for the ack and all
 // frame READS — bytes past the preamble may already be buffered).
 //
-// This is exported for gt-worker-attach, which is a separate binary from the
-// daemon and so cannot reach the package-internal dialer.
+// This is exported for the pane launcher (internal/workerattach), which cannot
+// reach the package-internal dialer.
 func DialExecStream(ctx context.Context, opts ExecStreamOptions) (net.Conn, *sockproto.Codec, error) {
 	if opts.Address == "" {
 		return nil, nil, fmt.Errorf("socket: exec stream requires an address")
