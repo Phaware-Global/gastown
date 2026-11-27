@@ -188,3 +188,31 @@ func TestAgentStateGtKeyChangesKeepGtAgent(t *testing.T) {
 		})
 	}
 }
+
+// A process bd leaves behind holding its output pipes must not stall the call,
+// and the call still succeeds because bd itself did.
+func TestAgentStateWriteDoesNotWaitForBdChildren(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd is a shell script")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+sleep 20 &
+[ "$1" != show ] || echo '[{"labels":["gt:agent"]}]'
+`
+	if err := os.WriteFile(filepath.Join(dir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	old := bdWaitDelay
+	bdWaitDelay = 100 * time.Millisecond
+	defer func() { bdWaitDelay = old }()
+
+	start := time.Now()
+	if err := setAgentIdleCycles("x-refinery", t.TempDir(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("write took %v", elapsed)
+	}
+}

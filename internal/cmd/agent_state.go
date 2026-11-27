@@ -238,11 +238,12 @@ func writeAgentStateLabels(agentBead, beadsDir string, changes map[string]*strin
 
 	cmd := exec.CommandContext(ctx, "bd", append([]string{"update", agentBead}, edits...)...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	cmd.WaitDelay = bdWaitDelay
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := beads.TrimWaitDelay(cmd.Run()); err != nil {
 		if errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String())); errMsg != "" {
 			return fmt.Errorf("%s", errMsg)
 		}
@@ -278,6 +279,10 @@ func getAgentLabels(agentBead, beadsDir string) (map[string]string, error) {
 // ceiling prevents await-event/await-signal from stalling past the patrol timeout.
 const bdCallTimeout = 30 * time.Second
 
+// bdWaitDelay bounds how long a bd call waits on its output pipes once bd has
+// exited or been killed, since a process bd started can keep them open.
+var bdWaitDelay = 2 * time.Second
+
 // getAllAgentLabels retrieves all labels (including non-state) from an agent bead.
 func getAllAgentLabels(agentBead, beadsDir string) ([]string, error) {
 	args := []string{"show", agentBead, "--json"}
@@ -287,12 +292,13 @@ func getAllAgentLabels(agentBead, beadsDir string) ([]string, error) {
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	cmd.WaitDelay = bdWaitDelay
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := beads.TrimWaitDelay(cmd.Run()); err != nil {
 		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if strings.Contains(errMsg, "not found") {
 			return nil, fmt.Errorf("agent bead not found: %s", agentBead)

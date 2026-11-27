@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/gofrs/flock"
@@ -264,6 +265,22 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	return &issue, nil
 }
 
+// sessionStateLabelKeys are the label keys that describe one agent session and
+// must not carry over to the next.
+var sessionStateLabelKeys = []string{"backoff-until", "done-cp", "done-intent", "heartbeat", "idle"}
+
+// sessionStateLabels returns the labels that belong to a previous session.
+func sessionStateLabels(labels []string) []string {
+	var stale []string
+	for _, label := range labels {
+		key, _, ok := strings.Cut(label, ":")
+		if ok && slices.Contains(sessionStateLabelKeys, key) {
+			stale = append(stale, label)
+		}
+	}
+	return stale
+}
+
 // CreateOrReopenAgentBead creates an agent bead or reopens an existing one.
 // This handles the case where a polecat is nuked and re-spawned with the same name:
 // the old agent bead exists (open or closed), so we update it instead of
@@ -322,11 +339,14 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	// Update the bead with new fields and ensure gt:agent label is set.
 	// Agent beads use type=task (a valid built-in type) and are identified
 	// by the gt:agent label, not by type (see IsAgentBead).
+	// Never SetLabels here: bd removes every label and re-adds them one at a
+	// time, so an interrupted write can leave the bead without gt:agent.
 	description := FormatAgentDescription(title, fields)
 	updateOpts := UpdateOptions{
-		Title:       &title,
-		Description: &description,
-		SetLabels:   []string{"gt:agent"},
+		Title:        &title,
+		Description:  &description,
+		AddLabels:    []string{"gt:agent"},
+		RemoveLabels: sessionStateLabels(existing.Labels),
 	}
 	if err := target.Update(id, updateOpts); err != nil {
 		return nil, fmt.Errorf("updating agent bead: %w", err)
