@@ -789,6 +789,25 @@ func TestSessionOpen_DefaultBranchFollowsTheHostsUpstreamRef(t *testing.T) {
 	assert.Empty(t, git(t, worktree, "status", "--porcelain"))
 }
 
+// The default branch's name comes from the host. One that git would read as
+// an option (`git branch ... -m origin/-m` renames the current branch) must
+// not reach git's argv: bring-up succeeds and leaves that branch alone.
+func TestSessionOpen_UnsafeDefaultBranchNameIsLeftAlone(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc12@mv3cxv4t"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	head := git(t, rigRepo, "rev-parse", "HEAD")
+	git(t, rigRepo, "update-ref", "refs/heads/"+branch, head)
+	git(t, rigRepo, "update-ref", "refs/heads/-m", head)
+	git(t, rigRepo, "update-ref", "refs/remotes/origin/-m", head)
+	git(t, rigRepo, "symbolic-ref", "HEAD", "refs/heads/-m")
+
+	worktree := provisionOn(t, proxyURL, ca, branch)
+	assert.Equal(t, "origin/-m", git(t, worktree, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"))
+	assert.Equal(t, branch, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+	assert.Equal(t, "origin/"+branch, git(t, worktree, "rev-parse", "--abbrev-ref", "@{upstream}"))
+}
+
 func TestValidBranch(t *testing.T) {
 	for _, ok := range []string{"polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa-mv3cxv4t", "main"} {
 		assert.True(t, validBranch(ok), "%q must be accepted", ok)

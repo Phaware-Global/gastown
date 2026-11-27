@@ -1193,7 +1193,8 @@ func useUpstreamTrackingRefs(ctx context.Context, worktree, branch string) error
 	}
 	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output()
 	def := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/")
-	if err != nil || def == branch {
+	// def is the host's name for its default branch and goes into git's argv.
+	if err != nil || def == branch || !validBranch(def) {
 		return nil
 	}
 	if exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+def).Run() != nil {
