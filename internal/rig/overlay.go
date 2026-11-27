@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 )
@@ -175,7 +177,7 @@ const localExcludeFileName = "gt-exclude"
 // needs git's per-worktree config (extensions.worktreeConfig).
 //
 // A per-worktree core.excludesFile takes the place of the user's global one inside
-// this worktree.
+// this worktree, so the global file's patterns are copied into it.
 func EnsureLocalExcludePatterns(worktreePath string) error {
 	gitDir, err := gitRevParse(worktreePath, "--absolute-git-dir")
 	if err != nil {
@@ -185,7 +187,12 @@ func EnsureLocalExcludePatterns(worktreePath string) error {
 	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
 		return fmt.Errorf("creating local exclude dir: %w", err)
 	}
-	content := "# Gas Town (written by gt; do not edit)\n" + strings.Join(gasTownLocalExcludePatterns(), "\n") + "\n"
+	// git reads a single excludes file, so the per-worktree one would otherwise
+	// switch off the user's global ignore here and let `git add -A` stage whatever
+	// it hides (.env, key files). Carry its patterns over; this file is rewritten on
+	// every add or repair, so the copy stays current.
+	content := userGlobalExcludes() +
+		"# Gas Town (written by gt; do not edit)\n" + strings.Join(gasTownLocalExcludePatterns(), "\n") + "\n"
 	if err := os.WriteFile(excludePath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("writing local exclude: %w", err)
 	}
@@ -199,13 +206,47 @@ func EnsureLocalExcludePatterns(worktreePath string) error {
 	return nil
 }
 
+// userGlobalExcludes returns the contents of the excludes file git applies outside
+// any repository: core.excludesFile from the global or system config, else git's
+// default $XDG_CONFIG_HOME/git/ignore (~/.config/git/ignore). Empty if there is none.
+func userGlobalExcludes() string {
+	var path string
+	for _, scope := range []string{"--global", "--system"} {
+		out, err := exec.Command("git", "config", scope, "--path", "--get", "core.excludesFile").Output()
+		if p := strings.TrimSpace(string(out)); err == nil && p != "" {
+			path = p
+			break
+		}
+	}
+	if path == "" {
+		base := os.Getenv("XDG_CONFIG_HOME")
+		if base == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return ""
+			}
+			base = filepath.Join(home, ".config")
+		}
+		path = filepath.Join(base, "git", "ignore")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	return "# Copied from " + path + "\n" + strings.TrimRight(string(data), "\n") + "\n\n"
+}
+
 // enableWorktreeConfig turns on extensions.worktreeConfig for the repository that
 // worktreePath belongs to. Once the extension is on, every linked worktree reads
 // the common config as its own, so a core.bare=true left there makes all of them
 // fail with "this operation must be run in a work tree". As git's own
 // sparse-checkout does, core.bare is therefore moved to the main worktree's
-// config.worktree first; each step leaves the repository usable, so concurrent
-// agents in sibling worktrees are never broken mid-way.
+// config.worktree first; each step leaves linked worktrees usable.
+//
+// Sibling polecats are set up concurrently, so the migration runs under a file lock
+// in the common git dir, and each write retries while another git process holds
+// config.lock. If the extension still cannot be enabled, core.bare is put back so
+// the repository is not left reading as non-bare.
 func enableWorktreeConfig(worktreePath string) error {
 	commonDir, err := gitRevParse(worktreePath, "--git-common-dir")
 	if err != nil {
@@ -222,28 +263,57 @@ func enableWorktreeConfig(worktreePath string) error {
 	if get("extensions.worktreeConfig") == "true" {
 		return nil
 	}
+
+	lock := flock.New(filepath.Join(commonDir, "gt-worktree-config.lock"))
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("locking %s: %w", commonDir, err)
+	}
+	defer func() { _ = lock.Unlock() }()
+	if get("extensions.worktreeConfig") == "true" {
+		return nil // a sibling finished the migration while we waited
+	}
+
 	if get("core.worktree") != "" {
 		return fmt.Errorf("not enabling per-worktree git config: %s sets core.worktree", commonConfig)
 	}
 	set := func(file string, args ...string) error {
-		out, err := exec.Command("git", append([]string{"config", "--file", file}, args...)...).CombinedOutput()
+		var out []byte
+		var err error
+		for attempt := 0; attempt < gitConfigLockRetries; attempt++ {
+			out, err = exec.Command("git", append([]string{"config", "--file", file}, args...)...).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "could not lock config file") {
+				break
+			}
+			time.Sleep(gitConfigLockBackoff)
+		}
 		if err != nil {
 			return fmt.Errorf("git config %s in %s: %w: %s", strings.Join(args, " "), file, err, strings.TrimSpace(string(out)))
 		}
 		return nil
 	}
-	if bare := get("core.bare"); bare != "" {
+	bare := get("core.bare")
+	if bare != "" {
 		if err := set(filepath.Join(commonDir, "config.worktree"), "core.bare", bare); err != nil {
 			return err
 		}
-		// A concurrent caller may already have removed it; the next read decides.
-		_ = set(commonConfig, "--unset", "core.bare")
-		if get("core.bare") != "" {
-			return fmt.Errorf("could not move core.bare out of %s", commonConfig)
+		if err := set(commonConfig, "--unset", "core.bare"); err != nil {
+			return err
 		}
 	}
-	return set(commonConfig, "extensions.worktreeConfig", "true")
+	if err := set(commonConfig, "extensions.worktreeConfig", "true"); err != nil {
+		if bare != "" {
+			_ = set(commonConfig, "core.bare", bare)
+		}
+		return err
+	}
+	return nil
 }
+
+// git holds config.lock only for the duration of one write, so a short wait clears it.
+const (
+	gitConfigLockRetries = 20
+	gitConfigLockBackoff = 50 * time.Millisecond
+)
 
 func gitRevParse(worktreePath, arg string) (string, error) {
 	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", arg).CombinedOutput()
