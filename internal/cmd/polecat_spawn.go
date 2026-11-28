@@ -2,12 +2,16 @@
 package cmd
 
 import (
+	"cmp"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -61,14 +65,36 @@ type SlingSpawnOptions struct {
 	SkipAdmission bool   // Caller already holds a polecat admission reservation
 }
 
+// slingPolecatManager is the part of polecat.Manager that spawning for sling uses.
+type slingPolecatManager interface {
+	CheckDoltHealth() error
+	CheckDoltServerCapacity() error
+	FindIdlePolecatContext(ctx context.Context, progress func(checked, total int)) (*polecat.Polecat, error)
+	ReuseIdlePolecat(name string, opts polecat.AddOptions) (*polecat.Polecat, error)
+	AllocateAndAdd(opts polecat.AddOptions) (string, *polecat.Polecat, error)
+	Get(name string) (*polecat.Polecat, error)
+	Remove(name string, force bool) error
+}
+
+var newSlingPolecatManager = func(r *rig.Rig, g *git.Git, t *tmux.Tmux) slingPolecatManager {
+	return polecat.NewManager(r, g, t)
+}
+
+// The idle-polecat scan is only an optimization over creating a fresh polecat,
+// so it gets a time budget and reports on itself while it runs.
+var (
+	idleScanBudget                  = 60 * time.Second
+	idleScanProgressEvery           = 10 * time.Second
+	slingProgressOut      io.Writer = os.Stderr
+)
+
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
-func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (info *SpawnedPolecatInfo, err error) {
 	// Find workspace
 	townRoot := opts.TownRoot
 	if townRoot == "" {
-		var err error
 		townRoot, err = workspace.FindFromCwdOrError()
 		if err != nil {
 			return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -92,7 +118,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Get polecat manager (with tmux for session-aware allocation)
 	polecatGit := git.NewGit(r.Path)
 	t := tmux.NewTmux()
-	polecatMgr := polecat.NewManager(r, polecatGit, t)
+	polecatMgr := newSlingPolecatManager(r, polecatGit, t)
 
 	// Pre-spawn Dolt health check (gt-94llt7): verify Dolt is reachable before
 	// allocating a polecat. Prevents orphaned polecats when Dolt is down.
@@ -157,13 +183,29 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				opts.HookBead, maxRespawns,
 				opts.HookBead, rigName, opts.HookBead)
 		}
-		witness.RecordBeadRespawn(townRoot, opts.HookBead)
+		// Counted only once a polecat is obtained: an attempt that failed or
+		// was killed on the way never respawned the bead.
+		defer func() {
+			if err == nil {
+				witness.RecordBeadRespawn(townRoot, opts.HookBead)
+			}
+		}()
 	}
 
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
-	idlePolecat, findErr := polecatMgr.FindIdlePolecat()
+	idlePolecat, scanOverran, findErr := findIdlePolecatWithinBudget(polecatMgr)
+	if scanOverran {
+		// No idle polecat was tried, so say how to use one if this fails.
+		defer func() {
+			if err != nil {
+				err = fmt.Errorf("%w\nThe idle-polecat scan ran out of time, so none was reused. "+
+					"Sling to an idle polecat by name: gt sling %s %s/<polecat>",
+					err, cmp.Or(opts.HookBead, "<bead>"), rigName)
+			}
+		}()
+	}
 	if findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
 		fmt.Printf("Reusing idle polecat: %s\n", polecatName)
@@ -351,6 +393,51 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		account:     opts.Account,
 		agent:       opts.Agent,
 	}, nil
+}
+
+// findIdlePolecatWithinBudget looks for a reusable idle polecat, reporting
+// progress, and gives up after idleScanBudget. A scan given up on may still be
+// waiting on a subprocess; it only reads, and its result is discarded.
+func findIdlePolecatWithinBudget(mgr slingPolecatManager) (idle *polecat.Polecat, overran bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), idleScanBudget)
+	defer cancel()
+
+	type result struct {
+		idle *polecat.Polecat
+		err  error
+	}
+	done := make(chan result, 1)
+	var checked, total atomic.Int64
+	go func() {
+		p, err := mgr.FindIdlePolecatContext(ctx, func(c, n int) {
+			checked.Store(int64(c))
+			total.Store(int64(n))
+		})
+		done <- result{p, err}
+	}()
+
+	start := time.Now()
+	fmt.Fprintf(slingProgressOut, "Looking for an idle polecat to reuse (up to %s)...\n", idleScanBudget)
+	ticker := time.NewTicker(idleScanProgressEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case r := <-done:
+			if !errors.Is(r.err, context.DeadlineExceeded) {
+				return r.idle, false, r.err
+			}
+		case <-ticker.C:
+			state := "loading polecats"
+			if n := total.Load(); n > 0 {
+				state = fmt.Sprintf("checked %d of %d polecats", checked.Load(), n)
+			}
+			fmt.Fprintf(slingProgressOut, "  still scanning after %s: %s\n", time.Since(start).Round(time.Second), state)
+			continue
+		case <-ctx.Done():
+		}
+		fmt.Fprintf(slingProgressOut, "Idle-polecat scan passed its %s budget; allocating a fresh polecat instead.\n", idleScanBudget)
+		return nil, true, nil
+	}
 }
 
 // startPolecatSessionFn is a seam for tests (gt-azm0): sling.go, sling_dispatch.go,
