@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,8 +78,19 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+// fillDirCap leaves the rig no directory slot for a fresh polecat.
+func fillDirCap(t *testing.T, town string) {
+	t.Helper()
+	for i := range polecat.EffectivePolecatDirCap(0) {
+		if err := os.MkdirAll(filepath.Join(town, "testrig", "polecats", fmt.Sprintf("p%d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestSpawnPolecatForSlingScanBudgetAndRespawnCount(t *testing.T) {
 	const slow = 10 * time.Second
+	const late = 900 * time.Millisecond // past the budget, within the limit
 	idle := &polecat.Polecat{Name: "idler"}
 	noRoom := errors.New("no room")
 	cases := []struct {
@@ -88,13 +100,18 @@ func TestSpawnPolecatForSlingScanBudgetAndRespawnCount(t *testing.T) {
 		wantHint     bool
 		wantOverrun  bool
 		wantRespawns int
+		atDirCap     bool
 	}{
-		{"slow scan falls back to a fresh polecat", fakeSpawnManager{scanDelay: slow, idle: idle}, "fresh", false, true, 1},
-		{"slow scan and failed allocation", fakeSpawnManager{scanDelay: slow, allocErr: noRoom}, "", true, true, 0},
-		{"quick scan and failed allocation", fakeSpawnManager{allocErr: noRoom}, "", false, false, 0},
-		{"failed health check", fakeSpawnManager{healthErr: errors.New("dolt down")}, "", false, false, 0},
-		{"fresh polecat", fakeSpawnManager{}, "fresh", false, false, 1},
-		{"reused idle polecat", fakeSpawnManager{idle: idle}, "idler", false, false, 1},
+		{"slow scan falls back to a fresh polecat", fakeSpawnManager{scanDelay: slow, idle: idle}, "fresh", false, true, 1, false},
+		{"slow scan and failed allocation", fakeSpawnManager{scanDelay: slow, allocErr: noRoom}, "", true, true, 0, false},
+		{"quick scan and failed allocation", fakeSpawnManager{allocErr: noRoom}, "", false, false, 0, false},
+		{"failed health check", fakeSpawnManager{healthErr: errors.New("dolt down")}, "", false, false, 0, false},
+		{"fresh polecat", fakeSpawnManager{}, "fresh", false, false, 1, false},
+		{"reused idle polecat", fakeSpawnManager{idle: idle}, "idler", false, false, 1, false},
+		// With no slot for a fresh polecat, a late scan is waited for.
+		{"at cap, late scan finds an idle polecat", fakeSpawnManager{scanDelay: late, idle: idle}, "idler", false, false, 1, true},
+		{"at cap, late scan finds none", fakeSpawnManager{scanDelay: late}, "", true, false, 0, true},
+		{"at cap, scan passes the limit too", fakeSpawnManager{scanDelay: slow, idle: idle}, "", true, false, 0, true},
 	}
 
 	for _, tc := range cases {
@@ -113,6 +130,9 @@ func TestSpawnPolecatForSlingScanBudgetAndRespawnCount(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.atDirCap {
+				fillDirCap(t, town)
+			}
 			t.Chdir(town)
 			if msg, err := exec.Command("git", "init", "-q", filepath.Join(town, "clone")).CombinedOutput(); err != nil {
 				t.Fatalf("git init: %v: %s", err, msg)
@@ -123,12 +143,15 @@ func TestSpawnPolecatForSlingScanBudgetAndRespawnCount(t *testing.T) {
 			fake.release = make(chan struct{})
 			out := &lockedBuffer{}
 			oldNew, oldBudget, oldEvery, oldOut := newSlingPolecatManager, idleScanBudget, idleScanProgressEvery, slingProgressOut
+			oldLimit := idleScanLimit
 			t.Cleanup(func() {
 				close(fake.release)
 				newSlingPolecatManager, idleScanBudget, idleScanProgressEvery, slingProgressOut = oldNew, oldBudget, oldEvery, oldOut
+				idleScanLimit = oldLimit
 			})
 			newSlingPolecatManager = func(*rig.Rig, *git.Git, *tmux.Tmux) slingPolecatManager { return &fake }
 			idleScanBudget, idleScanProgressEvery, slingProgressOut = 300*time.Millisecond, 50*time.Millisecond, out
+			idleScanLimit = 3 * time.Second
 
 			start := time.Now()
 			info, err := SpawnPolecatForSling("testrig", SlingSpawnOptions{
@@ -155,6 +178,9 @@ func TestSpawnPolecatForSlingScanBudgetAndRespawnCount(t *testing.T) {
 			log := out.String()
 			if got := strings.Contains(log, "allocating a fresh polecat"); got != tc.wantOverrun {
 				t.Errorf("overrun notice = %v, want %v: %q", got, tc.wantOverrun, log)
+			}
+			if tc.atDirCap && !strings.Contains(log, "waiting for the scan") {
+				t.Errorf("no notice that the scan is waited for: %q", log)
 			}
 			if tc.wantOverrun && !strings.Contains(log, "checked 1 of 3") {
 				t.Errorf("no progress while scanning: %q", log)
