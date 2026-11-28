@@ -604,7 +604,10 @@ func TestGetStartCommand_RefineryIsIsolated(t *testing.T) {
 		t.Errorf("start command uses the role start_command: %s", cmd)
 	}
 
-	town.RoleAgents = map[string]string{"refinery": "codex"}
+	// A custom agent, so the result does not depend on an installed binary: a
+	// preset whose binary is missing falls back to the default agent.
+	town.Agents = map[string]*config.RuntimeConfig{"not-claude": {Provider: "codex", Command: "codex"}}
+	town.RoleAgents = map[string]string{"refinery": "not-claude"}
 	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), town); err != nil {
 		t.Fatal(err)
 	}
