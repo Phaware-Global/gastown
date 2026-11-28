@@ -1,0 +1,42 @@
+#!/bin/bash
+# Installed and overwritten by gt. Do not edit.
+#
+# Blocks a push to the default branch that makes an integration branch tip
+# newly reachable, unless GT_INTEGRATION_LAND=1 is set, which only
+# "gt mq integration land" does.
+
+[[ "$GT_INTEGRATION_LAND" == "1" ]] && exit 0
+
+default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's#refs/remotes/origin/##')
+if [[ -z "$default_branch" ]]; then
+  if git rev-parse --verify origin/master &>/dev/null; then
+    default_branch=master
+  else
+    default_branch=main
+  fi
+fi
+
+zero=0000000000000000000000000000000000000000
+
+while read -r _ local_sha remote_ref remote_sha; do
+  [[ "$remote_ref" == "refs/heads/$default_branch" ]] || continue
+  # Deletions and initial pushes have nothing to compare.
+  [[ "$remote_sha" == "$zero" || "$local_sha" == "$zero" ]] && continue
+
+  # ls-remote rather than local tracking refs, which can outlive their branch.
+  integration_refs=$(git ls-remote --quiet origin "refs/heads/integration/*" 2>&1) || {
+    echo "BLOCKED: cannot verify integration branches (remote unreachable)."
+    echo "Retry the push when the remote is reachable."
+    exit 1
+  }
+  for ref in $(echo "$integration_refs" | awk '{print $1}'); do
+    if git merge-base --is-ancestor "$ref" "$local_sha" &&
+      ! git merge-base --is-ancestor "$ref" "$remote_sha"; then
+      echo "BLOCKED: Push to $default_branch introduces integration branch content."
+      echo "Integration branches must be landed via: gt mq integration land <epic-id>"
+      exit 1
+    fi
+  done
+done
+
+exit 0

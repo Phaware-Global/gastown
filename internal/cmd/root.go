@@ -113,6 +113,11 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
+	// Before anything below runs git.
+	if err := disableHooksForPRCheckoutCommands(cmd); err != nil {
+		return err
+	}
+
 	// Initialize CLI theme (dark/light mode support)
 	initCLITheme()
 

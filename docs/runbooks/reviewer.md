@@ -192,6 +192,29 @@ the Reviewer's defining advantage over a diff-only reviewer.
 
 ---
 
+## PR checkouts never execute PR code
+
+A tracked hooks directory (`core.hooksPath` pointing at `.githooks`, `.husky`,
+and so on) lets a PR branch choose the git hooks that run. Reviewer and refinery
+sessions, and the `gt reviewer checkout`, `gt refinery pr sync-branch`,
+`gt refinery pr push-branch` and `gt mq integration land` commands, therefore
+override `core.hooksPath` through `GIT_CONFIG_*` environment variables. The
+shared repo config is not changed, so polecats keep their hooks.
+
+- The reviewer uses `/dev/null`: no hooks.
+- The refinery uses `<town>/.runtime/trusted-hooks`, which gt writes itself and
+  which holds only the integration-branch landing guard (`pre-push`). The other
+  checks in a repository's own hooks do not run.
+- gt refuses that directory if it is not a real directory, is owned by another
+  user, or is group or world writable. The refinery then does not start, and git
+  fails in any session built without the guard. Fix the ownership or mode, or
+  delete the directory so gt recreates it.
+
+Restart sessions that were already running to pick this up.
+
+Never run package installs or lifecycle scripts (`npm`/`yarn`/`pnpm install`,
+`prepare`, `postinstall`) or `make` targets from the PR in a PR checkout.
+
 ## Operating
 
 ### What happens automatically
@@ -234,6 +257,22 @@ consolidate` before the single `post`. Dedup keys on `(path, line, title)`, keep
 the highest priority, and unions the perspective tags; the consolidated summary
 carries a verdict line for **every** perspective (perspectives with no findings
 are still accounted for).
+
+### Running passes headlessly
+
+`gt reviewer run --pr <N> --sha <head-sha> --round <r>` runs every enabled
+perspective on the checked-out head, in parallel, from a reviewer worktree. Each
+pass is a separate headless Claude process (also when the reviewer role is
+configured with another agent). It gets the role's tool guards, built from the
+hook configuration `gt hooks sync` uses and passed in a file outside the
+worktree. It loads only user-level settings, so nothing in the PR's checkout
+configures it, and its only MCP server is codegraph.
+
+The command writes `perspective-<name>.json` and `receipt-<name>.json` (pass id,
+PR, commit, prompt and result hashes, start and end times) to
+`<rig>/reviewer/passes/pr<N>/` once every pass has exited, and prints each
+result's sha256. A failed pass leaves neither. The review
+sequence above does not depend on this command, and nothing checks the receipts.
 
 ### Findings JSON shape (consumed by `gt reviewer post`)
 
