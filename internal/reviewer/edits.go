@@ -8,7 +8,7 @@ import (
 
 // Edits are the coordinator's changes to the raw perspective results. A finding is
 // addressed by its raw id, "perspective:N", its 1-based position in that
-// perspective's result. Edits are carried in the payload.
+// perspective's result. Edits are carried in the payload so posting can reproduce it.
 type Edits struct {
 	Drop            []DropEdit        `json:"drop,omitempty"`
 	DropOpportunity []string          `json:"drop_opportunity,omitempty"` // "perspective:N"
