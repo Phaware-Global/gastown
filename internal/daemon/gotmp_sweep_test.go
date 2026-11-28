@@ -203,6 +203,14 @@ func TestGoTmpHoldersSeesOpenFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
+	// A failed listing also keeps the directory, so check the listing itself.
+	listing, err := goTmpHolders(context.Background())
+	if err != nil {
+		t.Fatalf("goTmpHolders: %v", err)
+	}
+	if !strings.Contains(listing, "go-build7777001") {
+		t.Fatal("listing does not name the directory with an open file")
+	}
 	s := &goTmpSweeper{maxAge: DefaultGoTmpMaxAge, holders: goTmpHolders,
 		logf: t.Logf}
 	s.sweep(context.Background(), root)
