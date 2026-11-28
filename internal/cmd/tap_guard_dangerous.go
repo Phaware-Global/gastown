@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -71,41 +72,45 @@ func runTapGuardDangerous(cmd *cobra.Command, args []string) error {
 	}
 
 	command := extractCommand(input)
+	if reason := dangerousReason(command); reason != "" {
+		printDangerousBlock(reason, command)
+		return NewSilentExit(2)
+	}
+	return nil
+}
+
+// dangerousReason returns why command is dangerous, or "".
+func dangerousReason(command string) string {
 	if command == "" {
-		return nil
+		return ""
 	}
 
 	lower := strings.ToLower(command)
 
 	// Check privilege escalation and package manager commands first
 	if reason := matchesSudo(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
+		return reason
 	}
 	if reason := matchesPackageInstall(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
+		return reason
 	}
 
 	// Check special patterns that need smarter matching
 	if reason := matchesDangerousRmRf(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
+		return reason
 	}
 	if reason := matchesDangerousGitPush(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
+		return reason
 	}
 
 	// Check simple fragment patterns
 	for _, pattern := range fragmentPatterns {
 		if matchesAllFragments(lower, pattern.contains) {
-			printDangerousBlock(pattern.reason, command)
-			return NewSilentExit(2)
+			return pattern.reason
 		}
 	}
 
-	return nil
+	return ""
 }
 
 // printDangerousBlock prints the standard block banner to stderr.
@@ -122,8 +127,26 @@ func printDangerousBlock(reason, originalCommand string) {
 	fmt.Fprintln(os.Stderr, "")
 }
 
-// extractCommand extracts the bash command from Claude Code hook input JSON.
+// reviewerExecPrefix matches "gt reviewer exec [--]" ahead of the command it
+// runs.
+var reviewerExecPrefix = regexp.MustCompile("(^|[\\s;|&(){}'\"`])(?:[^\\s;|&()'\"`]*/)?gt" +
+	`(?:\s|\\\n)+reviewer(?:\s|\\\n)+exec(?:\s|\\\n)+(?:--(?:\s|\\\n)+)?`)
+
+// extractCommand returns the bash command of a hook input as the guards should
+// judge it: with any "gt reviewer exec" removed, so the wrapper hides nothing.
 func extractCommand(input []byte) string {
+	command := rawCommand(input)
+	for {
+		unwrapped := reviewerExecPrefix.ReplaceAllString(command, "$1")
+		if unwrapped == command {
+			return command
+		}
+		command = unwrapped
+	}
+}
+
+// rawCommand extracts the bash command from Claude Code hook input JSON.
+func rawCommand(input []byte) string {
 	if len(input) == 0 {
 		return ""
 	}

@@ -452,6 +452,9 @@ type shellScope struct {
 	depth int // how many shells deep the command is
 	cwd   string
 	vars  map[string]string
+	// keepReviewerExec leaves "gt reviewer exec" as the program instead of
+	// looking through it, for the guard that requires it.
+	keepReviewerExec bool
 }
 
 func (s shellScope) clone() shellScope {
@@ -665,6 +668,13 @@ func (s shellScope) commandName(words []string) (string, []string) {
 			continue
 		}
 		name := path.Base(s.expand(w))
+		if !s.keepReviewerExec && name == "gt" && len(words) > 2 && words[1] == "reviewer" && words[2] == "exec" {
+			words = words[3:]
+			if len(words) > 0 && words[0] == "--" {
+				words = words[1:]
+			}
+			continue
+		}
 		valueFlags, wrapper := wrapperValueFlags[name]
 		if !wrapper {
 			return name, words[1:]
