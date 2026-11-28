@@ -42,8 +42,9 @@ File discovered work as beads (`bd create`) but don't fix it yourself.
 ## Secrets: never print environment values
 
 Never print environment values; check presence only
-(`test -n "$VAR" && echo set`). List names with `compgen -e`. Command output
-goes into your transcript, and a sed or grep redaction can fail silently.
+(`test -n "$VAR" && echo set`). List names with `bash -c 'compgen -e'`, never by
+cutting `env` output. Command output goes into your transcript, and a sed or grep
+redaction can fail silently.
 
 ---
 

@@ -30,14 +30,18 @@ Blocked:
     that print one, including through a variable assigned from it
   - reading /proc/<pid>/environ
   - any pipeline that starts with one of these, whatever filters follow
+  - echo or printf of a secret piped into a program, which cannot be told apart
+    from a program that displays its input
 
 A secret variable is an upper-case name containing TOKEN, SECRET, PASSWORD,
 PASSWD or CREDENTIAL, or ending in KEY or PAT as its own word (API_KEY,
 GITHUB_PAT).
 
-Allowed: listing names only (compgen -e, env | cut -d= -f1), presence checks
-(test -n "$VAR" && echo set, "${VAR:+set}", ${#VAR}) and passing a secret to a
-program that uses it.
+Allowed: listing names only (compgen -e, which is a bash builtin: from zsh run
+bash -c 'compgen -e'), presence checks (test -n "$VAR" && echo set,
+"${VAR:+set}", ${#VAR}) and passing a secret to a program that uses it. Cutting
+env output down to names is blocked: the continuation lines of a multi-line value
+get through cut and awk.
 
 This is a check on ordinary shell commands, not a sandbox: a script in another
 language, or a command name built at run time, is not seen.
@@ -87,8 +91,9 @@ Command output goes into the session transcript, so a printed secret must be
 rotated. Do not retry with a sed or grep redaction.
 
   Is a variable set?   test -n "$VAR" && echo set
-  Which names exist?   compgen -e        (or: env | cut -d= -f1)
+  Which names exist?   bash -c 'compgen -e'
   Need the value?      pass "$VAR" straight to the program that uses it
+  Feeding a tool?      let it read the environment (e.g. GH_TOKEN), or a file: cmd --password-stdin < file
 
 `, reason)
 }
@@ -144,8 +149,8 @@ func (s *envScan) script(script string, depth int) string {
 		return ""
 	}
 	for _, p := range pipelines {
-		for i, c := range p {
-			if reason := s.command(c, p[i+1:], depth); reason != "" {
+		for _, c := range p {
+			if reason := s.command(c, depth); reason != "" {
 				return reason
 			}
 		}
@@ -153,7 +158,7 @@ func (s *envScan) script(script string, depth int) string {
 	return ""
 }
 
-func (s *envScan) command(c envCommand, rest envPipeline, depth int) string {
+func (s *envScan) command(c envCommand, depth int) string {
 	words := slices.Clone(c.words)
 	for _, r := range c.redirects {
 		words = append(words, r.target)
@@ -173,7 +178,7 @@ func (s *envScan) command(c envCommand, rest envPipeline, depth int) string {
 			return "reading a process environment file"
 		}
 	}
-	return s.run(c.words, c, rest, depth)
+	return s.run(c.words, c, depth)
 }
 
 // envWrappers are the programs that run another command, beyond those the
@@ -187,7 +192,7 @@ var envWrappers = map[string]map[string]bool{
 
 // run judges the simple command in words, which is c's words or what is left of
 // them after a wrapper.
-func (s *envScan) run(words []envWord, c envCommand, rest envPipeline, depth int) string {
+func (s *envScan) run(words []envWord, c envCommand, depth int) string {
 	for len(words) > 0 {
 		w := words[0].text
 		if shellKeywords[w] {
@@ -224,7 +229,7 @@ func (s *envScan) run(words []envWord, c envCommand, rest envPipeline, depth int
 		if name == "timeout" && len(args) > 0 { // the duration
 			args = args[1:]
 		}
-		return s.run(args, c, rest, depth)
+		return s.run(args, c, depth)
 	}
 
 	for _, a := range args {
@@ -235,9 +240,9 @@ func (s *envScan) run(words []envWord, c envCommand, rest envPipeline, depth int
 
 	switch name {
 	case "env":
-		return s.env(args, c, rest, depth)
+		return s.env(args, c, depth)
 	case "printenv":
-		return s.printenv(args, c, rest)
+		return s.printenv(args)
 	case "set":
 		if len(args) == 0 {
 			return "bare set lists every variable"
@@ -249,6 +254,7 @@ func (s *envScan) run(words []envWord, c envCommand, rest envPipeline, depth int
 			return "this ps form prints process environments"
 		}
 	case "echo", "printf", "print":
+		// Blocked even when piped on: the next program may display its input.
 		for _, a := range args {
 			if ref := s.secretRef(a); ref != "" {
 				return name + " prints the secret variable " + ref
@@ -305,15 +311,12 @@ func (s *envScan) stdinPrint(c envCommand) string {
 }
 
 // env judges env, which prints the environment unless it is given a command.
-func (s *envScan) env(args []envWord, c envCommand, rest envPipeline, depth int) string {
-	nulSeparated := false
+func (s *envScan) env(args []envWord, c envCommand, depth int) string {
 	for len(args) > 0 {
 		a := args[0].text
 		switch {
 		case a == "--help" || a == "--version":
 			return ""
-		case a == "-0" || a == "--null":
-			nulSeparated = true
 		case a == "-u" || a == "-C" || a == "-P":
 			if len(args) > 1 {
 				args = args[1:]
@@ -326,25 +329,19 @@ func (s *envScan) env(args []envWord, c envCommand, rest envPipeline, depth int)
 		case shellAssignment.MatchString(a):
 			s.assign(shellAssignment.FindStringSubmatch(a)[1], args[0])
 		default:
-			return s.run(args, c, rest, depth)
+			return s.run(args, c, depth)
 		}
 		args = args[1:]
-	}
-	if !nulSeparated && namesOnly(c, rest) {
-		return ""
 	}
 	return "env with no command prints the whole environment"
 }
 
-func (s *envScan) printenv(args []envWord, c envCommand, rest envPipeline) string {
+func (s *envScan) printenv(args []envWord) string {
 	var names []string
-	nulSeparated := false
 	for _, a := range args {
 		switch {
 		case a.text == "--help" || a.text == "--version":
 			return ""
-		case a.text == "-0" || a.text == "--null":
-			nulSeparated = true
 		case !strings.HasPrefix(a.text, "-"):
 			names = append(names, a.text)
 		}
@@ -354,7 +351,7 @@ func (s *envScan) printenv(args []envWord, c envCommand, rest envPipeline) strin
 			return "printenv prints the secret variable " + n
 		}
 	}
-	if len(names) > 0 || (!nulSeparated && namesOnly(c, rest)) {
+	if len(names) > 0 {
 		return ""
 	}
 	return "bare printenv prints the whole environment"
@@ -411,66 +408,4 @@ func psShowsEnvironment(args []envWord) bool {
 		}
 	}
 	return false
-}
-
-// namesOnly reports whether the output of the listing c is cut down to variable
-// names before anything prints it. Only filters that pass whole lines through
-// may come before the cut.
-func namesOnly(c envCommand, rest envPipeline) bool {
-	for _, r := range c.redirects {
-		if r.fd != "2" { // other redirects send values around the pipe
-			return false
-		}
-	}
-	for _, next := range rest {
-		if len(next.words) == 0 || len(next.redirects) > 0 || len(next.heredocs) > 0 {
-			return false
-		}
-		args := make([]string, len(next.words)-1)
-		for i, w := range next.words[1:] {
-			args[i] = w.text
-		}
-		switch path.Base(next.words[0].text) {
-		case "sort":
-			if slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "-o") || strings.HasPrefix(a, "--output") }) {
-				return false
-			}
-		case "grep":
-			if slices.ContainsFunc(args, func(a string) bool {
-				return a == "--only-matching" || strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "o")
-			}) {
-				return false
-			}
-		case "cut":
-			return cutKeepsNames(args)
-		case "awk":
-			return len(args) == 2 && args[0] == "-F=" && strings.ReplaceAll(args[1], " ", "") == "{print$1}"
-		default:
-			return false
-		}
-	}
-	return false
-}
-
-// cutKeepsNames reports whether cut keeps exactly the text before the first =.
-func cutKeepsNames(args []string) bool {
-	delimiter, field := false, false
-	for i := 0; i < len(args); i++ {
-		switch a := args[i]; {
-		case a == "-s":
-		case a == "-d=" || a == "--delimiter==":
-			delimiter = true
-		case a == "-d" && i+1 < len(args) && args[i+1] == "=":
-			delimiter = true
-			i++
-		case a == "-f1" || a == "--fields=1":
-			field = true
-		case a == "-f" && i+1 < len(args) && args[i+1] == "1":
-			field = true
-			i++
-		default:
-			return false
-		}
-	}
-	return delimiter && field
 }

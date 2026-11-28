@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 )
 
@@ -18,7 +19,6 @@ type envWord struct {
 }
 
 type envRedirect struct {
-	fd     string // descriptor written before the operator, if any
 	op     string // ">", ">>", ">&", "<", "<<<"
 	target envWord
 }
@@ -37,6 +37,10 @@ type envCommand struct {
 
 // envPipeline is the commands joined by | or |&.
 type envPipeline []envCommand
+
+// redirectDescriptor matches a descriptor number, or the {name} form that has
+// the shell pick one.
+var redirectDescriptor = regexp.MustCompile(`^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$`)
 
 var errUnterminated = errors.New("unterminated quote or substitution")
 
@@ -212,9 +216,8 @@ func (l *envLexer) redirection() error {
 	if l.at(l.pos+1) == '(' { // process substitution
 		return l.substitution(l.pos + 2)
 	}
-	fd := ""
-	if l.inWord && !l.quoted && strings.Trim(l.text.String(), "0123456789") == "" {
-		fd = l.text.String()
+	// A descriptor written before the operator is not an argument.
+	if l.inWord && !l.quoted && redirectDescriptor.MatchString(l.text.String()) {
 		l.text.Reset()
 		l.word = envWord{}
 		l.inWord = false
@@ -250,7 +253,7 @@ func (l *envLexer) redirection() error {
 			l.pos++
 		}
 	}
-	l.redirect = &envRedirect{fd: fd, op: op}
+	l.redirect = &envRedirect{op: op}
 	return nil
 }
 
