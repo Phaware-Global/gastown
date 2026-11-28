@@ -1,7 +1,12 @@
 package config
 
 import (
+	"cmp"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,9 +22,52 @@ import (
 //
 // They do not cover CLAUDE.md or anything else the agent reads as text.
 
-// CheckoutMCPConfig is the MCP configuration of a session in a PR checkout:
-// the code graph server the review passes use, and nothing else.
-const CheckoutMCPConfig = `{"mcpServers":{"codegraph":{"type":"stdio","command":"codegraph","args":["serve","--mcp"]}}}`
+// CodegraphMCPArg is the gt subcommand that serves the code graph to a session
+// in a PR checkout.
+const CodegraphMCPArg = "codegraph-mcp"
+
+var gtExecutable = os.Executable
+
+// checkoutMCPConfig is the reviewer's own MCP configuration: the code graph
+// server the review passes use. It is started through this gt binary, which
+// runs codegraph from an absolute path; a bare name would be looked up from the
+// checkout, where a version-manager shim reads the PR author's configuration.
+func checkoutMCPConfig() string {
+	gt, err := gtExecutable()
+	if err != nil {
+		gt = "" // refused by verifyCheckoutIsolation
+	}
+	data, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"codegraph": map[string]any{
+		"type": "stdio", "command": gt, "args": []string{"reviewer", CodegraphMCPArg},
+	}}})
+	return string(data)
+}
+
+// pinCheckoutTools keeps the checkout from choosing which programs a session in
+// it runs, or their versions: the agent binary becomes an absolute path, and
+// the reviewer's mise is told to ignore configuration files in its checkout.
+// A binary that cannot be resolved is left for verifyCheckoutIsolation.
+func pinCheckoutTools(rc *RuntimeConfig, role, rigPath string) {
+	command := cmp.Or(rc.Command, "claude")
+	if !strings.ContainsRune(command, '/') && !filepath.IsAbs(command) {
+		if path, err := exec.LookPath(command); err == nil && filepath.IsAbs(path) {
+			rc.Command = path
+		}
+	}
+	if role != constants.RoleReviewer {
+		return
+	}
+	const ignored = "MISE_IGNORED_CONFIG_PATHS"
+	checkout := filepath.Join(rigPath, role, "rig")
+	paths := filepath.SplitList(cmp.Or(rc.Env[ignored], os.Getenv(ignored)))
+	if !slices.Contains(paths, checkout) {
+		paths = append(paths, checkout)
+	}
+	env := map[string]string{} // rc.Env may be shared with an agent preset
+	maps.Copy(env, rc.Env)
+	env[ignored] = strings.Join(paths, string(os.PathListSeparator))
+	rc.Env = env
+}
 
 // runsInPRCheckout reports whether sessions of role start inside a PR checkout.
 func runsInPRCheckout(role string) bool {
@@ -37,12 +85,17 @@ func addCheckoutIsolationFlags(args []string, settingsFile string) []string {
 	if len(flagValues(args, "--setting-sources")) == 0 {
 		args = append(args, "--setting-sources", "user")
 	}
-	if !slices.Contains(args, "--strict-mcp-config") {
-		// --mcp-config takes several values, so a flag must follow it or it
-		// would swallow the positional prompt.
-		args = append(args, "--mcp-config", CheckoutMCPConfig, "--strict-mcp-config")
+	own := checkoutMCPConfig()
+	if slices.Contains(flagValues(args, "--mcp-config"), own) {
+		return args
 	}
-	return args
+	// An operator's --mcp-config adds servers; ours is always there too.
+	// --mcp-config takes several values, so a flag must follow it or it would
+	// swallow the positional prompt.
+	if i := slices.Index(args, "--strict-mcp-config"); i >= 0 {
+		return slices.Insert(args, i, "--mcp-config", own)
+	}
+	return append(args, "--mcp-config", own, "--strict-mcp-config")
 }
 
 // verifyCheckoutIsolation returns an error unless a session started from rc
@@ -62,6 +115,9 @@ func verifyCheckoutIsolation(rc *RuntimeConfig, env map[string]string, settingsF
 			return refuse("command %q is a relative path", program)
 		}
 	}
+	if !filepath.IsAbs(rc.Command) {
+		return refuse("command %q has no absolute path", rc.Command)
+	}
 	if dir := env["CLAUDE_CONFIG_DIR"]; dir != "" && !filepath.IsAbs(dir) {
 		return refuse("CLAUDE_CONFIG_DIR %q is a relative path", dir)
 	}
@@ -74,6 +130,9 @@ func verifyCheckoutIsolation(rc *RuntimeConfig, env map[string]string, settingsF
 				return refuse("setting source %q is allowed by the agent arguments; only \"user\" is", source)
 			}
 		}
+	}
+	if !filepath.IsAbs(settingsFile) {
+		return refuse("the settings file %q is a relative path", settingsFile)
 	}
 	if got := flagValues(rc.Args, "--settings"); !slices.Equal(got, []string{settingsFile}) {
 		return refuse("--settings must be %s only, got %q", settingsFile, got)

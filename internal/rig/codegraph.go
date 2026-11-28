@@ -87,6 +87,34 @@ func EnsureCodegraphIndexSync(worktreePath, townRoot, rigPath string) error {
 	return nil
 }
 
+// CodegraphMCPCommand returns the command that serves the code graph over MCP,
+// resolved to absolute paths so that no version-manager shim runs. Its
+// environment holds no secrets.
+func CodegraphMCPCommand(ctx context.Context) (*exec.Cmd, error) {
+	exe := resolveCodegraphExe()
+	if !filepath.IsAbs(exe) {
+		return nil, ErrCodegraphUnavailable
+	}
+	argv, pathDir := codegraphArgv(exe)
+	argv = append(argv, "serve", "--mcp")
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: resolved codegraph install
+	cmd.Env = codegraphEnv(pathDir)
+	return cmd, nil
+}
+
+// codegraphArgv returns how to run the codegraph at exe, and the bin directory
+// a child `#!/usr/bin/env node` should resolve to.
+func codegraphArgv(exe string) (argv []string, pathDir string) {
+	// A `#!/usr/bin/env node` codegraph shim (mise or npm-global) must be run with
+	// an explicit Node, or the worktree's pinned Node hijacks the env-node shebang
+	// — the exact failure this resolver routes around. A standalone compiled binary
+	// (no node shebang) is run directly.
+	if node := nodeForCodegraph(exe); node != "" {
+		return []string{node, exe}, filepath.Dir(node)
+	}
+	return []string{exe}, filepath.Dir(exe)
+}
+
 // codegraphSubcommand picks `init` for a fresh worktree or `index` (a full
 // reindex) when .codegraph already exists. A reviewer worktree is reused across
 // PR checkouts, so a prior index must be rebuilt to match the newly checked-out
@@ -128,22 +156,9 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 		return nil, false
 	}
 
-	var cmd *exec.Cmd
-	// The PATH prepend must point at the bin dir of the Node actually used to run
-	// codegraph, so a child `#!/usr/bin/env node` resolves to that same Node and
-	// not the worktree's pinned one. Default to codegraph's own bin (standalone
-	// binary / direct run); override to the chosen Node's bin below.
-	pathDir := filepath.Dir(exe)
-	// A `#!/usr/bin/env node` codegraph shim (mise or npm-global) must be run with
-	// an explicit Node, or the worktree's pinned Node hijacks the env-node shebang
-	// — the exact failure this resolver routes around. A standalone compiled binary
-	// (no node shebang) is run directly.
-	if node := nodeForCodegraph(exe); node != "" {
-		cmd = exec.CommandContext(ctx, node, exe, subcmd, worktreePath)
-		pathDir = filepath.Dir(node)
-	} else {
-		cmd = exec.CommandContext(ctx, exe, subcmd, worktreePath)
-	}
+	argv, pathDir := codegraphArgv(exe)
+	argv = append(argv, subcmd, worktreePath)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: resolved codegraph install
 	cmd.Dir = worktreePath
 	cmd.Env = codegraphEnv(pathDir)
 	return cmd, true

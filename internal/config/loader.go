@@ -1643,6 +1643,7 @@ func withRoleSettingsFlag(rc *RuntimeConfig, role, rigPath string) *RuntimeConfi
 
 	if runsInPRCheckout(role) {
 		rc.Args = addCheckoutIsolationFlags(rc.Args, settingsFile)
+		pinCheckoutTools(rc, role, rigPath)
 		return rc
 	}
 

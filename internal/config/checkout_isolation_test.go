@@ -49,11 +49,12 @@ func TestReviewerLaunchArgs(t *testing.T) {
 	tests := []struct {
 		name    string
 		agent   *RuntimeConfig
-		wantMCP string
+		wantMCP []string // besides the reviewer's own
 	}{
-		{"default agent", nil, CheckoutMCPConfig},
-		{"custom claude agent", claude("--dangerously-skip-permissions", "--model", "opus"), CheckoutMCPConfig},
-		{"agent with its own strict MCP config", claude("--strict-mcp-config", "--mcp-config", "/etc/mcp.json"), "/etc/mcp.json"},
+		{"default agent", nil, nil},
+		{"custom claude agent", claude("--dangerously-skip-permissions", "--model", "opus"), nil},
+		{"agent with its own strict MCP config", claude("--strict-mcp-config", "--mcp-config", "/etc/mcp.json"), []string{"/etc/mcp.json"}},
+		{"agent with a non-strict MCP config", claude("--mcp-config", "/etc/mcp.json"), []string{"/etc/mcp.json"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -67,8 +68,12 @@ func TestReviewerLaunchArgs(t *testing.T) {
 			if got := flagValue(rc.Args, "--setting-sources"); got != "user" {
 				t.Errorf("--setting-sources = %q, want user", got)
 			}
-			if got := flagValue(rc.Args, "--mcp-config"); got != tt.wantMCP {
-				t.Errorf("--mcp-config = %q, want %q", got, tt.wantMCP)
+			want := append(slices.Clone(tt.wantMCP), checkoutMCPConfig())
+			got := flagValues(rc.Args, "--mcp-config")
+			slices.Sort(got)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Errorf("--mcp-config = %q, want %q", got, want)
 			}
 			if !slices.Contains(rc.Args, "--strict-mcp-config") {
 				t.Errorf("missing --strict-mcp-config: %q", rc.Args)
@@ -118,6 +123,7 @@ func TestReviewerStartRefused(t *testing.T) {
 		{"end of flags", claude("--"), `"--"`},
 		{"relative binary", &RuntimeConfig{Provider: "claude", Command: "./claude"}, "command"},
 		{"relative config dir", &RuntimeConfig{Provider: "claude", Command: "claude", Env: map[string]string{"CLAUDE_CONFIG_DIR": ".claude"}}, "CLAUDE_CONFIG_DIR"},
+		{"agent not on PATH", &RuntimeConfig{Provider: "claude", Command: "no-such-claude"}, "absolute path"},
 		{"not claude", &RuntimeConfig{Provider: "codex", Command: "codex"}, "not Claude Code"},
 	}
 	for _, tt := range tests {
@@ -132,6 +138,75 @@ func TestReviewerStartRefused(t *testing.T) {
 	}
 }
 
+// The reviewer settings file is the one --settings value accepted, so a
+// relative one would be read from the checkout.
+func TestVerifyCheckoutIsolationSettingsPath(t *testing.T) {
+	for _, tt := range []struct {
+		settings string
+		refused  bool
+	}{
+		{filepath.Join(t.TempDir(), "settings.json"), false},
+		{"myrig/reviewer/.claude/settings.json", true},
+		{".claude/settings.json", true},
+		{"", true},
+	} {
+		rc := &RuntimeConfig{Provider: "claude", Command: filepath.Join(t.TempDir(), "claude")}
+		rc.Args = addCheckoutIsolationFlags(nil, tt.settings)
+		err := verifyCheckoutIsolation(rc, nil, tt.settings)
+		if refused := err != nil; refused != tt.refused {
+			t.Errorf("settings %q: err = %v, want refused = %v", tt.settings, err, tt.refused)
+		}
+	}
+}
+
+// A bare tool name is looked up from the checkout, where a version-manager shim
+// reads the PR author's configuration.
+func TestReviewerToolsPinned(t *testing.T) {
+	var cfg struct {
+		MCPServers map[string]struct {
+			Command string
+			Args    []string
+		}
+	}
+	if err := json.Unmarshal([]byte(checkoutMCPConfig()), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cg, ok := cfg.MCPServers["codegraph"]
+	if !ok || len(cfg.MCPServers) != 1 || !filepath.IsAbs(cg.Command) {
+		t.Errorf("MCP config = %s, want codegraph alone with an absolute command", checkoutMCPConfig())
+	}
+
+	townRoot, rigPath := reviewerTestRig(t, nil)
+	checkout := filepath.Join(rigPath, "reviewer", "rig")
+	// Respawns take their command and env from the resolved config alone.
+	t.Setenv("MISE_IGNORED_CONFIG_PATHS", checkout)
+	rc := ResolveRoleAgentConfig("reviewer", townRoot, rigPath)
+	if !filepath.IsAbs(rc.Command) || rc.Env["MISE_IGNORED_CONFIG_PATHS"] != checkout {
+		t.Errorf("resolved command %q, mise ignore %q", rc.Command, rc.Env["MISE_IGNORED_CONFIG_PATHS"])
+	}
+	for _, tt := range []struct{ inherited, want string }{
+		{"", checkout},
+		{"/etc/mise", "/etc/mise" + string(os.PathListSeparator) + checkout},
+	} {
+		t.Setenv("MISE_IGNORED_CONFIG_PATHS", tt.inherited)
+		cmd, err := BuildStartupCommandWithAgentOverride(
+			map[string]string{"GT_ROLE": "myrig/reviewer"}, rigPath, "p", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(cmd, "MISE_IGNORED_CONFIG_PATHS="+ShellQuote(tt.want)+" ") {
+			t.Errorf("inherited %q: want MISE_IGNORED_CONFIG_PATHS=%s in %s", tt.inherited, tt.want, cmd)
+		}
+		claudeBin, err := exec.LookPath("claude")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(cmd, " "+claudeBin+" ") {
+			t.Errorf("agent binary not pinned to %s: %s", claudeBin, cmd)
+		}
+	}
+}
+
 // Runs the real Claude Code binary in a checkout that ships hooks and an MCP
 // server, with the launch arguments the reviewer gets. The API address is
 // unreachable: settings and MCP servers load before the first request.
@@ -143,9 +218,18 @@ func TestReviewerSessionIgnoresCheckoutConfig(t *testing.T) {
 		t.Skip("claude not installed")
 	}
 
-	townRoot, rigPath := reviewerTestRig(t, nil)
-	rc := ResolveRoleAgentConfig("reviewer", townRoot, rigPath)
 	marks, home, bin := t.TempDir(), t.TempDir(), t.TempDir()
+	// Stands in for the gt binary that serves the code graph.
+	stub := filepath.Join(bin, "gt")
+	defer func(orig func() (string, error)) { gtExecutable = orig }(gtExecutable)
+	gtExecutable = func() (string, error) { return stub, nil }
+
+	operatorMCP := filepath.Join(t.TempDir(), "mcp.json")
+	townRoot, rigPath := reviewerTestRig(t, &RuntimeConfig{
+		Provider: "claude", Command: "claude",
+		Args: []string{"--strict-mcp-config", "--mcp-config", operatorMCP},
+	})
+	rc := ResolveRoleAgentConfig("reviewer", townRoot, rigPath)
 	checkout := filepath.Join(rigPath, "reviewer", "rig")
 
 	write := func(path, content string, mode os.FileMode) {
@@ -167,7 +251,8 @@ func TestReviewerSessionIgnoresCheckoutConfig(t *testing.T) {
 	write(filepath.Join(checkout, ".mcp.json"), `{"mcpServers":{"from-checkout":{"command":"touch","args":["`+
 		filepath.Join(marks, "mcp")+`"]}}}`, 0o600)
 	// Stands in for the real codegraph server named in the launch arguments.
-	write(filepath.Join(bin, "codegraph"), "#!/bin/sh\nexit 0\n", 0o755)
+	write(stub, "#!/bin/sh\nexit 0\n", 0o755)
+	write(operatorMCP, `{"mcpServers":{"from-operator":{"command":"`+stub+`"}}}`, 0o600)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -205,8 +290,9 @@ func TestReviewerSessionIgnoresCheckoutConfig(t *testing.T) {
 	if !initialized {
 		t.Fatalf("no init event (run error: %v): %s", runErr, out)
 	}
-	if !slices.Equal(servers, []string{"codegraph"}) {
-		t.Errorf("MCP servers = %q, want only codegraph", servers)
+	slices.Sort(servers)
+	if !slices.Equal(servers, []string{"codegraph", "from-operator"}) {
+		t.Errorf("MCP servers = %q, want codegraph and the operator's", servers)
 	}
 	for name, want := range map[string]bool{"role": true, "project": false, "local": false, "mcp": false} {
 		_, err := os.Stat(filepath.Join(marks, name))

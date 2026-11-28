@@ -78,6 +78,8 @@ var beadsExemptCommands = map[string]bool{
 	"upgrade":       true, // Post-install migration orchestrator
 	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
 	"worker-attach": true, // Pane launcher for a remote polecat; needs only the worker
+
+	config.CodegraphMCPArg: true, // MCP server startup; spawn nothing first
 }
 
 // Commands exempt from the town root branch warning.
@@ -95,6 +97,8 @@ var branchCheckExemptCommands = map[string]bool{
 	"upgrade":       true, // Post-install migration
 	"scheduler":     true, // Daemon hot path; scheduler handles beads internally
 	"worker-attach": true, // Pane launcher for a remote polecat; the town root is not its concern
+
+	config.CodegraphMCPArg: true, // MCP server startup; spawn nothing first
 }
 
 // persistentPreRun runs before every command.

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -433,5 +434,29 @@ func TestCodegraphCommand_PATHPrependsRunningNodeDir(t *testing.T) {
 	}
 	if !strings.HasPrefix(gotPath, miseNodeBin+string(os.PathListSeparator)) {
 		t.Errorf("PATH = %q, want it to start with the running Node's bin %q", gotPath, miseNodeBin)
+	}
+}
+
+func TestCodegraphMCPCommand(t *testing.T) {
+	isolatePATH(t)
+	mise := t.TempDir()
+	t.Setenv("MISE_DATA_DIR", mise)
+	t.Setenv("GITHUB_TOKEN", "not-a-token")
+	if _, err := CodegraphMCPCommand(context.Background()); !errors.Is(err, ErrCodegraphUnavailable) {
+		t.Fatalf("with no codegraph: err = %v, want ErrCodegraphUnavailable", err)
+	}
+
+	exe := writeFakeMiseCodegraph(t, mise, "24.1.0", "#!/bin/sh\nexit 0\n")
+	cmd, err := CodegraphMCPCommand(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Path != exe || !slices.Equal(cmd.Args[1:], []string{"serve", "--mcp"}) {
+		t.Errorf("command = %q %q, want %s serve --mcp", cmd.Path, cmd.Args[1:], exe)
+	}
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "GITHUB_TOKEN=") {
+			t.Error("the server's environment holds GITHUB_TOKEN")
+		}
 	}
 }
