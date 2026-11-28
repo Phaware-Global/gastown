@@ -55,6 +55,7 @@ var (
 	reviewerDonePR int
 
 	reviewerPassDir          string
+	reviewerConsolidatePR    int
 	reviewerConsolidateEdits string
 )
 
@@ -118,6 +119,10 @@ rejected, since an approving disposition can only be a no-op or a
 de-escalation. This is why a "comment" from one perspective can never suppress
 another perspective's high finding.
 
+The payload must be the one 'gt reviewer consolidate' wrote: post re-verifies
+the pass receipts, requires every finding to trace to a raw finding, rebuilds the
+payload from the raw results and the recorded edits, and refuses any difference.
+
 The findings file (--findings, or "-" for stdin) is a JSON object. "summary"
 follows a fixed template — one verdict line per perspective plus any
 out-of-scope opportunities — which is rendered into GitHub markdown here, with
@@ -134,7 +139,7 @@ text, in characters:
       "verdicts": [{"perspective": "adversarial", "verdict": "one line"}],
       "opportunities": ["<optional; out-of-scope follow-up candidates>"]
     },
-    "reviewed_sha": "<optional; --sha overrides>",
+    "reviewed_sha": "<required; --sha must match>",
     "disposition": "<optional; request_changes|comment — escalation only>",
     "findings": [
       {"path": "internal/foo.go", "line": 42, "priority": "high",
@@ -206,13 +211,14 @@ The prompt is written to stdout.`,
 }
 
 var reviewerConsolidateCmd = &cobra.Command{
-	Use:   "consolidate [result.json ...]",
+	Use:   "consolidate",
+	Args:  cobra.NoArgs,
 	Short: "Merge per-perspective results into one findings payload for post",
-	Long: `Consolidate per-perspective subagent results into a single findings payload.
+	Long: `Consolidate per-perspective pass results into a single findings payload.
 
-Each input is a PerspectiveResult JSON object (perspective + verdict + findings),
-one per enabled perspective. Pass them as file arguments, or pipe a JSON array of
-them on stdin. Never edit a result: state your changes
+The inputs are the raw results 'gt reviewer run' wrote, one per enabled
+perspective. Consolidation fails unless every one has a receipt matching the
+result, the prompt, the PR and the commit. Never edit them: state your changes
 in --edits, addressing findings by raw id "perspective:N" (1-based):
 
   {"drop":    [{"id": "security:1", "reason": "one line, required"}],
@@ -223,9 +229,8 @@ in --edits, addressing findings by raw id "perspective:N" (1-based):
    "verdict": {"security": "shorter verdict"},
    "drop_opportunity": ["security:1"]}
 
-Every consolidated finding names its raw ids. The review body lists each dropped
+Every posted finding traces to a raw id. The review body lists each dropped
 finding with its reason, and labels reworded and added text as the reviewer's.
-
 The output is the findings JSON that 'gt reviewer post' consumes:
 
   - the summary lists every perspective's verdict (perspectives with no findings
@@ -259,7 +264,8 @@ func init() {
 	reviewerPostCmd.Flags().StringVar(&reviewerPostFindings, "findings", "",
 		`findings JSON file, or "-" for stdin (required)`)
 	reviewerPostCmd.Flags().StringVar(&reviewerPostSHA, "sha", "",
-		"head SHA to anchor the review to (default: PR's current head)")
+		"reviewed head SHA (must match the findings payload; default: its reviewed_sha)")
+	reviewerPostCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
 	_ = reviewerPostCmd.MarkFlagRequired("pr")
 	_ = reviewerPostCmd.MarkFlagRequired("findings")
 
@@ -303,9 +309,13 @@ func init() {
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
-		"reviewed head SHA to record in the consolidated payload")
+		"reviewed head SHA; the pass receipts must be for it (required)")
+	reviewerConsolidateCmd.Flags().IntVar(&reviewerConsolidatePR, "pr", 0, "PR number under review (required)")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateEdits, "edits", "",
 		`JSON file of your changes to the raw findings (or "-" for stdin)`)
+	_ = reviewerConsolidateCmd.MarkFlagRequired("pr")
+	_ = reviewerConsolidateCmd.MarkFlagRequired("sha")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
 		"merge-base the PR is diffed against; enables scope classification "+
 			"(findings outside the diff post as non-blocking)")
@@ -322,7 +332,7 @@ func init() {
 	reviewerRunCmd.Flags().StringVar(&reviewerPromptPriorThreads, "prior-threads", "",
 		"file of prior-round thread context; only used when round >= 2")
 	reviewerRunCmd.Flags().StringVar(&reviewerPromptInstructions, "instructions", "",
-		"file of extra execution instructions (recorded in the receipt)")
+		"file of extra execution instructions (disclosed in the review body)")
 	reviewerRunCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0, "per-pass finding cap")
 	reviewerRunCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0, "soft wall-clock budget per pass")
 	reviewerRunCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
@@ -428,7 +438,11 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	findings, err := reviewer.ParseFindings(data)
+	supplied, err := reviewer.ParseFindings(data)
+	if err != nil {
+		return err
+	}
+	findings, err := gateReviewPost(reviewerPostPR, reviewerPostSHA, supplied)
 	if err != nil {
 		return err
 	}
@@ -438,30 +452,8 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Anchor the review to the SHA actually reviewed so it is SHA-scoped for
-	// the refinery's engagement gate. Resolution order: --sha flag, then the
-	// findings payload's reviewed_sha (the SHA the Reviewer checked out and
-	// reviewed), then the PR's current head as a best-effort fallback. Honoring
-	// reviewed_sha preserves the "review exactly the requested SHA" contract
-	// even if the PR head moved between checkout and post.
-	sha := reviewerPostSHA
-	if sha == "" {
-		sha = findings.ReviewedSHA
-	}
-	if sha == "" {
-		if head, herr := provider.CurrentHeadSHA(reviewerPostPR); herr == nil {
-			sha = head
-		}
-	}
-	// A review with inline findings MUST be anchored to a commit: GitHub rejects
-	// the review API call without commit_id when comments are present, and the
-	// refinery's SHA-scoped engagement gate needs it to observe the review.
-	// Fail loudly rather than post a review the refinery will never see.
-	if sha == "" && len(findings.Findings) > 0 {
-		return fmt.Errorf("could not resolve a commit SHA to anchor PR #%d's review "+
-			"(pass --sha, or set reviewed_sha in the findings payload): a review with "+
-			"inline findings requires a commit_id", reviewerPostPR)
-	}
+	// Anchor to the SHA the passes reviewed, even if the PR head has moved.
+	sha := findings.ReviewedSHA
 
 	in := findings.BuildReviewInput(sha)
 	if err := postReviewAndClearStaleBlock(provider, cfg, reviewerPostPR, in); err != nil {
@@ -833,79 +825,23 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// on the heartbeat, so the record stays complete across the phase change.
 	touchReviewerPhase(reviewer.PhaseConsolidate)
 
-	if reviewerConsolidateEdits == "-" && len(args) == 0 {
-		return fmt.Errorf("--edits - needs result file arguments: stdin cannot carry both")
+	if reviewerConsolidatePR <= 0 {
+		return fmt.Errorf("--pr must be a positive PR number")
 	}
 	edits := &reviewer.Edits{}
-	rawEdits, err := readOptionalInput(reviewerConsolidateEdits)
+	raw, err := readOptionalInput(reviewerConsolidateEdits)
 	if err != nil {
 		return fmt.Errorf("reading --edits: %w", err)
 	}
-	if rawEdits != "" {
-		if edits, err = reviewer.ParseEdits([]byte(rawEdits)); err != nil {
+	if raw != "" {
+		if edits, err = reviewer.ParseEdits([]byte(raw)); err != nil {
 			return err
 		}
 	}
 	if base := strings.TrimSpace(reviewerConsolidateBaseSHA); base != "" {
 		edits.BaseSHA = base
 	}
-
-	var results []reviewer.PerspectiveResult
-
-	if len(args) == 0 {
-		// No file args: read a JSON array of PerspectiveResult objects from
-		// stdin. Re-marshal each element and run it through ParsePerspectiveResult
-		// so stdin and file inputs get identical validation/normalization.
-		// Guard against a hang when stdin is an interactive terminal (no pipe).
-		if stat, statErr := os.Stdin.Stat(); statErr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
-			return fmt.Errorf("no result files given and stdin is a terminal; " +
-				"pass result.json file arguments or pipe a JSON array of results")
-		}
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf("reading results from stdin: %w", err)
-		}
-		var raw []json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("parsing results array from stdin: %w", err)
-		}
-		if len(raw) == 0 {
-			return fmt.Errorf("no perspective results on stdin")
-		}
-		for i, elem := range raw {
-			r, perr := reviewer.ParsePerspectiveResult(elem)
-			if perr != nil {
-				return fmt.Errorf("stdin result[%d]: %w", i, perr)
-			}
-			results = append(results, *r)
-		}
-	} else {
-		for _, path := range args {
-			data, err := os.ReadFile(path) //nolint:gosec // operator-supplied result file
-			if err != nil {
-				return fmt.Errorf("reading result file %s: %w", path, err)
-			}
-			r, perr := reviewer.ParsePerspectiveResult(data)
-			if perr != nil {
-				return fmt.Errorf("%s: %w", path, perr)
-			}
-			results = append(results, *r)
-		}
-	}
-
-	// Build the diff manifest so findings can be classified against what this
-	// PR actually changed. Best-effort by design: --base-sha is optional, and a
-	// git failure yields a nil manifest, which classifies everything as
-	// ScopeUnknown and changes nothing. Scope filtering must never be able to
-	// silently downgrade a review just because git was unavailable — a missing
-	// manifest is missing evidence, not evidence of good scope.
-	base := edits.BaseSHA
-	if base == "" {
-		base = resolveConsolidateBaseSHA()
-	}
-	manifest := buildDiffManifest(base, reviewerConsolidateSHA)
-
-	fs, err := reviewer.ConsolidateWithEdits(results, edits, reviewerConsolidateSHA, manifest)
+	fs, err := consolidateVerifiedPasses(reviewerConsolidatePR, reviewerConsolidateSHA, edits)
 	if err != nil {
 		return err
 	}
@@ -1314,35 +1250,4 @@ func isHexObjectName(s string) bool {
 		}
 	}
 	return true
-}
-
-// resolveConsolidateBaseSHA returns the merge-base to classify findings
-// against: the explicit --base-sha when given, otherwise derived the same way
-// `gt reviewer prompt` derives it.
-//
-// The derivation is not a convenience. The sanctioned consolidate invocation —
-// the one the role template, `gt prime` and the runbook all print, and which the
-// template tells the Reviewer to run literally ("do not improvise the
-// procedure; run the commands") — passes only --sha. Requiring --base-sha would
-// have left scope classification switched off on the exact path every review
-// actually takes: buildDiffManifest returns nil without it, so every finding
-// classifies ScopeUnknown and nothing is demoted. A feature that only engages
-// when someone remembers an undocumented flag is a feature that never engages.
-//
-// The PR number comes from the heartbeat rather than a new --pr flag, because
-// consolidate deliberately takes no --pr (it inherits the heartbeat's identity
-// fields so the record stays complete across the phase change).
-func resolveConsolidateBaseSHA() string {
-	if b := strings.TrimSpace(reviewerConsolidateBaseSHA); b != "" {
-		return b
-	}
-	rigPath := reviewerRigPathForHeartbeat()
-	if rigPath == "" {
-		return ""
-	}
-	hb := reviewer.ReadHeartbeat(rigPath)
-	if hb == nil || hb.PR <= 0 {
-		return ""
-	}
-	return resolveReviewBaseSHA(hb.PR, reviewerConsolidateSHA)
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -27,8 +28,8 @@ var reviewerRunCmd = &cobra.Command{
 Each pass executes the same prompt 'gt reviewer prompt' prints. The command
 writes the pass's raw perspective-<name>.json plus receipt-<name>.json, which
 records the pass id, prompt and result hashes, and start and end times, under
-<rig>/reviewer/passes/pr<N>/, outside the worktree. 'consolidate' does not
-check the receipts.
+<rig>/reviewer/passes/pr<N>/. 'consolidate' and 'post'
+accept only results with a matching receipt.
 
 With no arguments every enabled perspective runs; name one to re-run it. A pass
 can take longer than a foreground shell timeout, so run this in the background
@@ -67,6 +68,81 @@ func reviewerPassDirFor(pr int) (string, error) {
 		return "", fmt.Errorf("cannot locate the rig; pass --dir")
 	}
 	return filepath.Join(rigPath, "reviewer", "passes", fmt.Sprintf("pr%d", pr)), nil
+}
+
+// verifiedPasses loads the receipted results for a PR at a commit.
+func verifiedPasses(pr int, sha string) ([]reviewer.VerifiedPass, error) {
+	names, err := reviewerEnabledPerspectives()
+	if err != nil {
+		return nil, err
+	}
+	dir, err := reviewerPassDirFor(pr)
+	if err != nil {
+		return nil, err
+	}
+	return reviewer.VerifyPasses(dir, names, pr, sha)
+}
+
+// consolidateVerifiedPasses builds the review payload from receipted results.
+func consolidateVerifiedPasses(pr int, sha string, edits *reviewer.Edits) (*reviewer.Findings, error) {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return nil, fmt.Errorf("--sha is required: the pass receipts are checked against it")
+	}
+	passes, err := verifiedPasses(pr, sha)
+	if err != nil {
+		return nil, err
+	}
+	// The receipts hold the full object name, which the review anchor needs.
+	full := passes[0].Receipt.SHA
+
+	// A nil manifest leaves every finding unclassified, so an unavailable diff
+	// never downgrades a review.
+	base := edits.BaseSHA
+	if base == "" {
+		base = resolveReviewBaseSHA(pr, full)
+	}
+	return reviewer.ConsolidatePasses(passes, edits, full, buildDiffManifest(base, full))
+}
+
+// gateReviewPost re-derives the payload from the receipted results and refuses
+// a supplied payload that differs from it.
+func gateReviewPost(pr int, shaFlag string, supplied *reviewer.Findings) (*reviewer.Findings, error) {
+	sha := supplied.ReviewedSHA
+	if sha == "" {
+		return nil, fmt.Errorf("refusing to post: the payload has no reviewed_sha; build it with `gt reviewer consolidate`")
+	}
+	if shaFlag != "" && !reviewer.SameCommit(shaFlag, sha) {
+		return nil, fmt.Errorf("refusing to post: --sha %s differs from the payload's reviewed_sha %s", shaFlag, sha)
+	}
+	passes, err := verifiedPasses(pr, sha)
+	if err != nil {
+		return nil, fmt.Errorf("refusing to post: %w", err)
+	}
+	if err := reviewer.UntracedFinding(passes, supplied.Findings); err != nil {
+		return nil, fmt.Errorf("refusing to post: %w", err)
+	}
+	edits := supplied.Edits
+	if edits == nil {
+		edits = &reviewer.Edits{}
+	}
+	derived, err := consolidateVerifiedPasses(pr, sha, edits)
+	if err != nil {
+		return nil, fmt.Errorf("refusing to post: %w", err)
+	}
+	encoded, err := json.Marshal(derived)
+	if err != nil {
+		return nil, err
+	}
+	expected, err := reviewer.ParseFindings(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("refusing to post: %w", err)
+	}
+	if !reflect.DeepEqual(expected, supplied) {
+		return nil, fmt.Errorf("refusing to post: the payload is not what `gt reviewer consolidate` builds " +
+			"from the verified pass results; re-run consolidate (use --edits, not a file editor)")
+	}
+	return expected, nil
 }
 
 func runReviewerRun(cmd *cobra.Command, args []string) error {
