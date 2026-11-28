@@ -574,3 +574,44 @@ func TestGetStartCommand_ClaudeAgentFallsThrough(t *testing.T) {
 		t.Errorf("getStartCommand returned literal TOML start_command verbatim — beacon injection was skipped: %q", startCmd)
 	}
 }
+
+// The refinery runs in a PR checkout: a role start_command must not replace the
+// isolated launch command, and an agent that cannot be isolated is refused.
+func TestGetStartCommand_RefineryIsIsolated(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	town := config.NewTownSettings()
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), town); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{config: &Config{TownRoot: townRoot}, logger: log.New(io.Discard, "", 0)}
+	parsed := &ParsedIdentity{RoleType: "refinery", RigName: "myrig"}
+	roleConfig := &beads.RoleConfig{StartCommand: "exec claude --custom"}
+
+	cmd := d.getStartCommand(roleConfig, parsed)
+	for _, want := range []string{"--setting-sources user", "--strict-mcp-config"} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("start command lacks %q: %s", want, cmd)
+		}
+	}
+	if strings.Contains(cmd, "--custom") {
+		t.Errorf("start command uses the role start_command: %s", cmd)
+	}
+
+	// A custom agent, so the result does not depend on an installed binary: a
+	// preset whose binary is missing falls back to the default agent.
+	town.Agents = map[string]*config.RuntimeConfig{"not-claude": {Provider: "codex", Command: "codex"}}
+	town.RoleAgents = map[string]string{"refinery": "not-claude"}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), town); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := d.getStartCommand(roleConfig, parsed); cmd != "" {
+		t.Errorf("want no command for a refinery that cannot be isolated, got %s", cmd)
+	}
+}

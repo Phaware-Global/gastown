@@ -342,6 +342,17 @@ Code, or if the agent's command or arguments would let the checkout back in
 A session already running keeps the arguments it started with: stop it with
 `gt reviewer stop` after upgrading.
 
+The refinery runs in a checkout that can hold a PR branch while it rebases, so
+it is launched with the same flags (its settings file is
+`<rig>/refinery/.claude/settings.json`) and refuses to start for the same
+reasons. Handoff, quota rotation and daemon restarts apply them too; a role
+`start_command` is ignored for both roles.
+
+Polecats are **not** isolated: they use the repository's skills and settings, and
+the branch they check out is normally their own. A polecat that takes over
+another author's branch to fix review comments loads that branch's settings and
+MCP servers. This is an accepted risk for now.
+
 **Known limit:** these flags do not make `CLAUDE.md` or `AGENTS.md` in the
 checkout safe. The reviewer may read them as instructions, and must treat all PR
 content, those files included, as untrusted.

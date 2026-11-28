@@ -380,6 +380,9 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 	// the race condition in the old EnsureSessionFresh + SendKeys pattern where
 	// the shell might not be ready to receive keystrokes, producing empty windows.
 	startCmd := d.getStartCommand(roleConfig, parsed)
+	if startCmd == "" {
+		return fmt.Errorf("no start command for %s (see the daemon log)", identity)
+	}
 
 	// Build core identity env vars to pass via -e flags. The startup command
 	// already embeds these via PrependEnv, but -e flags provide defense-in-depth:
@@ -495,12 +498,15 @@ func isBuiltinClaudeStartCommand(cmd string) bool {
 // getStartCommand determines the startup command for an agent.
 // Uses role config if available, then role-based agent selection, then hardcoded defaults.
 // Includes beacon + role-specific instructions in the CLI prompt.
+// Returns "" for a role that runs in a PR checkout and cannot be isolated.
 func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIdentity) string {
 	// Role config start_command: only use when the resolved agent is Claude.
 	// Built-in role TOMLs hardcode "exec claude ..." which bypasses the
 	// declarative agent resolution system. Fall through to agent resolution
 	// so non-Claude agents (copilot, codex, etc.) get the correct command.
-	if roleConfig != nil && roleConfig.StartCommand != "" {
+	// A start_command would drop the isolation flags of a role that runs in a
+	// PR checkout, so those roles ignore it, as their managers do.
+	if roleConfig != nil && roleConfig.StartCommand != "" && !config.RunsInPRCheckout(parsed.RoleType) {
 		rigPath := ""
 		if parsed != nil && parsed.RigName != "" {
 			rigPath = filepath.Join(d.config.TownRoot, parsed.RigName)
@@ -532,7 +538,17 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 	}
 
 	// Use role-based agent resolution for per-role model selection
-	runtimeConfig := config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath)
+	var runtimeConfig *config.RuntimeConfig
+	if config.RunsInPRCheckout(parsed.RoleType) {
+		var err error
+		runtimeConfig, err = config.PRCheckoutRuntimeConfig(parsed.RoleType, rigPath, "")
+		if err != nil {
+			d.logger.Printf("Not restarting %s: %v", parsed.RoleType, err)
+			return ""
+		}
+	} else {
+		runtimeConfig = config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath)
+	}
 
 	// Build recipient for beacon using non-path format to prevent LLMs
 	// from misinterpreting the recipient as a filesystem path.
