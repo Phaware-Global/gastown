@@ -25,6 +25,8 @@ const (
 	maintainGCTimeout = 5 * time.Minute
 	// maintainBackupTimeout is the timeout for dolt backup sync on a single database.
 	maintainBackupTimeout = 2 * time.Minute
+	// maintainBackupListTimeout is the timeout for listing a database's backup remotes.
+	maintainBackupListTimeout = 10 * time.Second
 	// maintainQueryTimeout is the timeout for individual SQL queries during flatten.
 	maintainQueryTimeout = 30 * time.Second
 )
@@ -103,15 +105,9 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	dbInfos := make([]maintainDBInfo, 0, len(databases))
-	for _, dbName := range databases {
-		info := maintainDBInfo{name: dbName}
-		if count, err := maintainCountCommits(config, dbName); err == nil {
-			info.commitCount = count
-		}
-		info.hasBackup = maintainHasBackup(config.DataDir, dbName)
-		dbInfos = append(dbInfos, info)
-	}
+	dbInfos := maintainPlanDatabases(config.DataDir, databases,
+		func(db string) (int, error) { return maintainCountCommits(config, db) },
+		maintainBackupListTimeout)
 
 	// Display plan.
 	flattenCount := 0
@@ -157,6 +153,20 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 		flatten: func(db string) error { return maintainFlattenDB(config, db) },
 		gc:      func(db string) error { return maintainGCDatabase(config, db) },
 	})
+}
+
+// maintainPlanDatabases gathers the commit count and backup remote of each database.
+func maintainPlanDatabases(dataDir string, databases []string, count func(string) (int, error), listTimeout time.Duration) []maintainDBInfo {
+	dbInfos := make([]maintainDBInfo, 0, len(databases))
+	for _, dbName := range databases {
+		info := maintainDBInfo{name: dbName}
+		if n, err := count(dbName); err == nil {
+			info.commitCount = n
+		}
+		info.hasBackup = maintainHasBackup(dataDir, dbName, listTimeout)
+		dbInfos = append(dbInfos, info)
+	}
+	return dbInfos
 }
 
 // maintainOps are the server-side steps of a maintenance run.
@@ -277,8 +287,8 @@ func maintainCountCommits(config *doltserver.Config, dbName string) (int, error)
 }
 
 // maintainHasBackup checks if a database has a <name>-backup remote configured.
-func maintainHasBackup(dataDir, dbName string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func maintainHasBackup(dataDir, dbName string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	dbDir := filepath.Join(dataDir, dbName)
