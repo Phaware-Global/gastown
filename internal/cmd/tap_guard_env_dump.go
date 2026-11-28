@@ -59,8 +59,15 @@ Blocked:
   - env, printenv, set, export, export -p, declare, typeset and readonly when
     they list variables, and ps forms that show process environments (e, -E)
   - printenv, declare -p, typeset or export -p of a secret variable
-  - any of these prints, or echo and printf, of an indirect expansion
-    (${!name}, zsh ${(P)name}), whose target cannot be known
+  - any of these prints, or echo and printf, of an indirect expansion or
+    nameref (${!name}, ${name@P}, zsh ${(P)name} and ${(e)name}, declare -n),
+    whose target cannot be known
+  - printing by name (printenv, declare, typeset, local, export, readonly, env)
+    when the name is built at run time: printenv "$n", declare -p $(...), globs
+  - eval, sh -c and env -S given text that contains an expansion
+  - a shell that reads its script from stdin or a process substitution, unless
+    the script is a here-string or heredoc of literal text, which is judged like
+    a -c script
   - zsh typeset -m and its relatives, which list variables by pattern
   - echo, printf or print of a secret variable, and heredocs or here-strings
     that print one, including through a variable assigned from it
@@ -142,6 +149,10 @@ const maxEnvScriptDepth = 8
 var (
 	secretVarName = regexp.MustCompile(`TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|APIKEY|(^|_)(KEY|PAT)$`)
 	upperVarName  = regexp.MustCompile(`^[A-Z0-9_]+$`)
+	plainVarName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// assignmentWord matches NAME=value, also when part of NAME is expanded.
+	assignmentWord = regexp.MustCompile(`^(?:[A-Za-z0-9_]|\$\{?[A-Za-z0-9_]+\}?)+(\[[^=]*\])?\+?=`)
+	digitsOnly     = regexp.MustCompile(`^[0-9]+$`)
 	// procEnviron matches a path argument, not prose that mentions one.
 	procEnviron = regexp.MustCompile(`^/proc/(\$\([^)]*\)|\S)*environ$`)
 	// suspiciousText decides whether a command that cannot be parsed is
@@ -156,17 +167,21 @@ func isSecretVarName(name string) bool {
 // envDumpReason says why command would print environment values, or "" when it
 // would not.
 func envDumpReason(command string) string {
-	scan := &envScan{tainted: map[string]bool{}}
+	scan := &envScan{tainted: map[string]bool{}, namerefs: map[string]bool{}}
 	return scan.script(command, 0)
 }
 
 type envScan struct {
-	tainted map[string]bool // variables assigned from a secret
+	tainted  map[string]bool // variables assigned from a secret
+	namerefs map[string]bool // variables declared with -n
 }
 
 // secretRef returns the first secret variable w expands.
 func (s *envScan) secretRef(w envWord) string {
 	for _, ref := range w.refs {
+		if s.namerefs[ref] {
+			return indirectRef
+		}
 		if ref == indirectRef || isSecretVarName(ref) || s.tainted[ref] {
 			return ref
 		}
@@ -301,17 +316,20 @@ func (s *envScan) run(words []envWord, c envCommand, depth int) string {
 	case "cat", "tee", "head", "tail", "less", "more", "sed", "awk", "grep", "rev", "base64", "xxd", "od":
 		return s.stdinPrint(c)
 	case "bash", "sh", "zsh", "dash", "ksh":
-		if script, ok := shellCommandString(name, args); ok {
-			return s.script(script, depth+1)
+		return s.shell(name, args, c, depth)
+	case "source", ".":
+		if len(args) > 0 && isProcessSubstitution(args[0]) {
+			return name + " runs a script built at run time"
 		}
-		for _, h := range c.heredocs {
-			if reason := s.script(h.body.text, depth+1); reason != "" {
-				return reason
-			}
+		if len(args) > 0 && isStdinPath(args[0].text) {
+			return s.stdinScript(name, c, depth)
 		}
 	case "eval":
 		text := make([]string, len(args))
 		for i, a := range args {
+			if a.dynamic {
+				return "eval runs text built at run time"
+			}
 			text[i] = a.text
 		}
 		return s.script(strings.Join(text, " "), depth+1)
@@ -319,19 +337,86 @@ func (s *envScan) run(words []envWord, c envCommand, depth int) string {
 	return ""
 }
 
-// shellCommandString returns the script a shell is given with -c. It is the
-// first operand, so other options may stand on either side of -c or share its
-// word.
-func shellCommandString(shell string, args []envWord) (string, bool) {
-	command := false
+func isProcessSubstitution(w envWord) bool {
+	return w.dynamic && strings.HasPrefix(w.text, "<(")
+}
+
+func isStdinPath(p string) bool {
+	return p == "/dev/stdin" || p == "/dev/fd/0" || p == "/proc/self/fd/0"
+}
+
+// shell judges a shell by where its script comes from: a -c operand, a script
+// file or stdin.
+func (s *envScan) shell(name string, args []envWord, c envCommand, depth int) string {
+	operand, command, stdin := shellOperand(name, args)
+	switch {
+	case operand == nil && !stdin && slices.ContainsFunc(args, func(a envWord) bool { return a.text == "--version" || a.text == "--help" }):
+		return ""
+	case command:
+		if operand == nil {
+			return ""
+		}
+		return s.literalScript(name+" -c", *operand, depth)
+	case stdin || operand == nil || isStdinPath(operand.text):
+		return s.stdinScript(name, c, depth)
+	case isProcessSubstitution(*operand):
+		return name + " runs a script built at run time"
+	}
+	// The script is a file, which may still run what a heredoc feeds it.
+	for _, h := range c.heredocs {
+		if reason := s.script(h.body.text, depth+1); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// literalScript judges the script in w, which has to be literal text.
+func (s *envScan) literalScript(runner string, w envWord, depth int) string {
+	if w.dynamic {
+		return runner + " runs text built at run time"
+	}
+	return s.script(w.text, depth+1)
+}
+
+// stdinScript judges the script runner reads from stdin. Only a here-string or
+// heredoc shows what that is.
+func (s *envScan) stdinScript(runner string, c envCommand, depth int) string {
+	var scripts []envWord
+	for _, r := range c.redirects {
+		switch r.op {
+		case "<<<":
+			scripts = append(scripts, r.target)
+		case "<":
+			return runner + " reads its script from a redirect"
+		}
+	}
+	for _, h := range c.heredocs {
+		scripts = append(scripts, h.body)
+	}
+	if len(scripts) == 0 {
+		return runner + " reads its script from stdin"
+	}
+	for _, w := range scripts {
+		if reason := s.literalScript(runner, w, depth); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// shellOperand returns a shell's first operand, which is the script with -c and
+// the script file otherwise. Other options may stand on either side of -c or
+// share its word. stdin reports -s, which makes every operand a parameter.
+func shellOperand(shell string, args []envWord) (operand *envWord, command, stdin bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i].text
 		switch {
 		case a == "--" || a == "-":
-			if command && i+1 < len(args) {
-				return args[i+1].text, true
+			if i+1 < len(args) {
+				operand = &args[i+1]
 			}
-			return "", false
+			return operand, command, stdin
 		case strings.HasPrefix(a, "--"):
 			if a == "--rcfile" || a == "--init-file" || a == "--emulate" {
 				i++
@@ -342,21 +427,23 @@ func shellCommandString(shell string, args []envWord) (string, bool) {
 				switch a[j] {
 				case 'c':
 					command = command || a[0] == '-'
+				case 's':
+					stdin = stdin || a[0] == '-'
 				case 'o', 'O':
+					values++
 					// zsh and ksh also take the option name in the same word.
 					if (shell == "zsh" || shell == "ksh") && j+1 < len(a) {
+						values--
 						j = len(a)
-						continue
 					}
-					values++
 				}
 			}
 			i += values
 		default:
-			return a, command
+			return &args[i], command, stdin
 		}
 	}
-	return "", false
+	return nil, command, stdin
 }
 
 func (s *envScan) assign(name string, w envWord) {
@@ -406,11 +493,13 @@ func (s *envScan) env(args []envWord, c envCommand, depth int) string {
 			}
 		case a == "-S" || a == "--split-string":
 			if len(args) > 1 {
-				return s.script(args[1].text, depth+1)
+				return s.literalScript("env -S", args[1], depth)
 			}
 		case strings.HasPrefix(a, "-"):
 		case shellAssignment.MatchString(a):
 			s.assign(shellAssignment.FindStringSubmatch(a)[1], args[0])
+		case args[0].dynamic:
+			return "env is given a name built at run time"
 		default:
 			return s.run(args, c, depth)
 		}
@@ -422,10 +511,9 @@ func (s *envScan) env(args []envWord, c envCommand, depth int) string {
 func (s *envScan) printenv(args []envWord) string {
 	var names []string
 	for _, a := range args {
-		if slices.Contains(a.refs, indirectRef) {
-			return "printenv prints " + printed(indirectRef)
-		}
 		switch {
+		case a.dynamic:
+			return "printenv is given a name built at run time"
 		case a.text == "--help" || a.text == "--version":
 			return ""
 		case !strings.HasPrefix(a.text, "-"):
@@ -450,6 +538,9 @@ func (s *envScan) declare(builtin string, args []envWord) string {
 	var names []envWord
 	for _, a := range args {
 		if len(a.text) > 1 && (a.text[0] == '-' || a.text[0] == '+') {
+			if a.dynamic {
+				return builtin + " is given options built at run time"
+			}
 			flags += a.text[1:]
 			continue
 		}
@@ -477,12 +568,22 @@ func (s *envScan) declare(builtin string, args []envWord) string {
 	}
 	prints := strings.Contains(flags, "p") ||
 		flags == "" && (builtin == "declare" || builtin == "typeset")
+	// export -n removes the export attribute; elsewhere -n makes a nameref.
+	nameref := builtin != "export" && strings.Contains(flags, "n")
+	printing := strings.Contains(flags, "p")
 	for _, w := range names {
-		name, _, assigned := strings.Cut(w.text, "=")
+		name, _, _ := strings.Cut(w.text, "=")
+		assigned := assignmentWord.MatchString(w.text)
+		literal := !w.dynamic && plainVarName.MatchString(name)
+		if nameref {
+			s.namerefs[strings.TrimSuffix(name, "+")] = true
+		}
 		switch {
-		case assigned:
-			s.assign(name, w)
-		case prints && slices.Contains(w.refs, indirectRef):
+		case assigned && !printing:
+			s.assign(strings.TrimSuffix(name, "+"), w)
+		case !literal && !digitsOnly.MatchString(w.text):
+			return builtin + " is given a name built at run time"
+		case prints && s.namerefs[name]:
 			return builtin + " prints " + printed(indirectRef)
 		case prints && (isSecretVarName(name) || s.tainted[name]):
 			return builtin + " prints the secret variable " + name

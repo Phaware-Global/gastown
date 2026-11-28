@@ -16,6 +16,9 @@ type envWord struct {
 	text string
 	refs []string // variables whose values the shell expands into the word
 	subs []string // scripts of command and process substitutions in the word
+	// dynamic means the shell builds the word at run time, so text is not what
+	// the command receives.
+	dynamic bool
 }
 
 type envRedirect struct {
@@ -47,6 +50,9 @@ var redirectDescriptor = regexp.MustCompile(`^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}
 // have this name.
 const indirectRef = "!"
 
+// globOrBraces matches unquoted text that the shell expands without a $.
+var globOrBraces = regexp.MustCompile(`[*?]|\[[^\]]*\]|\{[^{}]*(,|\.\.)[^{}]*\}`)
+
 var errUnterminated = errors.New("unterminated quote or substitution")
 
 type envLexer struct {
@@ -59,6 +65,7 @@ type envLexer struct {
 
 	word       envWord
 	text       strings.Builder
+	bare       strings.Builder // the unquoted literal part of the word
 	inWord     bool
 	quoted     bool
 	redirect   *envRedirect // awaiting its target
@@ -84,6 +91,7 @@ func (l *envLexer) endWord() {
 	}
 	w := l.word
 	w.text = l.text.String()
+	w.dynamic = w.dynamic || globOrBraces.MatchString(l.bare.String())
 	switch {
 	case l.heredocTag:
 		h := &envHeredoc{tag: w.text, quoted: l.quoted}
@@ -99,6 +107,7 @@ func (l *envLexer) endWord() {
 	}
 	l.word = envWord{}
 	l.text.Reset()
+	l.bare.Reset()
 	l.inWord, l.quoted = false, false
 }
 
@@ -210,6 +219,7 @@ func (l *envLexer) step() error {
 	case '<', '>':
 		return l.redirection()
 	default:
+		l.bare.WriteByte(c)
 		l.add(string([]byte{c}))
 		l.pos++
 	}
@@ -224,6 +234,7 @@ func (l *envLexer) redirection() error {
 	// A descriptor written before the operator is not an argument.
 	if l.inWord && !l.quoted && redirectDescriptor.MatchString(l.text.String()) {
 		l.text.Reset()
+		l.bare.Reset()
 		l.word = envWord{}
 		l.inWord = false
 	}
@@ -308,6 +319,7 @@ func (l *envLexer) backtick() error {
 		return errUnterminated
 	}
 	l.word.subs = append(l.word.subs, l.s[l.pos+1:end])
+	l.word.dynamic = true
 	l.add(l.s[l.pos : end+1])
 	l.pos = end + 1
 	return nil
@@ -326,6 +338,7 @@ func (l *envLexer) substitution(body int) error {
 			if depth == 0 {
 				end := inner.pos
 				l.word.subs = append(l.word.subs, l.s[body:end])
+				l.word.dynamic = true
 				l.add(l.s[l.pos : end+1])
 				l.pos = end + 1
 				return nil
@@ -387,6 +400,7 @@ func (l *envLexer) dollar(inDouble bool) error {
 		if err != nil {
 			return err
 		}
+		l.word.dynamic = true
 		l.add(l.s[l.pos : end+1])
 		l.pos = end + 1
 	case next == '(':
@@ -399,17 +413,30 @@ func (l *envLexer) dollar(inDouble bool) error {
 		if err := l.braced(l.s[l.pos+2 : end]); err != nil {
 			return err
 		}
+		l.word.dynamic = true
 		l.add(l.s[l.pos : end+1])
 		l.pos = end + 1
-	case next == '\'' && !inDouble: // $'...' is literal text
+	case next == '\'' && !inDouble: // $'...' is literal text, unless it has escapes
+		if body := l.s[l.pos+2:]; strings.Contains(body[:max(strings.IndexByte(body, '\''), 0)], `\`) {
+			l.word.dynamic = true
+		}
 		l.pos++
 	default:
-		end := l.pos + 1
+		start := l.pos + 1
+		// zsh $=name, $~name and $^name print the value of name.
+		for start < len(l.s) && strings.IndexByte("=~^", l.s[start]) >= 0 {
+			start++
+		}
+		end := start
 		for end < len(l.s) && isShellNameByte(l.s[end]) {
 			end++
 		}
-		if end > l.pos+1 {
-			l.word.refs = append(l.word.refs, l.s[l.pos+1:end])
+		switch {
+		case end > start:
+			l.word.refs = append(l.word.refs, l.s[start:end])
+			l.word.dynamic = true
+		case next != 0 && strings.IndexByte("@*#?-$!+[", next) >= 0:
+			l.word.dynamic = true
 		}
 		l.add(l.s[l.pos:end])
 		l.pos = end
@@ -421,15 +448,19 @@ func isShellNameByte(c byte) bool {
 	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
+// promptExpansion matches what follows the name in bash's ${name@P}, which
+// expands the value again.
+var promptExpansion = regexp.MustCompile(`^[@*]?(\[[^\]]*\])?@P$`)
+
 // braced records what ${...} expands to the value of, including indirectRef for
-// ${!name} and zsh's ${(P)name}. Length (#), "is it set" (+ and :+) and the
+// ${!name}, ${name@P} and zsh's ${(P)name} and ${(e)name}. Length (#), "is it set" (+ and :+) and the
 // listings of names or array keys (${!prefix*}, ${!array[@]}) do not expand a
 // value.
 func (l *envLexer) braced(inner string) error {
 	indirect := false
 	if strings.HasPrefix(inner, "(") { // zsh expansion flags
 		if end := strings.IndexByte(inner, ')'); end >= 0 {
-			indirect = strings.Contains(inner[:end], "P")
+			indirect = strings.ContainsAny(inner[:end], "Pe")
 			inner = inner[end+1:]
 		}
 	}
@@ -449,6 +480,9 @@ func (l *envLexer) braced(inner string) error {
 		case "*", "@", "[*]", "[@]":
 			return nil
 		}
+		indirect = true
+	}
+	if promptExpansion.MatchString(rest) {
 		indirect = true
 	}
 	if !strings.HasPrefix(rest, "+") && !strings.HasPrefix(rest, ":+") {
@@ -484,8 +518,11 @@ func (l *envLexer) expansions(text string) error {
 	}
 	l.word.refs = append(l.word.refs, inner.word.refs...)
 	l.word.subs = append(l.word.subs, inner.word.subs...)
+	l.word.dynamic = l.word.dynamic || inner.word.dynamic
 	return nil
 }
+
+var heredocEscapes = strings.NewReplacer(`\\`, `\`, `\$`, `$`, "\\`", "`")
 
 // heredocBodies consumes the bodies of the heredocs opened on the line that
 // just ended.
@@ -512,6 +549,9 @@ func (l *envLexer) heredocBodies() error {
 			return err
 		}
 		h.body.refs, h.body.subs = expanded.word.refs, expanded.word.subs
+		h.body.dynamic = expanded.word.dynamic
+		// The shell that reads the body gets it with these escapes removed.
+		h.body.text = heredocEscapes.Replace(h.body.text)
 	}
 	l.pending = nil
 	return nil

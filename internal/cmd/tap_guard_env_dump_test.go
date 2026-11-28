@@ -259,6 +259,7 @@ func TestEnvDumpGuardBlocks(t *testing.T) {
 		`f() { local -n r=$1; echo "$r"; }; f GH_TOKEN`,
 		"typeset -n r=GH_TOKEN; print $r",
 		`declare -n r; r=GH_TOKEN; echo "$r"`,
+		"declare -n r=GH_TOKEN; declare -p r",
 		// Script text built at run time.
 		`eval "echo \$$v"`,
 		`eval "$cmd"`,
@@ -279,6 +280,7 @@ func TestEnvDumpGuardBlocks(t *testing.T) {
 		"bash -s < x",
 		"sh -s",
 		"bash -s arg <<< 'env'",
+		"bash -s -- --help <<< 'env'",
 		"bash /dev/stdin < x",
 		"bash <(echo env)",
 		"source <(echo env)",
