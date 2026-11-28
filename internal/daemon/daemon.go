@@ -108,6 +108,13 @@ type Daemon struct {
 	workAlerts      map[string]time.Time
 	crashedSessions map[string]string
 
+	// panelessSince records when a remote worker session was FIRST observed
+	// with no host tmux session, keyed by rig and session. In-memory only: a
+	// daemon restart restarts the wait. Guarded because rigs are reaped
+	// concurrently.
+	panelessMu    sync.Mutex
+	panelessSince map[string]time.Time
+
 	// reviewerLastNudge rate-limits reviewer stuck-nudges to one per rig per
 	// cooldown. Guarded because reapStuckReviewers fans out over rigs
 	// concurrently via rigPool.runPerRig. In-memory only — losing it on restart
@@ -3427,6 +3434,7 @@ func (d *Daemon) reapIdlePolecats() {
 
 	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
 		d.reapRigIdlePolecats(rigName, idleTimeout)
+		d.reapRigPanelessRemoteSessions(rigName, idleTimeout)
 		return nil
 	})
 }
@@ -3442,6 +3450,106 @@ func (d *Daemon) reapRigIdlePolecats(rigName string, timeout time.Duration) {
 	maxRuntime := d.rigMaxRuntime(filepath.Join(d.config.TownRoot, rigName))
 	for _, polecatName := range polecats {
 		d.reapIdlePolecat(rigName, polecatName, timeout, maxRuntime)
+	}
+}
+
+// reapRigPanelessRemoteSessions resolves a remote rig's backend and releases
+// the worker sessions that have had no host tmux session for timeout. No-op
+// for local rigs.
+func (d *Daemon) reapRigPanelessRemoteSessions(rigName string, timeout time.Duration) {
+	rigPath := filepath.Join(d.config.TownRoot, rigName)
+	settings, err := agentconfig.LoadRigSettings(agentconfig.RigSettingsPath(rigPath))
+	if err != nil || settings == nil || !settings.Execution.IsRemote() {
+		return
+	}
+	backend, err := execution.ForConfig(settings.Execution)
+	if err != nil {
+		d.logger.Printf("Warning: resolving execution backend to reap paneless sessions of %s: %v", rigName, err)
+		return
+	}
+	d.reapPanelessRemoteSessions(rigName, backend, d.tmux.HasSession, time.Now(), timeout)
+}
+
+// reapPanelessRemoteSessions tears down the rig's worker sessions whose host
+// tmux session has been gone for timeout. For a remote backend the pane is
+// the agent's only I/O path, so such a session has no running agent, yet it
+// keeps its worker slot and worktree: reapIdlePolecat only looks at polecats
+// whose tmux session is alive, and stopping or nuking a polecat ends the pane
+// without releasing the worker.
+//
+// The wait is measured from the daemon's own first observation, not from any
+// worker-side or heartbeat timestamp: session start provisions the worker
+// before it creates the pane, and a crashed polecat is restarted onto its
+// existing worker session, so a session without a pane is only abandoned once
+// it has stayed that way.
+func (d *Daemon) reapPanelessRemoteSessions(rigName string, backend execution.Backend, hasSession func(string) (bool, error), now time.Time, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+	defer cancel()
+	eps, err := backend.Discover(ctx, execution.IdentityTags{Rig: rigName})
+	if err != nil {
+		d.logger.Printf("Warning: discovering remote sessions for %s: %v", rigName, err)
+		return
+	}
+
+	prefix := rigName + "/"
+	seen := map[string]bool{}
+	for _, ep := range eps {
+		sessionName := ep.Identity.Session
+		if sessionName == "" {
+			continue
+		}
+		key := prefix + sessionName
+		seen[key] = true
+		alive, err := hasSession(sessionName)
+		if err != nil {
+			continue // unknown this pass: neither start nor reset the wait
+		}
+		gone, due := d.notePaneless(key, alive, now, timeout)
+		if !due {
+			continue
+		}
+		d.logger.Printf("Releasing remote worker session %s of %s: no host session for %v (threshold %v)",
+			sessionName, rigName, gone.Truncate(time.Second), timeout)
+		if err := backend.Teardown(ctx, ep); err != nil {
+			// The entry stays, so the next pass retries.
+			d.logger.Printf("Warning: tearing down paneless remote session %s of %s: %v", sessionName, rigName, err)
+			continue
+		}
+		d.forgetPaneless(func(k string) bool { return k == key })
+	}
+	d.forgetPaneless(func(k string) bool { return strings.HasPrefix(k, prefix) && !seen[k] })
+}
+
+// notePaneless records one observation of a worker session's host tmux
+// session and reports how long it has been gone and whether that reaches
+// timeout. An alive session clears its record.
+func (d *Daemon) notePaneless(key string, alive bool, now time.Time, timeout time.Duration) (gone time.Duration, due bool) {
+	d.panelessMu.Lock()
+	defer d.panelessMu.Unlock()
+	if alive {
+		delete(d.panelessSince, key)
+		return 0, false
+	}
+	since, ok := d.panelessSince[key]
+	if !ok {
+		if d.panelessSince == nil {
+			d.panelessSince = map[string]time.Time{}
+		}
+		d.panelessSince[key] = now
+		return 0, false
+	}
+	gone = now.Sub(since)
+	return gone, gone >= timeout
+}
+
+// forgetPaneless drops the paneless records whose key matches.
+func (d *Daemon) forgetPaneless(match func(key string) bool) {
+	d.panelessMu.Lock()
+	defer d.panelessMu.Unlock()
+	for key := range d.panelessSince {
+		if match(key) {
+			delete(d.panelessSince, key)
+		}
 	}
 }
 
