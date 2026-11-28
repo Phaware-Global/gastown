@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // fakeDoltBackup puts a dolt on PATH that runs list for "dolt backup" and sync
@@ -79,5 +81,47 @@ func TestMaintainRewritesHistoryOnlyAfterBackup(t *testing.T) {
 				t.Errorf("error = %v, want one naming %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestMaintainQuoteDBName(t *testing.T) {
+	tests := []struct {
+		name string
+		want string // empty: the name is refused
+	}{
+		{name: "hq", want: "`hq`"},
+		{name: "My_rig2", want: "`My_rig2`"},
+		{name: ""},
+		{name: "a`b"},
+		{name: "a'b"},
+		{name: `a"b`},
+		{name: "a;b"},
+		{name: "a b"},
+		{name: "a-b"},
+		{name: "a.b"},
+		{name: "hq\n"},
+	}
+	for _, tt := range tests {
+		got, err := maintainQuoteDBName(tt.name)
+		if got != tt.want || (err == nil) != (tt.want != "") {
+			t.Errorf("maintainQuoteDBName(%q) = %q, %v; want %q", tt.name, got, err, tt.want)
+		}
+	}
+}
+
+func TestMaintainRefusesInvalidDBName(t *testing.T) {
+	const bad = "a`b"
+	count := func(string) (int, error) { return 500, nil }
+	infos := maintainPlanDatabases(t.TempDir(), []string{bad}, count, time.Second)
+	if err := infos[0].listErr; err == nil || !strings.Contains(err.Error(), "invalid database name") {
+		t.Errorf("plan error = %v, want invalid database name", err)
+	}
+	for step, err := range map[string]error{
+		"count":   func() error { _, err := maintainCountCommits(&doltserver.Config{}, bad); return err }(),
+		"flatten": maintainFlattenDB(&doltserver.Config{Port: 1}, bad),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "invalid database name") {
+			t.Errorf("%s error = %v, want invalid database name", step, err)
+		}
 	}
 }

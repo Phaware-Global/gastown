@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -79,12 +80,25 @@ func init() {
 	rootCmd.AddCommand(maintainCmd)
 }
 
+// maintainDBNameRe is the rule for Dolt database names.
+var maintainDBNameRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
+// maintainQuoteDBName validates a database name and returns it quoted as an SQL
+// identifier. Call it before building any query that names a database.
+func maintainQuoteDBName(name string) (string, error) {
+	if !maintainDBNameRe.MatchString(name) {
+		return "", fmt.Errorf("invalid database name %q: only letters, digits and underscore are allowed", name)
+	}
+	return "`" + name + "`", nil
+}
+
 // maintainDBInfo holds per-database info for the maintenance plan.
 type maintainDBInfo struct {
 	name        string
 	commitCount int
 	hasBackup   bool
-	// listErr means it is unknown whether a backup remote is configured.
+	// listErr means it is unknown whether a backup remote is configured, or the
+	// database name is invalid.
 	listErr error
 }
 
@@ -183,6 +197,11 @@ func maintainPlanDatabases(dataDir string, databases []string, count func(string
 	dbInfos := make([]maintainDBInfo, 0, len(databases))
 	for _, dbName := range databases {
 		info := maintainDBInfo{name: dbName}
+		if _, err := maintainQuoteDBName(dbName); err != nil {
+			info.listErr = err
+			dbInfos = append(dbInfos, info)
+			continue
+		}
 		if n, err := count(dbName); err == nil {
 			info.commitCount = n
 		}
@@ -226,7 +245,7 @@ func maintainExecute(dataDir string, dbInfos []maintainDBInfo, threshold int, op
 	for _, db := range dbInfos {
 		switch {
 		case db.listErr != nil:
-			fmt.Printf("  %s %s: cannot list backups, will not flatten or gc: %v\n", style.Bold.Render("✗"), db.name, db.listErr)
+			fmt.Printf("  %s %s: cannot confirm backup, will not flatten or gc: %v\n", style.Bold.Render("✗"), db.name, db.listErr)
 			unconfirmed = append(unconfirmed, db.name)
 		case !db.hasBackup:
 			noBackup = append(noBackup, db.name)
@@ -315,6 +334,10 @@ func maintainUnconfirmedError(databases []string) error {
 
 // maintainCountCommits returns the number of Dolt commits in a database.
 func maintainCountCommits(config *doltserver.Config, dbName string) (int, error) {
+	quoted, err := maintainQuoteDBName(dbName)
+	if err != nil {
+		return 0, err
+	}
 	db, err := maintainOpenDB(config, dbName)
 	if err != nil {
 		return 0, err
@@ -325,8 +348,8 @@ func maintainCountCommits(config *doltserver.Config, dbName string) (int, error)
 	defer cancel()
 
 	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName)
-	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s.dolt_log", quoted)
+	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil { //nolint:gosec // G701: query holds only a name maintainQuoteDBName validated
 		return 0, err
 	}
 	return count, nil
@@ -410,6 +433,10 @@ func maintainOpenDBWithReadTimeout(config *doltserver.Config, dbName, readTimeou
 // Per Tim Sehn (2026-02-28): DOLT_RESET --soft + DOLT_COMMIT is safe on a
 // running server. Concurrent writes during flatten are safe.
 func maintainFlattenDB(config *doltserver.Config, dbName string) error {
+	quoted, err := maintainQuoteDBName(dbName)
+	if err != nil {
+		return err
+	}
 	db, err := maintainOpenDB(config, dbName)
 	if err != nil {
 		return err
@@ -434,13 +461,13 @@ func maintainFlattenDB(config *doltserver.Config, dbName string) error {
 	// Find root commit.
 	var rootHash string
 	if err := db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName),
+		fmt.Sprintf("SELECT commit_hash FROM %s.dolt_log ORDER BY date ASC LIMIT 1", quoted),
 	).Scan(&rootHash); err != nil {
 		return fmt.Errorf("find root commit: %w", err)
 	}
 
 	// USE database for session-scoped operations.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
+	if _, err := db.ExecContext(ctx, "USE "+quoted); err != nil {
 		return fmt.Errorf("use database: %w", err)
 	}
 
