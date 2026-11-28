@@ -26,6 +26,9 @@ Blocked:
   - env, printenv, set, export, export -p, declare, typeset and readonly when
     they list variables, and ps forms that show process environments (e, -E)
   - printenv, declare -p, typeset or export -p of a secret variable
+  - any of these prints, or echo and printf, of an indirect expansion
+    (${!name}, zsh ${(P)name}), whose target cannot be known
+  - zsh typeset -m and its relatives, which list variables by pattern
   - echo, printf or print of a secret variable, and heredocs or here-strings
     that print one, including through a variable assigned from it
   - reading /proc/<pid>/environ
@@ -39,7 +42,8 @@ GITHUB_PAT).
 
 Allowed: listing names only (compgen -e, which is a bash builtin: from zsh run
 bash -c 'compgen -e'), presence checks (test -n "$VAR" && echo set,
-"${VAR:+set}", ${#VAR}) and passing a secret to a program that uses it. Cutting
+"${VAR:+set}", ${#VAR}), listing names or array keys by indirection
+(${!prefix*}, ${!array[@]}) and passing a secret to a program that uses it. Cutting
 env output down to names is blocked: the continuation lines of a multi-line value
 get through cut and awk.
 
@@ -130,7 +134,7 @@ type envScan struct {
 // secretRef returns the first secret variable w expands.
 func (s *envScan) secretRef(w envWord) string {
 	for _, ref := range w.refs {
-		if isSecretVarName(ref) || s.tainted[ref] {
+		if ref == indirectRef || isSecretVarName(ref) || s.tainted[ref] {
 			return ref
 		}
 	}
@@ -257,17 +261,15 @@ func (s *envScan) run(words []envWord, c envCommand, depth int) string {
 		// Blocked even when piped on: the next program may display its input.
 		for _, a := range args {
 			if ref := s.secretRef(a); ref != "" {
-				return name + " prints the secret variable " + ref
+				return name + " prints " + printed(ref)
 			}
 		}
 		return s.stdinPrint(c)
 	case "cat", "tee", "head", "tail", "less", "more", "sed", "awk", "grep", "rev", "base64", "xxd", "od":
 		return s.stdinPrint(c)
 	case "bash", "sh", "zsh", "dash", "ksh":
-		for i := 0; i+1 < len(args); i++ {
-			if f := args[i].text; strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "--") && strings.HasSuffix(f, "c") {
-				return s.script(args[i+1].text, depth+1)
-			}
+		if script, ok := shellCommandString(name, args); ok {
+			return s.script(script, depth+1)
 		}
 		for _, h := range c.heredocs {
 			if reason := s.script(h.body.text, depth+1); reason != "" {
@@ -284,10 +286,58 @@ func (s *envScan) run(words []envWord, c envCommand, depth int) string {
 	return ""
 }
 
+// shellCommandString returns the script a shell is given with -c. It is the
+// first operand, so other options may stand on either side of -c or share its
+// word.
+func shellCommandString(shell string, args []envWord) (string, bool) {
+	command := false
+	for i := 0; i < len(args); i++ {
+		a := args[i].text
+		switch {
+		case a == "--" || a == "-":
+			if command && i+1 < len(args) {
+				return args[i+1].text, true
+			}
+			return "", false
+		case strings.HasPrefix(a, "--"):
+			if a == "--rcfile" || a == "--init-file" || a == "--emulate" {
+				i++
+			}
+		case len(a) > 1 && (a[0] == '-' || a[0] == '+'):
+			values := 0
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 'c':
+					command = command || a[0] == '-'
+				case 'o', 'O':
+					// zsh and ksh also take the option name in the same word.
+					if (shell == "zsh" || shell == "ksh") && j+1 < len(a) {
+						j = len(a)
+						continue
+					}
+					values++
+				}
+			}
+			i += values
+		default:
+			return a, command
+		}
+	}
+	return "", false
+}
+
 func (s *envScan) assign(name string, w envWord) {
 	if s.secretRef(w) != "" {
 		s.tainted[name] = true
 	}
+}
+
+// printed says what printing the ref found by secretRef would reveal.
+func printed(ref string) string {
+	if ref == indirectRef {
+		return "an indirect expansion, whose target may be a secret"
+	}
+	return "the secret variable " + ref
 }
 
 // stdinPrint judges a heredoc or here-string fed to a program that prints its
@@ -304,7 +354,7 @@ func (s *envScan) stdinPrint(c envCommand) string {
 	}
 	for _, in := range inputs {
 		if ref := s.secretRef(in); ref != "" {
-			return "this prints the secret variable " + ref
+			return "this prints " + printed(ref)
 		}
 	}
 	return ""
@@ -339,6 +389,9 @@ func (s *envScan) env(args []envWord, c envCommand, depth int) string {
 func (s *envScan) printenv(args []envWord) string {
 	var names []string
 	for _, a := range args {
+		if slices.Contains(a.refs, indirectRef) {
+			return "printenv prints " + printed(indirectRef)
+		}
 		switch {
 		case a.text == "--help" || a.text == "--version":
 			return ""
@@ -372,6 +425,17 @@ func (s *envScan) declare(builtin string, args []envWord) string {
 	if strings.ContainsAny(flags, "fF") { // functions, not variables
 		return ""
 	}
+	// zsh -m takes the names as patterns and prints whatever matches.
+	pattern := strings.Contains(flags, "m") &&
+		slices.ContainsFunc(names, func(w envWord) bool { return !strings.Contains(w.text, "=") })
+	if pattern {
+		return builtin + " -m lists the variables matching a pattern and their values"
+	}
+	// A number after zsh's -p picks the print format; it is not a name.
+	if strings.Contains(flags, "p") &&
+		!slices.ContainsFunc(names, func(w envWord) bool { return strings.Trim(w.text, "0123456789") != "" }) {
+		names = nil
+	}
 	if len(names) == 0 {
 		if builtin == "local" && flags == "" {
 			return ""
@@ -385,6 +449,8 @@ func (s *envScan) declare(builtin string, args []envWord) string {
 		switch {
 		case assigned:
 			s.assign(name, w)
+		case prints && slices.Contains(w.refs, indirectRef):
+			return builtin + " prints " + printed(indirectRef)
 		case prints && (isSecretVarName(name) || s.tainted[name]):
 			return builtin + " prints the secret variable " + name
 		}

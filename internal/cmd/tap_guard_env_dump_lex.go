@@ -42,6 +42,11 @@ type envPipeline []envCommand
 // the shell pick one.
 var redirectDescriptor = regexp.MustCompile(`^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$`)
 
+// indirectRef stands in a word's refs for an indirect expansion. The variable it
+// reads is known only at run time, so it counts as a secret. No variable can
+// have this name.
+const indirectRef = "!"
+
 var errUnterminated = errors.New("unterminated quote or substitution")
 
 type envLexer struct {
@@ -416,29 +421,43 @@ func isShellNameByte(c byte) bool {
 	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
-// braced records what ${...} expands to the value of. Length (#), "is it set"
-// (+ and :+) and name listings (!prefix*) do not expand a value.
+// braced records what ${...} expands to the value of, including indirectRef for
+// ${!name} and zsh's ${(P)name}. Length (#), "is it set" (+ and :+) and the
+// listings of names or array keys (${!prefix*}, ${!array[@]}) do not expand a
+// value.
 func (l *envLexer) braced(inner string) error {
+	indirect := false
 	if strings.HasPrefix(inner, "(") { // zsh expansion flags
 		if end := strings.IndexByte(inner, ')'); end >= 0 {
+			indirect = strings.Contains(inner[:end], "P")
 			inner = inner[end+1:]
 		}
 	}
 	if strings.HasPrefix(inner, "#") || strings.HasPrefix(inner, "+") {
 		return nil
 	}
-	indirect := strings.HasPrefix(inner, "!")
+	// A lone ${!} is the last background process ID, as is ${!:-none}.
+	bang := len(inner) > 1 && inner[0] == '!' && (isShellNameByte(inner[1]) || inner[1] == '#')
 	inner = strings.TrimLeft(inner, "!=~^")
 	end := 0
 	for end < len(inner) && isShellNameByte(inner[end]) {
 		end++
 	}
 	name, rest := inner[:end], inner[end:]
-	if indirect && (strings.HasSuffix(rest, "*") || strings.HasSuffix(rest, "@")) {
-		return nil
+	if bang {
+		switch rest {
+		case "*", "@", "[*]", "[@]":
+			return nil
+		}
+		indirect = true
 	}
-	if name != "" && !strings.HasPrefix(rest, "+") && !strings.HasPrefix(rest, ":+") {
-		l.word.refs = append(l.word.refs, name)
+	if !strings.HasPrefix(rest, "+") && !strings.HasPrefix(rest, ":+") {
+		if name != "" {
+			l.word.refs = append(l.word.refs, name)
+		}
+		if indirect {
+			l.word.refs = append(l.word.refs, indirectRef)
+		}
 	}
 	// The default or replacement text can expand further values.
 	return l.expansions(rest)
