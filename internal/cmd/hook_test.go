@@ -3,12 +3,17 @@ package cmd
 import (
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 // TestHookPolecatEnvCheck verifies that the polecat guard in runHook uses
 // GT_ROLE as the authoritative check, so coordinators with a stale GT_POLECAT
 // in their environment are not blocked from hooking (GH #1707).
 func TestHookPolecatEnvCheck(t *testing.T) {
+	prodguard.Stub(t, "bd")
+	t.Chdir(t.TempDir())
+
 	tests := []struct {
 		name      string
 		role      string

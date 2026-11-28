@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -17,6 +18,8 @@ import (
 var helperProcessHook func()
 
 func TestMain(m *testing.M) {
+	done := prodguard.Install()
+
 	if helperProcessHook != nil {
 		helperProcessHook()
 	}
@@ -54,5 +57,5 @@ func TestMain(m *testing.M) {
 		_ = os.Remove(socketPath)
 	}
 	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	os.Exit(done(code))
 }

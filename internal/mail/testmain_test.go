@@ -5,9 +5,12 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 func TestMain(m *testing.M) {
+	done := prodguard.Install()
+
 	// The mail package's own tests legitimately exercise the real
 	// Router.Send path — they verify routing behavior, address parsing,
 	// fan-out, etc. Opt this package's test binary out of the
@@ -18,5 +21,5 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	os.Exit(done(code))
 }

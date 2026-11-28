@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 func setupNudgeTestRegistry(t *testing.T) {
@@ -291,6 +292,7 @@ func TestNudgeInvalidPriority(t *testing.T) {
 }
 
 func TestNudgeValidModesAccepted(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// Verify all valid modes pass the validation check (they'll fail later
 	// on tmux operations, but should NOT fail on mode validation).
 	origMode := nudgeModeFlag
@@ -451,6 +453,7 @@ func TestIdleWatcherPollInterval(t *testing.T) {
 }
 
 func TestNudgeTrailingSlashNormalization(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// The mail system uses "mayor/" and "deacon/" as canonical addresses.
 	// runNudge must strip the trailing slash so these match the role shortcuts.
 	// Without normalization, "mayor/" falls through to parseAddress which
