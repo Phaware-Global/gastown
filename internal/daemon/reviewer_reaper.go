@@ -254,10 +254,10 @@ const (
 //	          its heartbeat while looping, which phase age alone cannot catch.
 //	age     — time in the current phase. Note that a heartbeat parked at
 //	          PhasePrompt is the NORMAL shape of a review in flight: the
-//	          perspective subagents run entirely between the last `gt reviewer
-//	          prompt` and `gt reviewer consolidate`, with no command in between
+//	          perspective passes run entirely between `gt reviewer
+//	          run` and `gt reviewer consolidate`, with no command in between
 //	          to refresh the timestamp. The threshold must accommodate a full
-//	          subagent pass, which is why it defaults to 45m.
+//	          pass, which is why it defaults to 45m.
 //
 // nudged reports whether this reviewer has already been nudged for a cap breach.
 // It is what makes the courtesy nudge below terminate: without it, a reviewer

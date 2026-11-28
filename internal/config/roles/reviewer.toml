@@ -26,7 +26,7 @@ kill_cooldown = "5m"
 # time (heartbeat elapsed) is a hard kill that a looping reviewer cannot evade.
 # Must stay above pr_review_timeout (30m) so the refinery's await-review
 # escalation — which carries diagnostics a silent kill would destroy — fires
-# first. Note the perspective subagents run between `gt reviewer prompt` and
+# first. Note the perspective passes run between `gt reviewer run` and
 # `gt reviewer consolidate` with nothing refreshing the heartbeat, so this must
-# accommodate a full subagent pass.
+# accommodate a full pass.
 stuck_threshold = "45m"

@@ -130,6 +130,10 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    not a reason to withhold approval — a PR whose findings are all medium or
    below is APPROVED, with the nits posted as threads to fix.
 
+   **Carried review.** If the new head only merges the base branch, you may skip
+   the run: `consolidate --sha <new> --carried-from <old> ...`. The command
+   verifies that this PR's own diff is unchanged and refuses otherwise.
+
 6. **Consolidate** all per-perspective results into one findings payload. This
    deduplicates overlapping findings (same `file:line` and title) deterministically and
    builds a summary that accounts for every perspective's verdict:

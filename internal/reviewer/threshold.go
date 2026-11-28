@@ -33,12 +33,12 @@ func ClampPassDuration(d, stuck time.Duration) time.Duration {
 	return d
 }
 
-// PassDuration returns the soft wall-clock budget for one perspective subagent
+// PassDuration returns the soft wall-clock budget for one perspective
 // pass on a rig: half that rig's configured stuck threshold, floored at
 // MinPassDuration.
 //
 // Derived from the rig's threshold rather than a compile-time constant, because
-// the passes run in parallel between `gt reviewer prompt` and `gt reviewer
+// the passes run in parallel between `gt reviewer run` and `gt reviewer
 // consolidate` with nothing refreshing the heartbeat — so the slowest pass is
 // exactly what the reaper's phase-age rail measures. A rig that raises its
 // threshold must get proportionally more budget, or its passes trip a rail it

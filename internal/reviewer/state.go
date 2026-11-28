@@ -427,8 +427,8 @@ func Classify(o Observation) State {
 			return StateIdle
 		}
 		// The abandoned window must clear the documented no-touch gap, or a third
-		// party gets a supervisory signal for free. The perspective subagents run
-		// entirely between `gt reviewer prompt` and `gt reviewer consolidate` with
+		// party gets a supervisory signal for free. The perspective passes run
+		// entirely between `gt reviewer run` and `gt reviewer consolidate` with
 		// nothing refreshing the file — which is why the stuck threshold is 45m —
 		// so with a bare 15m grace, one `rm heartbeat.json` during that window had
 		// a perfectly healthy reviewer reported as abandoned. Waiting out the same
@@ -498,7 +498,7 @@ const (
 	// It deliberately exceeds merge_queue.pr_review_timeout (30m) so the
 	// refinery's await-review escalation — which carries diagnostics a silent
 	// kill would destroy — always fires first. It must also accommodate a full
-	// perspective subagent pass, because those run between `gt reviewer prompt`
+	// perspective pass, because those run between `gt reviewer run`
 	// and `gt reviewer consolidate` with nothing refreshing the heartbeat.
 	DefaultStuckThreshold = 45 * time.Minute
 

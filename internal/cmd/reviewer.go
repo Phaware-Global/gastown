@@ -54,9 +54,10 @@ var (
 
 	reviewerDonePR int
 
-	reviewerPassDir          string
-	reviewerConsolidatePR    int
-	reviewerConsolidateEdits string
+	reviewerPassDir                string
+	reviewerConsolidatePR          int
+	reviewerConsolidateEdits       string
+	reviewerConsolidateCarriedFrom string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -231,6 +232,9 @@ in --edits, addressing findings by raw id "perspective:N" (1-based):
 
 Every posted finding traces to a raw id. The review body lists each dropped
 finding with its reason, and labels reworded and added text as the reviewer's.
+--carried-from <sha> reuses the passes of an earlier head when this PR's own
+diff is unchanged, and the body names that head.
+
 The output is the findings JSON that 'gt reviewer post' consumes:
 
   - the summary lists every perspective's verdict (perspectives with no findings
@@ -314,6 +318,8 @@ func init() {
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateEdits, "edits", "",
 		`JSON file of your changes to the raw findings (or "-" for stdin)`)
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateCarriedFrom, "carried-from", "",
+		"earlier head the passes ran at; allowed only if the PR's own diff is unchanged at --sha")
 	_ = reviewerConsolidateCmd.MarkFlagRequired("pr")
 	_ = reviewerConsolidateCmd.MarkFlagRequired("sha")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
@@ -841,7 +847,8 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	if base := strings.TrimSpace(reviewerConsolidateBaseSHA); base != "" {
 		edits.BaseSHA = base
 	}
-	fs, err := consolidateVerifiedPasses(reviewerConsolidatePR, reviewerConsolidateSHA, edits)
+	fs, err := consolidateVerifiedPasses(reviewerConsolidatePR, reviewerConsolidateSHA,
+		reviewerConsolidateCarriedFrom, edits)
 	if err != nil {
 		return err
 	}

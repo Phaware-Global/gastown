@@ -100,6 +100,8 @@ type Findings struct {
 	Edits *Edits `json:"edits,omitempty"`
 	// Dropped lists the raw findings the edits left out.
 	Dropped []DroppedFinding `json:"dropped,omitempty"`
+	// CarriedFrom is the head the passes ran at, when it is not ReviewedSHA.
+	CarriedFrom string `json:"carried_from,omitempty"`
 }
 
 // Length budgets for a single finding, in runes.
@@ -454,6 +456,10 @@ func (fs *Findings) SummaryBody(reviewedSHA string) string {
 	}
 	if sha != "" {
 		fmt.Fprintf(&b, " · **Reviewed SHA:** `%s`", sha)
+	}
+	if fs.CarriedFrom != "" {
+		fmt.Fprintf(&b, " · **Carried from:** `%s` (the passes ran there; this PR's own diff is unchanged)",
+			fs.CarriedFrom)
 	}
 	return b.String()
 }

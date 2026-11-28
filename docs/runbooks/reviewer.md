@@ -239,6 +239,10 @@ any payload that differs from what the raw results and edits produce. The body
 lists dropped findings with reasons and each pass's end time, and labels
 reworded and added text as the reviewer's.
 
+`--carried-from <old-sha>` reuses the passes of an earlier head. It is refused
+unless the PR's diff against its base, including line numbers, is the same at
+both heads; the body names the head the passes ran at.
+
 Dedup keys on `(path, line)`, keeps the highest priority, and unions the
 perspective tags; the summary carries a verdict line for **every** perspective.
 
