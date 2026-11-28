@@ -566,6 +566,19 @@ func TestProvision_SessionLimit(t *testing.T) {
 	assert.Contains(t, err.Error(), "session limit")
 }
 
+// Orphaned sessions hold no slot on the worker, so they must not count toward
+// the limit here either: a worker whose list is full of orphans still opens.
+func TestProvision_OrphanedSessionsDoNotCountTowardTheLimit(t *testing.T) {
+	w := newFakeWorker(t)
+	w.maxSessions = 1
+	w.preload(sockproto.SessionSummary{Session: "other", Rig: "MyRig", Polecat: "nux", State: "orphaned"})
+	b, _ := testBackend(t, w)
+
+	_, err := b.Provision(context.Background(), spec())
+	require.NoError(t, err)
+	assert.Contains(t, w.got(), "session_open")
+}
+
 // A worker on a binary that predates agent files would drop them silently and
 // start the agent without its settings. The session must not be opened.
 func TestProvision_WorkerWithoutAgentFilesIsRefused(t *testing.T) {

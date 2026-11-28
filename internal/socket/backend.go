@@ -256,8 +256,17 @@ func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.Poleca
 	}
 
 	// max_sessions gate (§12 decision 1): the worker also enforces this, but
-	// failing fast here gives a clearer error than a session_error.
-	if cap := c.ack.Capabilities; cap != nil && cap.MaxSessions > 0 && len(c.ack.Sessions) >= cap.MaxSessions {
+	// failing fast here gives a clearer error than a session_error. Like the
+	// worker, count only live sessions: an orphaned one has no agent and
+	// holds no slot there, so counting it here would refuse sessions the
+	// worker would open.
+	live := 0
+	for _, sess := range c.ack.Sessions {
+		if sess.State != "orphaned" {
+			live++
+		}
+	}
+	if cap := c.ack.Capabilities; cap != nil && cap.MaxSessions > 0 && live >= cap.MaxSessions {
 		return execution.Endpoint{}, fmt.Errorf("socket: worker at %s is at its session limit (%d)", b.settings.Address, cap.MaxSessions)
 	}
 
