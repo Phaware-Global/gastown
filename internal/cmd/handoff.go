@@ -19,6 +19,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -804,7 +805,7 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	}
 
 	// Parse the session name to get the identity (used for GT_ROLE and beacon)
-	identity, err := session.ParseSessionName(sessionName)
+	identity, err := parseRestartSession(sessionName)
 	if err != nil {
 		return "", fmt.Errorf("cannot parse session name %q: %w", sessionName, err)
 	}
@@ -867,7 +868,22 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		}
 	}
 	var runtimeCmd string
-	if currentAgent != "" {
+	if config.RunsInPRCheckout(simpleRole) {
+		rc, err := config.PRCheckoutRuntimeConfig(simpleRole, rigPath, currentAgent)
+		if err != nil {
+			return "", err
+		}
+		if identity.Role == session.RoleReviewer {
+			// The settings carry the reviewer's tool guards and the previous
+			// session could have edited them. reviewer.Manager.Start renders
+			// them on every start; a respawn has to as well.
+			settingsFile := config.RoleSettingsFile(rc, simpleRole, rigPath)
+			if err := hooks.RenderClaudeSettings(settingsFile, identity.Rig+"/"+simpleRole, simpleRole); err != nil {
+				return "", fmt.Errorf("rendering reviewer settings: %w", err)
+			}
+		}
+		runtimeCmd = rc.BuildCommandWithPrompt(beacon)
+	} else if currentAgent != "" {
 		var err error
 		runtimeCmd, err = config.GetRuntimeCommandWithPromptAndAgentOverride(rigPath, beacon, currentAgent)
 		if err != nil {
@@ -1081,7 +1097,7 @@ func sessionWorkDir(sessionName, townRoot string) (string, error) {
 
 	default:
 		// Parse session name to determine role and resolve paths
-		identity, err := session.ParseSessionName(sessionName)
+		identity, err := parseRestartSession(sessionName)
 		if err != nil {
 			return "", fmt.Errorf("unknown session type: %s (%w)", sessionName, err)
 		}
@@ -1098,6 +1114,8 @@ func sessionWorkDir(sessionName, townRoot string) (string, error) {
 			return fmt.Sprintf("%s/%s/witness", townRoot, identity.Rig), nil
 		case session.RoleRefinery:
 			return fmt.Sprintf("%s/%s/refinery/rig", townRoot, identity.Rig), nil
+		case session.RoleReviewer:
+			return fmt.Sprintf("%s/%s/reviewer/rig", townRoot, identity.Rig), nil
 		case session.RolePolecat:
 			return fmt.Sprintf("%s/%s/polecats/%s", townRoot, identity.Rig, identity.Name), nil
 		case session.RoleDog:
@@ -1108,10 +1126,20 @@ func sessionWorkDir(sessionName, townRoot string) (string, error) {
 	}
 }
 
-// sessionToGTRole converts a session name to a GT_ROLE value.
-// Uses session.ParseSessionName for consistent parsing across the codebase.
-func sessionToGTRole(sessionName string) string {
+// parseRestartSession parses a session name for handoff and respawn.
+// session.ParseSessionName reads "<prefix>-reviewer" as a polecat named
+// "reviewer", which has no directory to restart in.
+func parseRestartSession(sessionName string) (*session.AgentIdentity, error) {
 	identity, err := session.ParseSessionName(sessionName)
+	if err == nil && identity.Role == session.RolePolecat && identity.Name == constants.RoleReviewer {
+		identity.Role, identity.Name = session.RoleReviewer, ""
+	}
+	return identity, err
+}
+
+// sessionToGTRole converts a session name to a GT_ROLE value.
+func sessionToGTRole(sessionName string) string {
+	identity, err := parseRestartSession(sessionName)
 	if err != nil {
 		return ""
 	}

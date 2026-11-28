@@ -17,9 +17,12 @@ const (
 	RoleOverseer  Role = "overseer"
 	RoleWitness   Role = "witness"
 	RoleRefinery  Role = "refinery"
-	RoleCrew      Role = "crew"
-	RolePolecat   Role = "polecat"
-	RoleDog       Role = "dog"
+	// RoleReviewer is not returned by ParseSessionName, which reads a reviewer
+	// session as a polecat; callers that must tell them apart set it.
+	RoleReviewer Role = "reviewer"
+	RoleCrew     Role = "crew"
+	RolePolecat  Role = "polecat"
+	RoleDog      Role = "dog"
 )
 
 // AgentIdentity represents a parsed Gas Town agent identity.
@@ -199,6 +202,8 @@ func (a *AgentIdentity) SessionName() string {
 		return WitnessSessionName(a.prefix())
 	case RoleRefinery:
 		return RefinerySessionName(a.prefix())
+	case RoleReviewer:
+		return ReviewerSessionName(a.prefix())
 	case RoleCrew:
 		return CrewSessionName(a.prefix(), a.Name)
 	case RolePolecat:
@@ -244,6 +249,8 @@ func (a *AgentIdentity) BeaconAddress() string {
 		return BeaconRecipient("witness", "", a.Rig)
 	case RoleRefinery:
 		return BeaconRecipient("refinery", "", a.Rig)
+	case RoleReviewer:
+		return BeaconRecipient("reviewer", "", a.Rig)
 	case RoleCrew:
 		return BeaconRecipient("crew", a.Name, a.Rig)
 	case RolePolecat:
@@ -277,6 +284,8 @@ func (a *AgentIdentity) Address() string {
 		return fmt.Sprintf("%s/witness", a.Rig)
 	case RoleRefinery:
 		return fmt.Sprintf("%s/refinery", a.Rig)
+	case RoleReviewer:
+		return fmt.Sprintf("%s/reviewer", a.Rig)
 	case RoleCrew:
 		return fmt.Sprintf("%s/crew/%s", a.Rig, a.Name)
 	case RolePolecat:

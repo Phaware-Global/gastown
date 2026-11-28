@@ -4817,11 +4817,11 @@ func TestBuildStartupCommandWithAgentOverride_PriorityOverRoleAgents(t *testing.
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 
-	// Configure town settings with role_agents: refinery = codex
+	// Configure town settings with role_agents: witness = codex
 	townSettings := NewTownSettings()
 	townSettings.DefaultAgent = "claude"
 	townSettings.RoleAgents = map[string]string{
-		constants.RoleRefinery: "codex",
+		constants.RoleWitness: "codex",
 	}
 	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
 		t.Fatalf("SaveTownSettings: %v", err)
@@ -4833,9 +4833,9 @@ func TestBuildStartupCommandWithAgentOverride_PriorityOverRoleAgents(t *testing.
 		t.Fatalf("SaveRigSettings: %v", err)
 	}
 
-	// agentOverride = "gemini" should take priority over role_agents[refinery] = "codex"
+	// agentOverride = "gemini" should take priority over role_agents[witness] = "codex"
 	cmd, err := BuildStartupCommandWithAgentOverride(
-		map[string]string{"GT_ROLE": constants.RoleRefinery},
+		map[string]string{"GT_ROLE": constants.RoleWitness},
 		rigPath,
 		"",
 		"gemini", // explicit override

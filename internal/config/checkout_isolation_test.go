@@ -24,7 +24,7 @@ func reviewerTestRig(t *testing.T, agent *RuntimeConfig) (townRoot, rigPath stri
 	town := NewTownSettings()
 	if agent != nil {
 		town.Agents = map[string]*RuntimeConfig{"under-test": agent}
-		town.RoleAgents = map[string]string{"reviewer": "under-test"}
+		town.RoleAgents = map[string]string{"reviewer": "under-test", "refinery": "under-test"}
 	}
 	if err := SaveTownSettings(TownSettingsPath(townRoot), town); err != nil {
 		t.Fatal(err)
@@ -88,10 +88,56 @@ func TestReviewerLaunchArgs(t *testing.T) {
 	}
 }
 
-// Only the reviewer is isolated; every other role keeps its project settings.
+func TestRefineryLaunchArgs(t *testing.T) {
+	townRoot, rigPath := reviewerTestRig(t, nil)
+	settings := filepath.Join(rigPath, "refinery", ".claude", "settings.json")
+
+	rc := ResolveRoleAgentConfig("refinery", townRoot, rigPath)
+	if got := flagValue(rc.Args, "--settings"); got != settings {
+		t.Errorf("--settings = %q, want %q", got, settings)
+	}
+	if got := flagValue(rc.Args, "--setting-sources"); got != "user" {
+		t.Errorf("--setting-sources = %q, want user", got)
+	}
+	if got := flagValue(rc.Args, "--mcp-config"); got != CheckoutMCPConfig {
+		t.Errorf("--mcp-config = %q, want %q", got, CheckoutMCPConfig)
+	}
+	if !slices.Contains(rc.Args, "--strict-mcp-config") {
+		t.Errorf("missing --strict-mcp-config: %q", rc.Args)
+	}
+}
+
+// A respawn resolves its command outside BuildStartupCommand, so it needs the
+// same flags and the same refusals, with and without an agent override.
+func TestPRCheckoutRuntimeConfig(t *testing.T) {
+	_, rigPath := reviewerTestRig(t, nil)
+	for _, role := range []string{"reviewer", "refinery"} {
+		for _, override := range []string{"", "claude"} {
+			rc, err := PRCheckoutRuntimeConfig(role, rigPath, override)
+			if err != nil {
+				t.Fatalf("%s, override %q: %v", role, override, err)
+			}
+			if got := flagValue(rc.Args, "--setting-sources"); got != "user" {
+				t.Errorf("%s, override %q: --setting-sources = %q, want user", role, override, got)
+			}
+			if got, want := flagValue(rc.Args, "--settings"), filepath.Join(rigPath, role, ".claude", "settings.json"); got != want {
+				t.Errorf("%s, override %q: --settings = %q, want %q", role, override, got, want)
+			}
+		}
+		if _, err := PRCheckoutRuntimeConfig(role, rigPath, "codex"); err == nil || !strings.Contains(err.Error(), "not Claude Code") {
+			t.Errorf("%s with codex: err = %v, want a refusal", role, err)
+		}
+	}
+	if _, err := PRCheckoutRuntimeConfig("refinery", "", ""); err == nil {
+		t.Error("no rig path: want a refusal")
+	}
+}
+
+// Only roles that run in a PR checkout are isolated; the rest keep their
+// project settings.
 func TestOtherRolesKeepProjectSettings(t *testing.T) {
 	townRoot, rigPath := reviewerTestRig(t, nil)
-	for _, role := range []string{"polecat", "crew", "witness", "refinery"} {
+	for _, role := range []string{"polecat", "crew", "witness"} {
 		rc := ResolveRoleAgentConfig(role, townRoot, rigPath)
 		if slices.Contains(rc.Args, "--setting-sources") || slices.Contains(rc.Args, "--strict-mcp-config") {
 			t.Errorf("%s: unexpected isolation flags %q", role, rc.Args)

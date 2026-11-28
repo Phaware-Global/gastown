@@ -960,3 +960,75 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 		}
 	})
 }
+
+// A respawned refinery or reviewer must not load configuration from the PR
+// checkout it restarts in.
+func TestBuildRestartCommand_PRCheckoutRolesAreIsolated(t *testing.T) {
+	setupHandoffTestRegistry(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), config.NewTownSettings()); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(townRoot)
+	t.Setenv("GT_TOWN_ROOT", "")
+	t.Setenv("GT_ROOT", "")
+
+	tests := []struct{ session, role string }{
+		{"gt-refinery", "refinery"},
+		{"gt-reviewer", "reviewer"},
+	}
+	for _, tt := range tests {
+		// GT_AGENT is set in running sessions and selects the override path.
+		for _, agent := range []string{"", "claude"} {
+			t.Run(tt.role+"/agent="+agent, func(t *testing.T) {
+				t.Setenv("GT_AGENT", agent)
+				cmd, err := buildRestartCommand(tt.session)
+				if err != nil {
+					t.Fatalf("buildRestartCommand: %v", err)
+				}
+				settings := filepath.Join(rigPath, tt.role, ".claude", "settings.json")
+				for _, want := range []string{
+					"cd " + townRoot + "/gastown/" + tt.role + "/rig && ",
+					"GT_ROLE=gastown/" + tt.role + " ",
+					"--settings " + settings,
+					"--setting-sources user",
+					"--strict-mcp-config",
+				} {
+					if !strings.Contains(cmd, want) {
+						t.Errorf("restart command lacks %q: %s", want, cmd)
+					}
+				}
+			})
+		}
+		t.Run(tt.role+"/not claude", func(t *testing.T) {
+			t.Setenv("GT_AGENT", "codex")
+			if cmd, err := buildRestartCommand(tt.session); err == nil {
+				t.Errorf("want a refusal, got %s", cmd)
+			}
+		})
+	}
+
+	// The reviewer's settings carry its tool guards and a previous session may
+	// have edited them, so a restart renders them again.
+	settings := filepath.Join(rigPath, "reviewer", ".claude", "settings.json")
+	if err := os.WriteFile(settings, []byte(`{"edited":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_AGENT", "")
+	if _, err := buildRestartCommand("gt-reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(settings); err != nil || strings.Contains(string(data), "edited") {
+		t.Errorf("reviewer settings not rendered again: %s (%v)", data, err)
+	}
+}

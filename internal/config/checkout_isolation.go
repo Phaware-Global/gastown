@@ -9,21 +9,52 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
-// The reviewer runs with its working directory inside a checkout of the PR
-// under review, so the PR's author controls the project files there. Claude
-// Code runs hooks, applies env and starts MCP servers from those files at
-// session start, with the session's credentials in scope. These launch flags
-// and the check below keep all of that from being loaded.
+// The reviewer and the refinery run with their working directory inside a
+// checkout that can hold an unmerged PR branch, so the PR's author controls the
+// project files there. Claude Code runs hooks, applies env and starts MCP
+// servers from those files at session start, with the session's credentials in
+// scope. These launch flags and the check below keep all of that from being
+// loaded.
+//
+// Polecats are not isolated: they use the repository's skills and settings, and
+// the branch they check out is normally their own.
 //
 // They do not cover CLAUDE.md or anything else the agent reads as text.
 
 // CheckoutMCPConfig is the MCP configuration of a session in a PR checkout:
-// the code graph server the review passes use, and nothing else.
+// the code graph server, and nothing else.
 const CheckoutMCPConfig = `{"mcpServers":{"codegraph":{"type":"stdio","command":"codegraph","args":["serve","--mcp"]}}}`
 
-// runsInPRCheckout reports whether sessions of role start inside a PR checkout.
-func runsInPRCheckout(role string) bool {
-	return role == constants.RoleReviewer
+// RunsInPRCheckout reports whether sessions of role start inside a PR checkout.
+// Every path that starts or respawns such a session must get its command from
+// BuildStartupCommandWithAgentOverride or PRCheckoutRuntimeConfig.
+func RunsInPRCheckout(role string) bool {
+	return role == constants.RoleReviewer || role == constants.RoleRefinery
+}
+
+// PRCheckoutRuntimeConfig returns the isolated runtime config for respawning a
+// session of role, or an error if the session cannot be isolated.
+// agentOverride, when set, replaces the role's configured agent.
+func PRCheckoutRuntimeConfig(role, rigPath, agentOverride string) (*RuntimeConfig, error) {
+	if rigPath == "" {
+		return nil, fmt.Errorf("refusing to start in a PR checkout: no rig path to locate the %s settings", role)
+	}
+	townRoot := filepath.Dir(rigPath)
+	var rc *RuntimeConfig
+	if agentOverride == "" {
+		rc = ResolveRoleAgentConfig(role, townRoot, rigPath)
+	} else {
+		var err error
+		rc, _, err = ResolveAgentConfigWithOverride(townRoot, rigPath, agentOverride)
+		if err != nil {
+			return nil, err
+		}
+		rc = withRoleSettingsFlag(rc, role, rigPath)
+	}
+	if err := verifyCheckoutIsolation(rc, rc.Env, RoleSettingsFile(rc, role, rigPath)); err != nil {
+		return nil, err
+	}
+	return rc, nil
 }
 
 // addCheckoutIsolationFlags appends the isolation flags the agent's own
