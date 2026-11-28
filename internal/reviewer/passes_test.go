@@ -28,7 +28,16 @@ const goodAnswer = `{"perspective":"security","verdict":"one issue","opportuniti
 func runTestPass(t *testing.T, dir string) {
 	t.Helper()
 	spec := PassSpec{Perspective: "security", PR: 7, SHA: testSHA, Round: 1, Prompt: "review it"}
-	if _, err := RunPass(context.Background(), dir, spec, answering(goodAnswer)); err != nil {
+	runAndWrite(t, dir, spec, answering(goodAnswer))
+}
+
+func runAndWrite(t *testing.T, dir string, spec PassSpec, invoke PassInvoker) {
+	t.Helper()
+	pass, err := RunPass(context.Background(), dir, spec, invoke)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pass.Write(dir); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -90,9 +99,7 @@ func TestRunPassFailureLeavesNoReceipt(t *testing.T) {
 func TestRunPassRepairsAnInvalidAnswerOnce(t *testing.T) {
 	dir := t.TempDir()
 	spec := PassSpec{Perspective: "security", PR: 7, SHA: testSHA, Prompt: "p"}
-	if _, err := RunPass(context.Background(), dir, spec, answering("oops", "```json\n"+goodAnswer+"\n```")); err != nil {
-		t.Fatal(err)
-	}
+	runAndWrite(t, dir, spec, answering("oops", "```json\n"+goodAnswer+"\n```"))
 	data, err := os.ReadFile(passResultPath(dir, "security"))
 	if err != nil {
 		t.Fatal(err)

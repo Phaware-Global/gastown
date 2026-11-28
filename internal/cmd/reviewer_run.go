@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -27,7 +29,8 @@ var reviewerRunCmd = &cobra.Command{
 Each pass executes the same prompt 'gt reviewer prompt' prints. The command
 writes the pass's raw perspective-<name>.json plus receipt-<name>.json, which
 records the pass id, prompt and result hashes, and start and end times, under
-<rig>/reviewer/passes/pr<N>/, outside the worktree. 'consolidate' does not
+<rig>/reviewer/passes/pr<N>/, outside the worktree. Both are written once every
+pass has exited, and each result's sha256 is printed. 'consolidate' does not
 check the receipts.
 
 With no arguments every enabled perspective runs; name one to re-run it. A pass
@@ -72,6 +75,9 @@ func reviewerPassDirFor(pr int) (string, error) {
 func runReviewerRun(cmd *cobra.Command, args []string) error {
 	if reviewerPromptPR <= 0 {
 		return fmt.Errorf("--pr must be a positive PR number")
+	}
+	if reviewerPromptPriorThreads == "-" && reviewerPromptInstructions == "-" {
+		return fmt.Errorf("--prior-threads and --instructions cannot both read from stdin (\"-\")")
 	}
 	cwd, err := requireReviewerWorktree()
 	if err != nil {
@@ -153,60 +159,101 @@ func runReviewerRun(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
 
+	err = runReviewerPasses(ctx, os.Stdout, dir, specs, invoke)
+	fmt.Printf("Raw results (do not edit): %s\n", dir)
+	return err
+}
+
+// runReviewerPasses runs the passes in parallel and writes their results only
+// after all of them have exited: a running pass has shell access to dir and
+// could otherwise replace a sibling's finished result and receipt. Each result's
+// sha256 goes to out, which no pass can rewrite.
+func runReviewerPasses(ctx context.Context, out io.Writer, dir string, specs []reviewer.PassSpec,
+	invoke reviewer.PassInvoker) error {
+	passes := make([]*reviewer.CompletedPass, len(specs))
 	errs := make([]error, len(specs))
 	var wg sync.WaitGroup
 	for i, spec := range specs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			receipt, err := reviewer.RunPass(ctx, dir, spec, invoke)
-			if err != nil {
-				errs[i] = err
-				fmt.Printf("✗ %s: %v\n", spec.Perspective, err)
-				return
-			}
-			fmt.Printf("✓ %s: finished %s\n", spec.Perspective, receipt.FinishedAt.Format(time.RFC3339))
+			passes[i], errs[i] = reviewer.RunPass(ctx, dir, spec, invoke)
 		}()
 	}
 	wg.Wait()
-	fmt.Printf("Raw results (do not edit): %s\n", dir)
+
+	for i, spec := range specs {
+		if errs[i] != nil {
+			// A sibling may have planted files where a failed pass wrote none.
+			errs[i] = errors.Join(errs[i], reviewer.RemovePassArtifacts(dir, []string{spec.Perspective}))
+		} else {
+			errs[i] = passes[i].Write(dir)
+		}
+		if errs[i] != nil {
+			_, _ = fmt.Fprintf(out, "✗ %s: %v\n", spec.Perspective, errs[i])
+			continue
+		}
+		receipt := passes[i].Receipt
+		_, _ = fmt.Fprintf(out, "✓ %s: finished %s, result sha256 %s\n",
+			spec.Perspective, receipt.FinishedAt.Format(time.RFC3339), receipt.ResultSHA256)
+	}
 	return errors.Join(errs...)
 }
 
-// reviewerPassSettings reduces the reviewer role's settings to what a pass must
-// inherit: the tool guards. The session hooks would prime the pass as the
-// reviewer itself.
-func reviewerPassSettings(roleSettings []byte) (string, error) {
-	var in struct {
-		Hooks          map[string]json.RawMessage `json:"hooks"`
-		EnabledPlugins json.RawMessage            `json:"enabledPlugins,omitempty"`
+// reviewerPassSettings renders what a pass inherits from the reviewer role: the
+// tool guards, built from the role's hook configuration as 'gt hooks sync' builds
+// them. No settings file is read from the rig, whose worktree holds the PR's own
+// files. Session hooks are left out: they would prime the pass as the reviewer
+// itself.
+func reviewerPassSettings(rigName string) ([]byte, error) {
+	cfg, err := hooks.ComputeExpected(rigName + "/reviewer")
+	if err != nil {
+		return nil, fmt.Errorf("building reviewer tool guards: %w", err)
 	}
-	if err := json.Unmarshal(roleSettings, &in); err != nil {
-		return "", fmt.Errorf("parsing reviewer settings: %w", err)
+	if len(cfg.PreToolUse) == 0 {
+		return nil, fmt.Errorf("reviewer role has no PreToolUse guards")
 	}
-	guards, ok := in.Hooks["PreToolUse"]
-	if !ok {
-		return "", fmt.Errorf("reviewer settings have no PreToolUse guards")
+	return json.Marshal(map[string]any{
+		"hooks":          hooks.HooksConfig{PreToolUse: cfg.PreToolUse},
+		"enabledPlugins": map[string]bool{"beads@beads-marketplace": false},
+	})
+}
+
+// stripPassConfigArgs drops every argument that chooses settings or MCP servers,
+// in both the "--flag value" and "--flag=value" forms, so the runner's own are
+// the only ones. Everything from "--" on goes too: flags appended after it would
+// be read as positional arguments.
+func stripPassConfigArgs(roleArgs []string) []string {
+	var args []string
+	for i := 0; i < len(roleArgs); i++ {
+		if roleArgs[i] == "--" {
+			break
+		}
+		flag, _, inline := strings.Cut(roleArgs[i], "=")
+		switch flag {
+		case "--settings", "--setting-sources":
+			if !inline {
+				i++
+			}
+		case "--mcp-config":
+			// Takes several values.
+			for i+1 < len(roleArgs) && !strings.HasPrefix(roleArgs[i+1], "-") {
+				i++
+			}
+		case "--strict-mcp-config":
+		default:
+			args = append(args, roleArgs[i])
+		}
 	}
-	in.Hooks = map[string]json.RawMessage{"PreToolUse": guards}
-	out, err := json.Marshal(in)
-	return string(out), err
+	return args
 }
 
 // claudePassArgs builds the headless argv for a pass. The worktree holds the
 // PR's own files, so project and local settings are not loaded (a PR could ship
 // hooks in them), and only the codegraph MCP server is available.
-func claudePassArgs(roleArgs []string, settings string) []string {
-	var args []string
-	for i := 0; i < len(roleArgs); i++ {
-		if roleArgs[i] == "--settings" {
-			i++
-			continue
-		}
-		args = append(args, roleArgs[i])
-	}
-	return append(args,
-		"--settings", settings,
+func claudePassArgs(roleArgs []string, settingsPath string) []string {
+	return append(stripPassConfigArgs(roleArgs),
+		"--settings", settingsPath,
 		"--setting-sources", "user",
 		"--strict-mcp-config",
 		"--mcp-config", `{"mcpServers":{"codegraph":{"type":"stdio","command":"codegraph","args":["serve","--mcp"]}}}`,
@@ -232,12 +279,7 @@ func claudeAnswer(stdout []byte) (string, error) {
 // claudePassInvoker runs passes on the reviewer role's Claude configuration.
 // Roles configured with another agent run their passes on the default Claude.
 func claudePassInvoker(townRoot, rigPath, worktree string) (reviewer.PassInvoker, error) {
-	settingsPath := filepath.Join(config.RoleSettingsDir("reviewer", rigPath), ".claude", "settings.json")
-	data, err := os.ReadFile(settingsPath) //nolint:gosec // fixed path under the rig
-	if err != nil {
-		return nil, fmt.Errorf("reading reviewer tool guards: %w", err)
-	}
-	settings, err := reviewerPassSettings(data)
+	settings, err := reviewerPassSettings(filepath.Base(rigPath))
 	if err != nil {
 		return nil, err
 	}
@@ -251,9 +293,16 @@ func claudePassInvoker(townRoot, rigPath, worktree string) (reviewer.PassInvoker
 			env = append(env, k+"="+v)
 		}
 	}
-	args := claudePassArgs(roleArgs, settings)
 
 	return func(ctx context.Context, prompt string) (string, error) {
+		// A fresh file per launch, so no earlier pass has had its path to edit.
+		settingsPath, err := writeTempSettings(settings)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		args := claudePassArgs(roleArgs, settingsPath)
 		c := exec.CommandContext(ctx, command, args...) //nolint:gosec // configured agent binary
 		util.SetProcessGroup(c)
 		c.WaitDelay = 10 * time.Second
@@ -266,4 +315,19 @@ func claudePassInvoker(townRoot, rigPath, worktree string) (reviewer.PassInvoker
 		}
 		return claudeAnswer(out)
 	}, nil
+}
+
+// writeTempSettings writes the pass guards to a private file outside the
+// worktree and returns its path.
+func writeTempSettings(settings []byte) (string, error) {
+	f, err := os.CreateTemp("", "gt-pass-settings-*.json")
+	if err != nil {
+		return "", fmt.Errorf("creating pass settings file: %w", err)
+	}
+	_, werr := f.Write(settings)
+	if err := errors.Join(werr, f.Close()); err != nil {
+		_ = os.Remove(f.Name())
+		return "", fmt.Errorf("writing pass settings file: %w", err)
+	}
+	return f.Name(), nil
 }

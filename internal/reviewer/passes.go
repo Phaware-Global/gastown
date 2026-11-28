@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 // The pass runner writes each perspective's raw result and a sidecar receipt
@@ -79,10 +81,34 @@ type PassSpec struct {
 // It must return an error unless the agent ran to completion.
 type PassInvoker func(ctx context.Context, prompt string) (string, error)
 
-// RunPass runs one perspective pass and writes its result and receipt into dir.
-// A pass that fails, or answers outside the PerspectiveResult contract twice,
-// leaves no receipt.
-func RunPass(ctx context.Context, dir string, spec PassSpec, invoke PassInvoker) (*PassReceipt, error) {
+// CompletedPass is a finished pass whose result and receipt are not yet on disk.
+type CompletedPass struct {
+	Receipt PassReceipt
+	result  []byte
+}
+
+// Write puts the pass's result and receipt into dir, at that perspective's own
+// paths. Both replace whatever is there, symlinks included.
+func (p *CompletedPass) Write(dir string) error {
+	name := p.Receipt.Perspective
+	if err := atomicfile.WriteFile(passResultPath(dir, name), p.result, 0o644); err != nil {
+		return fmt.Errorf("writing result: %w", err)
+	}
+	encoded, err := json.MarshalIndent(p.Receipt, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding receipt: %w", err)
+	}
+	if err := atomicfile.WriteFile(passReceiptPath(dir, name), append(encoded, '\n'), 0o644); err != nil {
+		return fmt.Errorf("writing receipt: %w", err)
+	}
+	return nil
+}
+
+// RunPass runs one perspective pass, keeping its prompt in dir. The result and
+// receipt are returned for the caller to Write once no other pass is running. A
+// pass that fails, or answers outside the PerspectiveResult contract twice,
+// returns neither.
+func RunPass(ctx context.Context, dir string, spec PassSpec, invoke PassInvoker) (*CompletedPass, error) {
 	if err := RemovePassArtifacts(dir, []string{spec.Perspective}); err != nil {
 		return nil, err
 	}
@@ -118,10 +144,7 @@ func RunPass(ctx context.Context, dir string, spec PassSpec, invoke PassInvoker)
 			spec.Prompt, verr, answer)
 	}
 
-	if err := os.WriteFile(passResultPath(dir, spec.Perspective), data, 0o644); err != nil { //nolint:gosec // operator-facing artifact
-		return nil, fmt.Errorf("writing result: %w", err)
-	}
-	receipt := &PassReceipt{
+	return &CompletedPass{result: data, Receipt: PassReceipt{
 		PassID:            hex.EncodeToString(id),
 		Perspective:       spec.Perspective,
 		PR:                spec.PR,
@@ -132,15 +155,7 @@ func RunPass(ctx context.Context, dir string, spec PassSpec, invoke PassInvoker)
 		ExtraInstructions: spec.ExtraInstructions,
 		StartedAt:         started,
 		FinishedAt:        time.Now().UTC(),
-	}
-	encoded, err := json.MarshalIndent(receipt, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("encoding receipt: %w", err)
-	}
-	if err := os.WriteFile(passReceiptPath(dir, spec.Perspective), append(encoded, '\n'), 0o644); err != nil { //nolint:gosec // operator-facing artifact
-		return nil, fmt.Errorf("writing receipt: %w", err)
-	}
-	return receipt, nil
+	}}, nil
 }
 
 // extractJSONObject drops any code fence or prose around the answer's object.

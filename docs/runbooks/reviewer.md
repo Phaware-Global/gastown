@@ -240,12 +240,15 @@ are still accounted for).
 `gt reviewer run --pr <N> --sha <head-sha> --round <r>` runs every enabled
 perspective on the checked-out head, in parallel, from a reviewer worktree. Each
 pass is a separate headless Claude process (also when the reviewer role is
-configured with another agent). It inherits the role's tool guards, loads no
-project settings from the PR's checkout, and gets only the codegraph MCP server.
+configured with another agent). It gets the role's tool guards, built from the
+hook configuration `gt hooks sync` uses and passed in a file outside the
+worktree. It loads only user-level settings, so nothing in the PR's checkout
+configures it, and its only MCP server is codegraph.
 
 The command writes `perspective-<name>.json` and `receipt-<name>.json` (pass id,
 PR, commit, prompt and result hashes, start and end times) to
-`<rig>/reviewer/passes/pr<N>/`. A failed pass leaves neither. The review
+`<rig>/reviewer/passes/pr<N>/` once every pass has exited, and prints each
+result's sha256. A failed pass leaves neither. The review
 sequence above does not depend on this command, and nothing checks the receipts.
 
 ### Findings JSON shape (consumed by `gt reviewer post`)
