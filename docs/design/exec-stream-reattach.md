@@ -704,7 +704,7 @@ worker's both count from `idle_since` (§3.1):
   (`service.go:1014-1044`). This is the rule that would have released the
   three sessions in §1.1.
 - **Launcher window** (§3.3, default 10 min), shorter than the detach timeout
-  so that a launcher giving up leaves time for a replace or adopt to find the
+  so that a launcher giving up leaves time for a replace to find the
   agent alive.
 
 `idle_since` starts when the worker *notices* the drop: at once for a closed
