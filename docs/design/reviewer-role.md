@@ -6,8 +6,8 @@ priority-badge parser widening) + the per-rig config surface (`review` block,
 `reviewer_local`, `reviewer_token_env`) landed. Remaining: Phase 2 dispatch
 (`gt reviewer request`/`done` + reviewer-worktree provisioning + session
 lifecycle) and Phase 3 (refinery patrol wiring) landed; deterministic
-perspective-prompt generation + parallel-subagent execution (`gt reviewer
-prompt`/`consolidate`) landed. Remaining: Phase 4 (crew), Phase 5 (Telegraph).
+perspective-prompt generation + parallel pass execution (`gt reviewer
+run`/`consolidate`) landed. Remaining: Phase 4 (crew), Phase 5 (Telegraph).
 **Created:** 2026-06-10
 **Replaces:** Augment (GitHub-org review app) in the refinery PR review loop
 **Cross-references:** [refinery-pr-workflow.md](refinery-pr-workflow.md),
@@ -81,8 +81,8 @@ observability. Rejected.
 - Reviewing PRs on repos that are not registered rigs.
 - Comment-triggered reviews of human-authored PRs (Phase 5, via Telegraph).
 - Multi-*session* perspective review (one ephemeral agent session per
-  perspective). v1 runs perspectives in parallel as **subagents within the one
-  reviewer session** (`gt reviewer prompt` per lens → parallel subagents → `gt
+  perspective). v1 runs perspectives as **headless passes under the one
+  reviewer session** (`gt reviewer run`, parallel headless passes → `gt
   reviewer consolidate`); a multi-session variant remains a possible later
   optimization but is not required for parallelism.
 - Replacing the human approver, the count gate, or any merge-gate semantics.
@@ -122,7 +122,7 @@ Polecat            Witness          Refinery                Reviewer            
   │                   │                ├─ await-review          ├─ checkout PR branch│
   │                   │                │   --no-trigger (poll)  ├─ codegraph context │
   │                   │                │                       ├─ N perspective     │
-  │                   │                │                       │   subagents ∥ then  │
+  │                   │                │                       │   passes ∥ then     │
   │                   │                │                       │   consolidate       │
   │                   │                │                       ├─ gh: post review ──▶│ threads
   │                   │                │                       ├─ gt reviewer done   │
@@ -221,8 +221,8 @@ explicitly accepts.
 
 Two things bound that. The abandon window is the rig's stuck threshold rather
 than a flat 15 minutes, so it clears the documented no-touch gap in which a
-healthy review legitimately writes nothing (the perspective subagents run
-entirely between `gt reviewer prompt` and `gt reviewer consolidate`). And the
+healthy review legitimately writes nothing (the perspective passes run
+entirely between `gt reviewer run` and `gt reviewer consolidate`). And the
 reaper corroborates with `IsIdle` before acting, so a session still producing
 output is not killed on the strength of a deleted file. Neither makes deletion
 free; both make it insufficient on its own.
@@ -233,8 +233,8 @@ ZFC design for exactly this reason.
 Two fields carry the load, and they answer different questions:
 
 - **`timestamp`** — when the current phase was entered. Its age is a *progress*
-  signal. Note that the perspective subagents run entirely between the last
-  `gt reviewer prompt` and `gt reviewer consolidate`, so a heartbeat parked at
+  signal. Note that the perspective passes run entirely between
+  `gt reviewer run` and `gt reviewer consolidate`, so a heartbeat parked at
   `prompt` is the normal shape of a review in flight, not by itself evidence of
   a wedge.
 - **`started_at`** — when the review was dispatched, preserved across every
@@ -243,7 +243,7 @@ Two fields carry the load, and they answer different questions:
   new review with its own budget, not a continuation of round 1.
 
   An in-session **phase** touch cannot reseed it, and cannot set the review
-  identity either: `gt reviewer prompt`/`post`/`consolidate` update only
+  identity either: `gt reviewer run`/`post`/`consolidate` update only
   `timestamp` and `phase`. The one exception is `gt reviewer checkout`, which
   starts a fresh clock when it checks out a PR other than the one on record —
   the queued-behind-a-wedge case, where the dispatcher's seed was deliberately
@@ -335,9 +335,8 @@ propulsion principle, completion protocol):
      dispatch). Re-review the **full diff** at the new SHA, but do NOT raise
      new findings on code unchanged since the last reviewed SHA unless a fix
      commit changed its behavior — no relitigation.
-   - Generate each enabled perspective's prompt (`gt reviewer prompt`) and run
-     the passes **in parallel** as subagents; collect one `PerspectiveResult`
-     per perspective.
+   - Run every enabled perspective **in parallel** (`gt reviewer run`), which
+     writes one `PerspectiveResult` and receipt per perspective.
    - Consolidate (`gt reviewer consolidate`) to deduplicate findings
      deterministically, then post **one** GitHub review via
      `gt reviewer post --pr <n> --findings <json>` — the only sanctioned
@@ -445,21 +444,22 @@ by the agent:
 
 1. `gt reviewer checkout <pr> --sha <sha>` — one detached checkout at the
    reviewed SHA, one warmed codegraph context.
-2. `gt reviewer prompt <name> --pr <pr> --sha <sha> --round <r>` per enabled
-   perspective — emits the lens + the shared execution contract + the output
-   schema. This is the single source of truth a pass executes from.
-3. The reviewer launches **one subagent per perspective in parallel**, each
-   reviewing strictly from its generated prompt and returning a
-   `PerspectiveResult` JSON object (`perspective` + required `verdict` +
-   `findings`).
-4. `gt reviewer consolidate perspective-*.json` deduplicates findings
-   deterministically (by `path:line:title`, highest priority wins, perspective
-   tags unioned) and builds a summary with a verdict line for every perspective.
-5. `gt reviewer post` posts the single consolidated review.
+2. `gt reviewer run --pr <pr> --sha <sha> --round <r>` — for each enabled
+   perspective, builds the prompt (lens + shared execution contract + output
+   schema; `gt reviewer prompt` prints the same text).
+3. The same command runs **one headless agent per perspective in parallel** and
+   writes each `PerspectiveResult` with a receipt binding it to the PR, commit,
+   prompt and run times.
+4. `gt reviewer consolidate --pr <pr> --sha <sha>` fails unless every enabled
+   perspective's receipt verifies, then deduplicates findings deterministically
+   (by `path:line`, highest priority wins, perspective tags unioned) and builds a
+   summary with a verdict line for every perspective.
+5. `gt reviewer post` re-verifies the receipts, rebuilds the payload, and posts
+   the single consolidated review.
 
 Determinism is the design point: prompt generation, dedup, and the output
 contract are tested Go (`internal/reviewer/prompt.go`, `consolidate.go`); only
-the per-lens judgment is left to the subagents. The `review.parallel` config flag
+the per-lens judgment is left to the passes. The `review.parallel` config flag
 is retained for a possible later multi-*session* variant, but parallelism across
 perspectives no longer depends on it — it is the default execution shape.
 

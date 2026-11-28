@@ -63,7 +63,7 @@ type PromptParams struct {
 	MaxFindings int
 	// MaxDuration is the pass's soft wall-clock budget, rendered into the
 	// contract as a self-imposed deadline. Nothing enforces it from outside the
-	// subagent's session — the point is that a pass which runs long returns a
+	// pass's own process — the point is that a pass which runs long returns a
 	// partial result with an honest verdict instead of hanging the whole review
 	// until the daemon kills the reviewer and discards everything it found.
 	// Below MinPassDuration (including zero) is corrected UP to that floor; a
@@ -79,7 +79,7 @@ type PromptParams struct {
 // BuildPerspectivePrompt renders the fully-resolved prompt for a single
 // perspective review pass: the lens, the shared execution contract (injected via
 // the SharedInstructions template variable), and any extra instructions. The
-// result is the source of truth a review subagent executes from — no reviewer
+// result is the source of truth a review pass executes from — no reviewer
 // heuristics, no per-agent reinterpretation of the procedure.
 func BuildPerspectivePrompt(p PromptParams) (string, error) {
 	if strings.TrimSpace(p.Perspective) == "" {

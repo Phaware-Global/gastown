@@ -27,9 +27,8 @@ Refinery (merge_strategy=pr)                Reviewer (gt-<rig>-reviewer)        
   │ wait CI green                                                                  │
   ├─ reviewer_local? → gt reviewer request <pr> --mr <id> ──▶ (bead + session)     │
   │                                          ├─ gt reviewer checkout <pr> --sha …  │
-  │                                          ├─ gt reviewer prompt <p> (per lens)   │
-  │                                          ├─ N perspective subagents IN PARALLEL │
-  │                                          ├─ gt reviewer consolidate *.json      │
+  │                                          ├─ gt reviewer run (passes ∥, receipts)│
+  │                                          ├─ gt reviewer consolidate             │
   │                                          ├─ gt reviewer post --pr N --findings ▶ inline threads
   │                                          └─ gt reviewer done (self-terminate)   │
   ├─ gt refinery pr await-review --no-trigger (polls for the review)               │
@@ -151,8 +150,8 @@ gt reviewer perspectives --show security  # prints a perspective's resolved prom
 The perspective markdown is only the **lens** ("what to look for"). The
 deterministic **execution contract** ("how to review, what to return") lives in
 one place — a shared, templated instruction block — and is injected into every
-generated prompt. The Reviewer never hand-writes a pass prompt; it generates one
-per perspective:
+generated prompt. The Reviewer never hand-writes a pass prompt; `gt reviewer
+run` generates one per perspective, and this prints it:
 
 ```bash
 gt reviewer prompt <name> --pr <N> --sha <head-sha> --round <r> \
@@ -211,29 +210,31 @@ gt reviewer request <N> [--mr <mr-bead-id>]
 
 # Inside the reviewer session, the role checks out, reviews in parallel, and posts:
 gt reviewer checkout <N> --sha <head-sha>          # detached checkout at the reviewed SHA
-gt reviewer prompt adversarial --pr <N> --sha <head-sha> --round 1 > prompt-adversarial.txt
-gt reviewer prompt security    --pr <N> --sha <head-sha> --round 1 > prompt-security.txt
-#   → launch one subagent per prompt IN PARALLEL; each returns a PerspectiveResult JSON
-#     saved to perspective-<name>.json
-gt reviewer consolidate perspective-*.json --sha <head-sha> --out findings.json
+gt reviewer run --pr <N> --sha <head-sha> --round 1  # every enabled pass; writes results + receipts
+gt reviewer consolidate --pr <N> --sha <head-sha> --out findings.json
 # Findings outside the PR diff are demoted to non-blocking. The diff base is
 # derived automatically; --base-sha <merge-base> overrides it.
 gt reviewer post --pr <N> --findings findings.json # the ONLY sanctioned posting path
 gt reviewer done                                    # clear state + self-terminate the session
 ```
 
-`gt reviewer checkout` and `gt reviewer post` refuse to run outside a reviewer
-worktree (`<rig>/reviewer/rig`). `gt reviewer prompt` and `gt reviewer
-consolidate` are pure generators/transformers — no GitHub calls — and run
-anywhere in the rig.
+`gt reviewer checkout`, `run` and `post` refuse to run outside a reviewer
+worktree (`<rig>/reviewer/rig`). `gt reviewer prompt` only generates text.
 
-The Reviewer runs perspective passes **in parallel** (one subagent per enabled
-perspective, each reviewing strictly from its generated prompt), then
-deterministically deduplicates the collected findings with `gt reviewer
-consolidate` before the single `post`. Dedup keys on `(path, line, title)`, keeps
-the highest priority, and unions the perspective tags; the consolidated summary
-carries a verdict line for **every** perspective (perspectives with no findings
-are still accounted for).
+Each pass is a separate headless Claude process (also when the reviewer role is
+configured with another agent). It inherits the role's tool guards, loads no
+project settings from the PR's checkout, and gets only the codegraph MCP server.
+
+`consolidate` and `post` fail unless every enabled perspective has a receipt
+(`receipt-<name>.json`: pass id, PR, commit, prompt and result hashes, start and
+end times) matching its result and prompt. `post` also rebuilds the payload from
+those results and refuses a different one. The coordinator trims through
+`consolidate --drop`, `--drop-opportunity`, `--reanchor` and `--verdict`; the
+review body lists those edits and each pass's end time. Receipts are unsigned,
+so this stops shortcuts, not deliberate forgery by a session with shell access.
+
+Dedup keys on `(path, line)`, keeps the highest priority, and unions the
+perspective tags; the summary carries a verdict line for **every** perspective.
 
 ### Findings JSON shape (consumed by `gt reviewer post`)
 

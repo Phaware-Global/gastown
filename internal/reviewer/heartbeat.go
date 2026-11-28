@@ -25,8 +25,8 @@ const (
 	PhaseDispatched = "dispatched"
 	// PhaseCheckout is written by `gt reviewer checkout`.
 	PhaseCheckout = "checkout"
-	// PhasePrompt is written by `gt reviewer prompt`, once per perspective. The
-	// long, unobserved subagent passes run immediately after the last one — so a
+	// PhasePrompt is written by `gt reviewer run` (and `prompt`). The
+	// long, unobserved passes run immediately after it — so a
 	// heartbeat parked at "prompt" is the expected shape of a review in flight,
 	// not by itself evidence of a wedge. See Age vs Elapsed below.
 	PhasePrompt = "prompt"

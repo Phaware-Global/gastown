@@ -87,6 +87,8 @@ type Findings struct {
 	// diff line, which normalizeFinding's path+line requirement makes
 	// inexpressible as a finding.
 	Disposition string `json:"disposition,omitempty"`
+	// Edits are the coordinator's changes to the pass results.
+	Edits *Edits `json:"edits,omitempty"`
 }
 
 // Length budgets for a single finding, in runes.
@@ -408,6 +410,9 @@ func (fs *Findings) SummaryBody(reviewedSHA string) string {
 		b.WriteString("\n")
 	}
 	fs.Summary.render(&b)
+	if !fs.Edits.IsZero() {
+		fmt.Fprintf(&b, "\n_Reviewer edits to the pass results: %s._\n", fs.Edits.describe())
+	}
 	b.WriteString("\n---\n\n")
 	b.WriteString(fs.countLine())
 	sha := reviewedSHA

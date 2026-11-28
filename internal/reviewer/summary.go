@@ -40,6 +40,9 @@ type ReviewSummary struct {
 type PerspectiveVerdict struct {
 	Perspective string `json:"perspective"`
 	Verdict     string `json:"verdict"`
+	// PassFinishedAt and ExtraInstructions come from the pass receipt.
+	PassFinishedAt    string `json:"pass_finished_at,omitempty"`
+	ExtraInstructions bool   `json:"extra_instructions,omitempty"`
 }
 
 // Content budgets for the summary template, in runes.
@@ -172,7 +175,15 @@ func (s *ReviewSummary) Normalize(ctx string) error {
 func (s *ReviewSummary) render(b *strings.Builder) {
 	b.WriteString("### Verdicts\n\n")
 	for _, v := range s.Verdicts {
-		fmt.Fprintf(b, "- **%s** — %s\n", v.Perspective, v.Verdict)
+		fmt.Fprintf(b, "- **%s** — %s", v.Perspective, v.Verdict)
+		if v.PassFinishedAt != "" {
+			fmt.Fprintf(b, " _(pass finished %s", v.PassFinishedAt)
+			if v.ExtraInstructions {
+				b.WriteString("; prompt had extra instructions")
+			}
+			b.WriteString(")_")
+		}
+		b.WriteString("\n")
 	}
 	if len(s.Opportunities) == 0 {
 		return

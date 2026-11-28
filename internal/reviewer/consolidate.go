@@ -6,7 +6,7 @@ import (
 )
 
 // PerspectiveResult is the structured output a single perspective review pass
-// (one subagent) returns: a required one-line verdict plus zero or more
+// returns: a required one-line verdict plus zero or more
 // findings. It is the deterministic machine contract between a perspective pass
 // and the consolidation step — the reviewer collects one of these per enabled
 // perspective and consolidates them into the single posted review.
@@ -273,7 +273,7 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffM
 				// duplicate's paths would let a lens that omitted them mask a
 				// lens that named them honestly — and the merged finding would
 				// post as a blocking demand for work in untouched files. Whether
-				// that happened would depend on subagent arrival order.
+				// that happened would depend on pass order.
 				out[idx].RemediationPaths = mergeRemediationPaths(
 					out[idx].RemediationPaths, f.RemediationPaths)
 				// Preserve perspective-specific detail rather than discarding the

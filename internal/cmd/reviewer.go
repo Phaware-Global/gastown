@@ -53,6 +53,13 @@ var (
 	reviewerConsolidateOut     string
 
 	reviewerDonePR int
+
+	reviewerPassDir             string
+	reviewerConsolidatePR       int
+	reviewerEditDrop            []string
+	reviewerEditDropOpportunity []string
+	reviewerEditReanchor        []string
+	reviewerEditVerdict         []string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -195,21 +202,27 @@ codegraph tooling, the evidence standard, and the exact output JSON schema. The
 perspective markdown supplies only the lens; this command supplies the rest, so
 no part of the procedure is left to per-agent interpretation.
 
-The reviewer role generates one prompt per enabled perspective and hands each to
-a subagent, which reviews from that prompt alone and returns a PerspectiveResult
-JSON object. The prompt is written to stdout.`,
+'gt reviewer run' executes this same prompt for each enabled perspective; this
+command only prints it.
+The prompt is written to stdout.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runReviewerPrompt,
 }
 
 var reviewerConsolidateCmd = &cobra.Command{
-	Use:   "consolidate [result.json ...]",
+	Use:   "consolidate",
+	Args:  cobra.NoArgs,
 	Short: "Merge per-perspective results into one findings payload for post",
-	Long: `Consolidate per-perspective subagent results into a single findings payload.
+	Long: `Consolidate per-perspective pass results into a single findings payload.
 
-Each input is a PerspectiveResult JSON object (perspective + verdict + findings),
-one per enabled perspective. Pass them as file arguments, or pipe a JSON array of
-them on stdin. The output is the findings JSON that 'gt reviewer post' consumes:
+The inputs are the results 'gt reviewer run' wrote to --dir, one per enabled
+perspective. Consolidation fails unless every one has a receipt matching the
+result, the prompt, the PR and the commit; hand-written or edited results are
+refused. To change what is posted, use the edit flags, which address findings and
+opportunities by 1-based position in the result file and are disclosed in the
+review body.
+
+The output is the findings JSON that 'gt reviewer post' consumes:
 
   - the summary lists every perspective's verdict (perspectives with no findings
     are still accounted for — never silent),
@@ -242,7 +255,8 @@ func init() {
 	reviewerPostCmd.Flags().StringVar(&reviewerPostFindings, "findings", "",
 		`findings JSON file, or "-" for stdin (required)`)
 	reviewerPostCmd.Flags().StringVar(&reviewerPostSHA, "sha", "",
-		"head SHA to anchor the review to (default: PR's current head)")
+		"reviewed head SHA (must match the findings payload; default: its reviewed_sha)")
+	reviewerPostCmd.Flags().StringVar(&reviewerPassDir, "dir", ".", "directory holding the pass results and receipts")
 	_ = reviewerPostCmd.MarkFlagRequired("pr")
 	_ = reviewerPostCmd.MarkFlagRequired("findings")
 
@@ -286,7 +300,19 @@ func init() {
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
-		"reviewed head SHA to record in the consolidated payload")
+		"reviewed head SHA; the pass receipts must be for it (required)")
+	reviewerConsolidateCmd.Flags().IntVar(&reviewerConsolidatePR, "pr", 0, "PR number under review (required)")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerPassDir, "dir", ".", "directory holding the pass results and receipts")
+	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditDrop, "drop", nil,
+		"drop a finding: perspective:N (repeatable)")
+	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditDropOpportunity, "drop-opportunity", nil,
+		"drop an opportunity: perspective:N (repeatable)")
+	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditReanchor, "reanchor", nil,
+		"move a finding to another line: perspective:N=LINE (repeatable)")
+	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditVerdict, "verdict", nil,
+		"shorten a verdict: perspective=text (repeatable)")
+	_ = reviewerConsolidateCmd.MarkFlagRequired("pr")
+	_ = reviewerConsolidateCmd.MarkFlagRequired("sha")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
 		"merge-base the PR is diffed against; enables scope classification "+
 			"(findings outside the diff post as non-blocking)")
@@ -297,6 +323,20 @@ func init() {
 		"the PR just reviewed; clears the heartbeat only if it records that review "+
 			"(omit to clear unconditionally)")
 
+	reviewerRunCmd.Flags().IntVar(&reviewerPromptPR, "pr", 0, "PR number under review (required)")
+	reviewerRunCmd.Flags().StringVar(&reviewerPromptSHA, "sha", "", "exact head SHA to review (required)")
+	reviewerRunCmd.Flags().IntVar(&reviewerPromptRound, "round", 1, "review round (>=2 is a fix round)")
+	reviewerRunCmd.Flags().StringVar(&reviewerPromptPriorThreads, "prior-threads", "",
+		"file of prior-round thread context; only used when round >= 2")
+	reviewerRunCmd.Flags().StringVar(&reviewerPromptInstructions, "instructions", "",
+		"file of extra execution instructions (disclosed in the review body)")
+	reviewerRunCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0, "per-pass finding cap")
+	reviewerRunCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0, "soft wall-clock budget per pass")
+	reviewerRunCmd.Flags().StringVar(&reviewerPassDir, "dir", ".", "directory to write results and receipts to")
+	_ = reviewerRunCmd.MarkFlagRequired("pr")
+	_ = reviewerRunCmd.MarkFlagRequired("sha")
+
+	reviewerCmd.AddCommand(reviewerRunCmd)
 	reviewerCmd.AddCommand(reviewerPostCmd)
 	reviewerCmd.AddCommand(reviewerCheckoutCmd)
 	reviewerCmd.AddCommand(reviewerPerspectivesCmd)
@@ -395,7 +435,11 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	findings, err := reviewer.ParseFindings(data)
+	supplied, err := reviewer.ParseFindings(data)
+	if err != nil {
+		return err
+	}
+	findings, err := gateReviewPost(reviewerPostPR, reviewerPostSHA, supplied)
 	if err != nil {
 		return err
 	}
@@ -405,30 +449,8 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Anchor the review to the SHA actually reviewed so it is SHA-scoped for
-	// the refinery's engagement gate. Resolution order: --sha flag, then the
-	// findings payload's reviewed_sha (the SHA the Reviewer checked out and
-	// reviewed), then the PR's current head as a best-effort fallback. Honoring
-	// reviewed_sha preserves the "review exactly the requested SHA" contract
-	// even if the PR head moved between checkout and post.
-	sha := reviewerPostSHA
-	if sha == "" {
-		sha = findings.ReviewedSHA
-	}
-	if sha == "" {
-		if head, herr := provider.CurrentHeadSHA(reviewerPostPR); herr == nil {
-			sha = head
-		}
-	}
-	// A review with inline findings MUST be anchored to a commit: GitHub rejects
-	// the review API call without commit_id when comments are present, and the
-	// refinery's SHA-scoped engagement gate needs it to observe the review.
-	// Fail loudly rather than post a review the refinery will never see.
-	if sha == "" && len(findings.Findings) > 0 {
-		return fmt.Errorf("could not resolve a commit SHA to anchor PR #%d's review "+
-			"(pass --sha, or set reviewed_sha in the findings payload): a review with "+
-			"inline findings requires a commit_id", reviewerPostPR)
-	}
+	// Anchor to the SHA the passes reviewed, even if the PR head has moved.
+	sha := findings.ReviewedSHA
 
 	in := findings.BuildReviewInput(sha)
 	if err := postReviewAndClearStaleBlock(provider, cfg, reviewerPostPR, in); err != nil {
@@ -548,6 +570,12 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 		target = shortSHA(target)
 	}
 	fmt.Printf("Checked out PR #%d (%s) in %s\n", prNumber, target, cwd)
+
+	if names, err := reviewerEnabledPerspectives(); err != nil {
+		style.PrintWarning("earlier pass results not cleared: %v", err)
+	} else if err := reviewer.RemovePassArtifacts(cwd, names); err != nil {
+		return err
+	}
 
 	// Deterministically (re)build the codegraph index for the checked-out head so
 	// the review runs against a real index instead of silently degrading to
@@ -694,11 +722,6 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	// still leaves evidence that the review reached the prompt phase.
 	touchReviewerPhase(reviewer.PhasePrompt)
 
-	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
-	if err != nil {
-		return err
-	}
-
 	// stdin can only be consumed once, so both inputs cannot read from it.
 	if reviewerPromptPriorThreads == "-" && reviewerPromptInstructions == "-" {
 		return fmt.Errorf("--prior-threads and --instructions cannot both read from stdin (\"-\")")
@@ -712,6 +735,24 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("reading --instructions: %w", err)
 	}
 
+	out, err := buildReviewerPassPrompt(townRoot, rigName, rigPath, reviewCfg, perspective,
+		resolveReviewBaseSHA(reviewerPromptPR, reviewerPromptSHA), priorThreads, extra)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// buildReviewerPassPrompt renders one perspective's prompt from the
+// reviewerPrompt* flags and the already-read inputs.
+func buildReviewerPassPrompt(townRoot, rigName, rigPath string, reviewCfg *config.ReviewConfig,
+	perspective, baseSHA, priorThreads, extra string) (string, error) {
+	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
+	if err != nil {
+		return "", err
+	}
+
 	maxFindings := reviewerPromptMaxFindings
 	if maxFindings <= 0 && reviewCfg != nil {
 		// GetMaxFindingsPerPerspective is itself nil-safe; the explicit guard
@@ -719,24 +760,19 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		maxFindings = reviewCfg.GetMaxFindingsPerPerspective()
 	}
 
-	out, err := reviewer.BuildPerspectivePrompt(reviewer.PromptParams{
+	return reviewer.BuildPerspectivePrompt(reviewer.PromptParams{
 		Perspective:       rp.Name,
 		Lens:              rp.Content,
 		RigName:           rigName,
 		PR:                reviewerPromptPR,
 		SHA:               reviewerPromptSHA,
-		BaseSHA:           resolveReviewBaseSHA(reviewerPromptPR, reviewerPromptSHA),
+		BaseSHA:           baseSHA,
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
 		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
-	if err != nil {
-		return err
-	}
-	fmt.Print(out)
-	return nil
 }
 
 // resolveReviewBaseSHA computes the pinned diff base for a review pass: the
@@ -792,58 +828,20 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// on the heartbeat, so the record stays complete across the phase change.
 	touchReviewerPhase(reviewer.PhaseConsolidate)
 
-	var results []reviewer.PerspectiveResult
-
-	if len(args) == 0 {
-		// No file args: read a JSON array of PerspectiveResult objects from
-		// stdin. Re-marshal each element and run it through ParsePerspectiveResult
-		// so stdin and file inputs get identical validation/normalization.
-		// Guard against a hang when stdin is an interactive terminal (no pipe).
-		if stat, statErr := os.Stdin.Stat(); statErr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
-			return fmt.Errorf("no result files given and stdin is a terminal; " +
-				"pass result.json file arguments or pipe a JSON array of results")
-		}
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf("reading results from stdin: %w", err)
-		}
-		var raw []json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("parsing results array from stdin: %w", err)
-		}
-		if len(raw) == 0 {
-			return fmt.Errorf("no perspective results on stdin")
-		}
-		for i, elem := range raw {
-			r, perr := reviewer.ParsePerspectiveResult(elem)
-			if perr != nil {
-				return fmt.Errorf("stdin result[%d]: %w", i, perr)
-			}
-			results = append(results, *r)
-		}
-	} else {
-		for _, path := range args {
-			data, err := os.ReadFile(path) //nolint:gosec // operator-supplied result file
-			if err != nil {
-				return fmt.Errorf("reading result file %s: %w", path, err)
-			}
-			r, perr := reviewer.ParsePerspectiveResult(data)
-			if perr != nil {
-				return fmt.Errorf("%s: %w", path, perr)
-			}
-			results = append(results, *r)
-		}
+	if reviewerConsolidatePR <= 0 {
+		return fmt.Errorf("--pr must be a positive PR number")
 	}
-
-	// Build the diff manifest so findings can be classified against what this
-	// PR actually changed. Best-effort by design: --base-sha is optional, and a
-	// git failure yields a nil manifest, which classifies everything as
-	// ScopeUnknown and changes nothing. Scope filtering must never be able to
-	// silently downgrade a review just because git was unavailable — a missing
-	// manifest is missing evidence, not evidence of good scope.
-	manifest := buildDiffManifest(resolveConsolidateBaseSHA(), reviewerConsolidateSHA)
-
-	fs := reviewer.Consolidate(results, reviewerConsolidateSHA, manifest)
+	edits := &reviewer.Edits{
+		Drop:            reviewerEditDrop,
+		DropOpportunity: reviewerEditDropOpportunity,
+		Reanchor:        reviewerEditReanchor,
+		Verdict:         reviewerEditVerdict,
+		BaseSHA:         strings.TrimSpace(reviewerConsolidateBaseSHA),
+	}
+	fs, err := consolidateVerifiedPasses(reviewerConsolidatePR, reviewerConsolidateSHA, edits)
+	if err != nil {
+		return err
+	}
 
 	// Report the event on STDERR, before the --out branch, so every invocation
 	// gets it. Posting is irreversible and the Reviewer cannot clear its own
@@ -877,6 +875,11 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encoding consolidated findings: %w", err)
 	}
 	encoded = append(encoded, '\n')
+	// 'post' enforces the finding budgets, and the payload cannot be hand-edited,
+	// so an overrun has to surface here.
+	if _, err := reviewer.ParseFindings(encoded); err != nil {
+		return fmt.Errorf("%w\n\nUse --drop or --reanchor and re-run consolidate; nothing was written", err)
+	}
 
 	if reviewerConsolidateOut != "" {
 		if err := os.WriteFile(reviewerConsolidateOut, encoded, 0o644); err != nil { //nolint:gosec // operator-facing output

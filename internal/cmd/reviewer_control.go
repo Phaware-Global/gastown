@@ -56,7 +56,7 @@ in that phase, and total review wall time — the numbers the daemon's reaper
 acts on.
 
 Note that a heartbeat parked at "prompt" is the NORMAL shape of a review in
-flight: the perspective subagents run between 'gt reviewer prompt' and
+flight: the perspective passes run between 'gt reviewer run' and
 'gt reviewer consolidate' with no command in between to refresh it. Judge by
 total elapsed rather than phase age alone.
 
