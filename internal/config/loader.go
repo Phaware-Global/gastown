@@ -2740,6 +2740,9 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		if err := verifyCheckoutIsolation(rc, resolvedEnv, RoleSettingsFile(rc, role, rigPath)); err != nil {
 			return "", err
 		}
+		if err := pinCheckoutTools(rc, resolvedEnv, filepath.Join(rigPath, role, "rig")); err != nil {
+			return "", err
+		}
 	}
 
 	var cmd string

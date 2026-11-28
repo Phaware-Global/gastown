@@ -304,8 +304,24 @@ func init() {
 	reviewerCmd.AddCommand(reviewerConsolidateCmd)
 	reviewerCmd.AddCommand(reviewerRequestCmd)
 	reviewerCmd.AddCommand(reviewerDoneCmd)
+	reviewerCmd.AddCommand(reviewerCodegraphMCPCmd)
 
 	rootCmd.AddCommand(reviewerCmd)
+}
+
+// reviewerCodegraphMCPCmd is what the reviewer's MCP configuration runs.
+var reviewerCodegraphMCPCmd = &cobra.Command{
+	Use:    config.CodegraphMCPArg,
+	Short:  "Serve the code graph over MCP from a pinned codegraph install",
+	Args:   cobra.NoArgs,
+	Hidden: true,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		server, err := rig.CodegraphMCPCommand(cmd.Context())
+		if err != nil {
+			return err
+		}
+		return becomeProcess(server)
+	},
 }
 
 // requireReviewerWorktree fails unless the current directory resolves to the

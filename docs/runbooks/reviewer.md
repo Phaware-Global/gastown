@@ -314,10 +314,23 @@ are the PR author's. The session is launched so that none of them configure it:
 - `--setting-sources user`: the checkout's `.claude/settings.json` and
   `.claude/settings.local.json`, and its project commands, agents and skills,
   are not loaded.
-- `--strict-mcp-config` with `--mcp-config` naming only the codegraph server:
+- `--strict-mcp-config` with `--mcp-config` naming the codegraph server:
   `.mcp.json` is ignored, and so are MCP servers from user settings and plugins.
-  To give the reviewer others, set `--strict-mcp-config --mcp-config
-  /absolute/path.json` in its agent's `args`.
+  To give the reviewer others, set `--mcp-config /absolute/path.json` in its
+  agent's `args`; they are added to codegraph. A server named `codegraph` in
+  that file would compete with the built-in one, so do not use that name. Give
+  each server an absolute `command`: a bare or relative one is looked up from
+  the checkout.
+
+So that the checkout cannot choose which programs run:
+
+- The codegraph server is started as `gt reviewer codegraph-mcp`, which runs
+  codegraph and its Node by absolute path (never a version-manager shim) with
+  secret variables removed.
+- The agent binary is resolved to an absolute path before launch.
+- `MISE_IGNORED_CONFIG_PATHS` includes the reviewer checkout, so mise shims for
+  `go`, `node` and the like ignore its `mise.toml` and version files. Other
+  version managers, and relative `PATH` entries, are not covered.
 
 The reviewer refuses to start, naming the reason, if its agent is not Claude
 Code, or if the agent's command or arguments would let the checkout back in

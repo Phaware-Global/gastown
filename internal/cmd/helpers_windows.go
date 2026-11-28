@@ -81,6 +81,12 @@ func execAgent(cfg *config.RuntimeConfig, prompt string) error {
 	return nil // unreachable
 }
 
+// becomeProcess runs c in place of the current process.
+func becomeProcess(c *exec.Cmd) error {
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return c.Run()
+}
+
 // execRuntime runs the runtime CLI, replacing the current process.
 // Uses os/exec.Command with stdio passthrough since syscall.Exec is Unix-only.
 func execRuntime(prompt, rigPath, configDir string) error {

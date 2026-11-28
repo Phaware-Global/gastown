@@ -43,6 +43,12 @@ func attachToTmuxSession(sessionID string) error {
 	return syscall.Exec(tmuxPath, args, os.Environ())
 }
 
+// becomeProcess replaces the current process with c, so that whoever stops this
+// one stops c.
+func becomeProcess(c *exec.Cmd) error {
+	return syscall.Exec(c.Path, c.Args, c.Env)
+}
+
 // execAgent execs the configured agent, replacing the current process.
 // Used when we're already in the target session and just need to start the agent.
 // If prompt is provided, it's passed as the initial prompt.
