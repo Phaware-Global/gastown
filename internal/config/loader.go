@@ -1643,6 +1643,7 @@ func withRoleSettingsFlag(rc *RuntimeConfig, role, rigPath string) *RuntimeConfi
 
 	if runsInPRCheckout(role) {
 		rc.Args = addCheckoutIsolationFlags(rc.Args, settingsFile)
+		pinCheckoutTools(rc, role, rigPath)
 		return rc
 	}
 
@@ -2738,9 +2739,6 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 			return "", fmt.Errorf("refusing to start in a PR checkout: no rig path to locate the %s settings", role)
 		}
 		if err := verifyCheckoutIsolation(rc, resolvedEnv, RoleSettingsFile(rc, role, rigPath)); err != nil {
-			return "", err
-		}
-		if err := pinCheckoutTools(rc, resolvedEnv, filepath.Join(rigPath, role, "rig")); err != nil {
 			return "", err
 		}
 	}

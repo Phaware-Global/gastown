@@ -123,6 +123,7 @@ func TestReviewerStartRefused(t *testing.T) {
 		{"end of flags", claude("--"), `"--"`},
 		{"relative binary", &RuntimeConfig{Provider: "claude", Command: "./claude"}, "command"},
 		{"relative config dir", &RuntimeConfig{Provider: "claude", Command: "claude", Env: map[string]string{"CLAUDE_CONFIG_DIR": ".claude"}}, "CLAUDE_CONFIG_DIR"},
+		{"agent not on PATH", &RuntimeConfig{Provider: "claude", Command: "no-such-claude"}, "absolute path"},
 		{"not claude", &RuntimeConfig{Provider: "codex", Command: "codex"}, "not Claude Code"},
 	}
 	for _, tt := range tests {
@@ -149,7 +150,7 @@ func TestVerifyCheckoutIsolationSettingsPath(t *testing.T) {
 		{".claude/settings.json", true},
 		{"", true},
 	} {
-		rc := &RuntimeConfig{Provider: "claude", Command: "claude"}
+		rc := &RuntimeConfig{Provider: "claude", Command: filepath.Join(t.TempDir(), "claude")}
 		rc.Args = addCheckoutIsolationFlags(nil, tt.settings)
 		err := verifyCheckoutIsolation(rc, nil, tt.settings)
 		if refused := err != nil; refused != tt.refused {
@@ -175,8 +176,14 @@ func TestReviewerToolsPinned(t *testing.T) {
 		t.Errorf("MCP config = %s, want codegraph alone with an absolute command", checkoutMCPConfig())
 	}
 
-	_, rigPath := reviewerTestRig(t, nil)
+	townRoot, rigPath := reviewerTestRig(t, nil)
 	checkout := filepath.Join(rigPath, "reviewer", "rig")
+	// Respawns take their command and env from the resolved config alone.
+	t.Setenv("MISE_IGNORED_CONFIG_PATHS", checkout)
+	rc := ResolveRoleAgentConfig("reviewer", townRoot, rigPath)
+	if !filepath.IsAbs(rc.Command) || rc.Env["MISE_IGNORED_CONFIG_PATHS"] != checkout {
+		t.Errorf("resolved command %q, mise ignore %q", rc.Command, rc.Env["MISE_IGNORED_CONFIG_PATHS"])
+	}
 	for _, tt := range []struct{ inherited, want string }{
 		{"", checkout},
 		{"/etc/mise", "/etc/mise" + string(os.PathListSeparator) + checkout},

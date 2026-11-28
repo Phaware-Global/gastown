@@ -1,8 +1,10 @@
 package config
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,24 +45,28 @@ func checkoutMCPConfig() string {
 
 // pinCheckoutTools keeps the checkout from choosing which programs a session in
 // it runs, or their versions: the agent binary becomes an absolute path, and
-// mise is told to ignore configuration files in the checkout.
-func pinCheckoutTools(rc *RuntimeConfig, env map[string]string, checkout string) error {
-	if !strings.ContainsRune(rc.Command, '/') && !filepath.IsAbs(rc.Command) {
-		path, err := exec.LookPath(rc.Command)
-		if err != nil || !filepath.IsAbs(path) {
-			return fmt.Errorf("refusing to start in a PR checkout: no absolute path for %q: %v", rc.Command, err)
+// the reviewer's mise is told to ignore configuration files in its checkout.
+// A binary that cannot be resolved is left for verifyCheckoutIsolation.
+func pinCheckoutTools(rc *RuntimeConfig, role, rigPath string) {
+	command := cmp.Or(rc.Command, "claude")
+	if !strings.ContainsRune(command, '/') && !filepath.IsAbs(command) {
+		if path, err := exec.LookPath(command); err == nil && filepath.IsAbs(path) {
+			rc.Command = path
 		}
-		rc.Command = path
+	}
+	if role != constants.RoleReviewer {
+		return
 	}
 	const ignored = "MISE_IGNORED_CONFIG_PATHS"
-	if inherited := os.Getenv(ignored); env[ignored] == "" && inherited != "" {
-		env[ignored] = inherited
+	checkout := filepath.Join(rigPath, role, "rig")
+	paths := filepath.SplitList(cmp.Or(rc.Env[ignored], os.Getenv(ignored)))
+	if !slices.Contains(paths, checkout) {
+		paths = append(paths, checkout)
 	}
-	if env[ignored] != "" {
-		env[ignored] += string(os.PathListSeparator)
-	}
-	env[ignored] += checkout
-	return nil
+	env := map[string]string{} // rc.Env may be shared with an agent preset
+	maps.Copy(env, rc.Env)
+	env[ignored] = strings.Join(paths, string(os.PathListSeparator))
+	rc.Env = env
 }
 
 // runsInPRCheckout reports whether sessions of role start inside a PR checkout.
@@ -108,6 +114,9 @@ func verifyCheckoutIsolation(rc *RuntimeConfig, env map[string]string, settingsF
 		if strings.ContainsRune(program, '/') && !filepath.IsAbs(program) {
 			return refuse("command %q is a relative path", program)
 		}
+	}
+	if !filepath.IsAbs(rc.Command) {
+		return refuse("command %q has no absolute path", rc.Command)
 	}
 	if dir := env["CLAUDE_CONFIG_DIR"]; dir != "" && !filepath.IsAbs(dir) {
 		return refuse("CLAUDE_CONFIG_DIR %q is a relative path", dir)
