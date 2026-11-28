@@ -12,6 +12,39 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Contract of the env-dump guard.
+//
+// Threat model: a cooperative agent that prints secret values by accident, for
+// example while debugging. The guard is not a sandbox. An agent that sets out to
+// get around it can, and so can a command that falls under a known limit below;
+// either way the value reaches the transcript and has to be rotated.
+//
+// Rule: a command is allowed only if the guard can show from its text that no
+// secret value reaches output. When a variable name or the text of a script is
+// built at run time the guard cannot know it, so it blocks:
+//
+//   - a command that prints variables by name (printenv, declare, typeset,
+//     local, export and readonly with -p or a list of names, env with a name)
+//     is given a name that is not a plain literal: an expansion, a command
+//     substitution, a glob or a brace list
+//   - an indirect expansion or nameref is printed: ${!name}, zsh ${(P)name} and
+//     ${(e)name}, bash ${name@P}, and variables declared with -n
+//   - eval, sh -c or env -S is given text that contains an expansion
+//   - a shell reads its script from stdin, unless that is a here-string or
+//     heredoc of literal text, which is then judged like a -c script
+//
+// Expanding a literal name that is not secret stays allowed (echo $HOME).
+//
+// Known limits, which are the residual risk:
+//
+//   - zsh flag delimiters that hide the name, e.g. ${(s:):)NAME}
+//   - command names, and arguments other than names and scripts, that are built
+//     at run time ($cmd, ps $flags)
+//   - values passed on through anything but a direct assignment: function
+//     arguments, loop variables, read, printf -v, files
+//   - script files, programs in other languages, remote environments (ssh,
+//     docker exec), tmux show-environment and set -x tracing
+
 var tapGuardEnvDumpCmd = &cobra.Command{
 	Use:   "env-dump",
 	Short: "Block commands that print environment values or secret variables",
