@@ -41,3 +41,34 @@ func TestSessionSecretAllowlistFollowsTownConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionSecretAllowlistCoversRoleCredentials(t *testing.T) {
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "settings"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"type":"town-settings","version":1,"assistant":{"sweep":{"jira":{"token_env":"ACME_JIRA_TOKEN"},"github":{"token_env":"ACME_FORGE_TOKEN"}}}}`
+	if err := os.WriteFile(filepath.Join(town, "settings", "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		role, name string
+		want       bool
+	}{
+		{"rig/polecats/toast", "GT_WORKER_TOKEN", true},
+		{"rig/witness", "GT_WORKER_TOKEN", false},
+		{"rig/refinery", "BITBUCKET_TOKEN", true},
+		{"rig/polecats/toast", "BITBUCKET_TOKEN", false},
+		{"assistant", "ACME_JIRA_TOKEN", true},
+		{"assistant", "ACME_FORGE_TOKEN", true},
+		{"assistant", "JIRA_API_TOKEN", true},
+		{"assistant", "GITHUB_TOKEN", true},
+		{"rig/polecats/toast", "ACME_JIRA_TOKEN", false},
+	}
+	for _, tc := range cases {
+		if got := slices.Contains(SessionSecretAllowlist(tc.role, town), tc.name); got != tc.want {
+			t.Errorf("SessionSecretAllowlist(%q) contains %s = %v, want %v", tc.role, tc.name, got, tc.want)
+		}
+	}
+}

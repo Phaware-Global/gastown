@@ -8,12 +8,14 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/BurntSushi/toml"
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // SecretEnvSuffixes are the name endings that mark an environment variable as a
-// secret. An agent session holds such a variable only if SessionSecretAllowlist
-// names it for the session's role.
+// secret, as are the names ConfiguredSecretEnvNames returns. An agent session
+// holds such a variable only if SessionSecretAllowlist names it for the
+// session's role.
 var SecretEnvSuffixes = []string{"_TOKEN", "_SECRET", "_PAT", "_KEY", "_PASSWORD"}
 
 // baseSessionSecrets are held by every session: the agent cannot reach its
@@ -49,7 +51,16 @@ func SessionSecretAllowlist(gtRole, townRoot string) []string {
 	role := ExtractSimpleRole(gtRole)
 	allowed := slices.Clone(baseSessionSecrets)
 
+	var ts *TownSettings
+	if townRoot != "" {
+		ts = loadTownSettingsIfValid(townRoot)
+	}
+
 	switch role {
+	case constants.RolePolecat:
+		// A remote polecat's pane runs `gt worker-attach`, which
+		// authenticates to the worker with this.
+		allowed = append(allowed, "GT_WORKER_TOKEN")
 	case constants.RoleReviewer:
 		// The dispatcher injects the reviewer's token under these names.
 		allowed = append(allowed, githubTokenEnvs...)
@@ -58,28 +69,91 @@ func SessionSecretAllowlist(gtRole, townRoot string) []string {
 		allowed = append(allowed, githubTokenEnvs...)
 		rig, _, _ := strings.Cut(gtRole, "/")
 		allowed = append(allowed, reviewerTokenEnvName(townRoot, rig))
+		if role == constants.RoleRefinery {
+			// The merge queue's PR provider on a Bitbucket rig.
+			allowed = append(allowed, "BITBUCKET_TOKEN")
+		}
 	case constants.RoleMayor:
 		allowed = append(allowed, githubTokenEnvs...)
 		allowed = append(allowed, reviewerTokenEnvName(townRoot, ""))
-		rigConfigs, _ := filepath.Glob(filepath.Join(townRoot, "*", "settings", "config.json"))
-		for _, path := range rigConfigs {
-			rig := filepath.Base(filepath.Dir(filepath.Dir(path)))
+		for _, rig := range rigsWithSettings(townRoot) {
 			allowed = append(allowed, reviewerTokenEnvName(townRoot, rig))
 		}
 	case constants.RoleAssistant:
-		// The sweep's default token variables.
+		// The sweep's default and configured token variables.
 		allowed = append(allowed, githubTokenEnvs...)
-		allowed = append(allowed, "JIRA_API_TOKEN")
+		allowed = append(allowed, "JIRA_API_TOKEN", ts.JiraSweep().TokenEnv, ts.GitHubSweep().TokenEnv)
 	}
 
-	if townRoot != "" && role != "" {
-		if ts, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot)); err == nil && ts != nil {
-			allowed = append(allowed, ts.RoleSecrets[role]...)
+	if ts != nil && role != "" {
+		allowed = append(allowed, ts.RoleSecrets[role]...)
+	}
+
+	return sortedNames(allowed)
+}
+
+// ConfiguredSecretEnvNames returns the sorted names of the environment
+// variables the town's config says hold secrets, whatever they end in: reviewer
+// tokens, telegraph webhook secrets, assistant sweep tokens and role_secrets.
+func ConfiguredSecretEnvNames(townRoot string) []string {
+	if townRoot == "" {
+		return nil
+	}
+	names := []string{DefaultReviewerTokenEnv}
+	for _, rig := range rigsWithSettings(townRoot) {
+		names = append(names, reviewerTokenEnvName(townRoot, rig))
+	}
+	if ts := loadTownSettingsIfValid(townRoot); ts != nil {
+		names = append(names, ts.JiraSweep().TokenEnv, ts.GitHubSweep().TokenEnv)
+		for _, extra := range ts.RoleSecrets {
+			names = append(names, extra...)
 		}
 	}
+	// internal/telegraph owns this file; only the secret names are read here.
+	var telegraph struct {
+		Telegraph struct {
+			Providers map[string]struct {
+				SecretEnv string `toml:"secret_env"`
+			} `toml:"providers"`
+		} `toml:"telegraph"`
+	}
+	if _, err := toml.DecodeFile(filepath.Join(townRoot, "settings", "telegraph.toml"), &telegraph); err == nil {
+		for _, provider := range telegraph.Telegraph.Providers {
+			names = append(names, provider.SecretEnv)
+		}
+	}
+	return sortedNames(names)
+}
 
-	sort.Strings(allowed)
-	return slices.Compact(allowed)
+// IsSecretEnvName reports whether name holds a secret: it ends in one of
+// SecretEnvSuffixes or is one of configured.
+func IsSecretEnvName(name string, configured []string) bool {
+	upper := strings.ToUpper(name)
+	return slices.Contains(configured, name) ||
+		slices.ContainsFunc(SecretEnvSuffixes, func(suffix string) bool { return strings.HasSuffix(upper, suffix) })
+}
+
+func sortedNames(names []string) []string {
+	names = slices.DeleteFunc(names, func(name string) bool { return name == "" })
+	sort.Strings(names)
+	return slices.Compact(names)
+}
+
+func loadTownSettingsIfValid(townRoot string) *TownSettings {
+	ts, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot))
+	if err != nil {
+		return nil
+	}
+	return ts
+}
+
+func rigsWithSettings(townRoot string) []string {
+	paths, _ := filepath.Glob(filepath.Join(townRoot, "*", "settings", "config.json"))
+	rigs := make([]string, 0, len(paths))
+	for _, path := range paths {
+		rigs = append(rigs, filepath.Base(filepath.Dir(filepath.Dir(path))))
+	}
+	return rigs
 }
 
 // reviewerTokenEnvName returns the rig's merge_queue.reviewer_token_env, or the

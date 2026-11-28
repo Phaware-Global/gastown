@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -301,9 +302,12 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
+	held := t.WithholdGlobalSecrets("")
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
+	// A server started by that call took this process's environment.
+	t.isolateSecrets(name, "", "", held)
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
@@ -359,9 +363,11 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
+	held := t.WithholdGlobalSecrets("")
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
+	t.isolateSecrets(name, "", "", held)
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
@@ -383,7 +389,7 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, scrubSecrets("", "", commandInWorkDir(workDir, command)))
+		respawnArgs = append(respawnArgs, scrubSecrets("", t.secretTownRoot(""), commandInWorkDir(workDir, command)))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -438,12 +444,20 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	townRoot := t.secretTownRoot(env["GT_ROOT"])
+	allowed := config.SessionSecretAllowlist(env["GT_ROLE"], townRoot)
+	configured := config.ConfiguredSecretEnvNames(townRoot)
 	for _, k := range keys {
+		if runtime.GOOS != "windows" && config.IsSecretEnvName(k, configured) && !slices.Contains(allowed, k) {
+			continue
+		}
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
 	}
+	held := t.WithholdGlobalSecrets(townRoot)
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
+	t.isolateSecrets(name, env["GT_ROLE"], townRoot, held)
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
@@ -463,7 +477,7 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, scrubSecrets(env["GT_ROLE"], env["GT_ROOT"], commandInWorkDir(workDir, command)))
+		respawnArgs = append(respawnArgs, scrubSecrets(env["GT_ROLE"], townRoot, commandInWorkDir(workDir, command)))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -2915,6 +2929,7 @@ func (t *Tmux) CapturePaneLines(session string, lines int) ([]string, error) {
 // AttachSession attaches to an existing session.
 // Note: This replaces the current process with tmux attach.
 func (t *Tmux) AttachSession(session string) error {
+	t.WithholdGlobalSecrets("")
 	_, err := t.run("attach-session", "-t", session)
 	return err
 }

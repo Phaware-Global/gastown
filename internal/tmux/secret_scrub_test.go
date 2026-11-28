@@ -36,11 +36,7 @@ func scrubTestServer(t *testing.T) *Tmux {
 	if err := tm.NewSession(keeper, ""); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	for _, name := range scrubFixtures {
-		if _, err := tm.run("set-environment", "-g", name, "fixture"); err != nil {
-			t.Fatalf("set-environment %s: %v", name, err)
-		}
-	}
+	seedGlobal(t, tm, scrubFixtures...)
 	t.Cleanup(func() {
 		for _, name := range scrubFixtures {
 			_, _ = tm.run("set-environment", "-g", "-u", name)
@@ -48,6 +44,38 @@ func scrubTestServer(t *testing.T) *Tmux {
 		_ = tm.KillSession(keeper)
 	})
 	return tm
+}
+
+func seedGlobal(t *testing.T, tm *Tmux, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if _, err := tm.run("set-environment", "-g", name, "fixture"); err != nil {
+			t.Fatalf("set-environment %s: %v", name, err)
+		}
+	}
+}
+
+// listedNames returns which of names show-environment reports as set, in the
+// global environment (session "") or a session's.
+func listedNames(t *testing.T, tm *Tmux, session string, names []string) []string {
+	t.Helper()
+	args := []string{"show-environment", "-g"}
+	if session != "" {
+		args = []string{"show-environment", "-t", session}
+	}
+	out, err := tm.run(args...)
+	if err != nil {
+		t.Fatalf("show-environment %q: %v", session, err)
+	}
+	var got []string
+	for _, line := range strings.Split(out, "\n") {
+		name, _, ok := strings.Cut(line, "=")
+		if ok && slices.Contains(names, name) {
+			got = append(got, name)
+		}
+	}
+	sort.Strings(got)
+	return got
 }
 
 // dumpNamesCommand writes the names (never the values) of the pane's
@@ -58,18 +86,23 @@ func dumpNamesCommand(out string) string {
 
 func readFixtureNames(t *testing.T, out string) []string {
 	t.Helper()
+	var got []string
+	for _, name := range strings.Fields(waitForFile(t, out)) {
+		if slices.Contains(scrubFixtures, name) {
+			got = append(got, name)
+		}
+	}
+	sort.Strings(got)
+	return got
+}
+
+func waitForFile(t *testing.T, out string) string {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		data, err := os.ReadFile(out)
 		if err == nil {
-			var got []string
-			for _, name := range strings.Fields(string(data)) {
-				if slices.Contains(scrubFixtures, name) {
-					got = append(got, name)
-				}
-			}
-			sort.Strings(got)
-			return got
+			return string(data)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("pane never wrote %s: %v", out, err)
@@ -110,6 +143,7 @@ func TestSessionEnvHoldsExactlyTheRoleSecrets(t *testing.T) {
 			_ = tm.KillSession(session)
 			t.Cleanup(func() { _ = tm.KillSession(session) })
 
+			seedGlobal(t, tm, scrubFixtures...)
 			if err := tm.NewSessionWithCommandAndEnv(session, dir, dumpNamesCommand(out), env); err != nil {
 				t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
 			}
@@ -145,10 +179,137 @@ func TestNewSessionWithCommandDropsInheritedSecrets(t *testing.T) {
 	_ = tm.KillSession(session)
 	t.Cleanup(func() { _ = tm.KillSession(session) })
 
+	seedGlobal(t, tm, scrubFixtures...)
 	if err := tm.NewSessionWithCommand(session, dir, dumpNamesCommand(out)); err != nil {
 		t.Fatalf("NewSessionWithCommand: %v", err)
 	}
 	if got, want := readFixtureNames(t, out), []string{"ANTHROPIC_API_KEY"}; !slices.Equal(got, want) {
 		t.Errorf("secrets = %v, want %v", got, want)
+	}
+}
+
+func startScrubSession(t *testing.T, tm *Tmux, session, role string, env map[string]string) {
+	t.Helper()
+	if env == nil {
+		env = map[string]string{}
+	}
+	env["GT_ROLE"] = role
+	if env["GT_ROOT"] == "" {
+		env["GT_ROOT"] = t.TempDir()
+	}
+	_ = tm.KillSession(session)
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+	if err := tm.NewSessionWithCommandAndEnv(session, env["GT_ROOT"], "sleep 30", env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+}
+
+func TestSessionStartEmptiesGlobalEnvOfSecrets(t *testing.T) {
+	tm := scrubTestServer(t)
+
+	startScrubSession(t, tm, "gt-scrub-reviewer", "rig/reviewer", map[string]string{"GH_TOKEN": "dispatched"})
+	seedGlobal(t, tm, scrubFixtures...)
+	startScrubSession(t, tm, "gt-scrub-polecat", "rig/polecats/toast", map[string]string{"UNRELATED_SERVICE_PAT": "caller"})
+
+	if got := listedNames(t, tm, "", scrubFixtures); len(got) != 0 {
+		t.Errorf("global environment still holds %v", got)
+	}
+	if got, want := listedNames(t, tm, "gt-scrub-polecat", scrubFixtures), []string{"ANTHROPIC_API_KEY"}; !slices.Equal(got, want) {
+		t.Errorf("polecat session secrets = %v, want %v", got, want)
+	}
+	want := []string{"ANTHROPIC_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"}
+	if got := listedNames(t, tm, "gt-scrub-reviewer", scrubFixtures); !slices.Equal(got, want) {
+		t.Errorf("reviewer session secrets = %v, want %v", got, want)
+	}
+	if got, err := tm.GetEnvironment("gt-scrub-reviewer", "GH_TOKEN"); err != nil || got != "dispatched" {
+		t.Errorf("reviewer lost the token it was dispatched with (err=%v)", err)
+	}
+}
+
+// A session that was inheriting a secret from the global environment keeps it
+// when that environment is emptied.
+func TestWithheldSecretsStayWithRunningSessions(t *testing.T) {
+	tm := scrubTestServer(t)
+	startScrubSession(t, tm, "gt-scrub-refinery", "rig/refinery", nil)
+	// Return the session to the state of one that only inherits.
+	for _, name := range scrubFixtures {
+		_, _ = tm.run("set-environment", "-t", "gt-scrub-refinery", "-u", name)
+	}
+	seedGlobal(t, tm, scrubFixtures...)
+	startScrubSession(t, tm, "gt-scrub-other", "rig/witness", nil)
+
+	out := filepath.Join(t.TempDir(), "names")
+	if err := tm.RespawnPane("gt-scrub-refinery", dumpNamesCommand(out)); err != nil {
+		t.Fatalf("RespawnPane: %v", err)
+	}
+	want := []string{"ANTHROPIC_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "GT_REVIEWER_GITHUB_TOKEN"}
+	if got := readFixtureNames(t, out); !slices.Equal(got, want) {
+		t.Errorf("respawned refinery secrets = %v, want %v", got, want)
+	}
+}
+
+// With nothing in the global environment, a session gets its secrets from the
+// process that starts it.
+func TestSessionSecretsComeFromStartingProcess(t *testing.T) {
+	tm := scrubTestServer(t)
+	for _, name := range scrubFixtures {
+		_, _ = tm.run("set-environment", "-g", "-u", name)
+		t.Setenv(name, "fixture")
+	}
+	startScrubSession(t, tm, "gt-scrub-own", "rig/refinery", nil)
+
+	want := []string{"ANTHROPIC_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "GT_REVIEWER_GITHUB_TOKEN"}
+	if got := listedNames(t, tm, "gt-scrub-own", scrubFixtures); !slices.Equal(got, want) {
+		t.Errorf("session secrets = %v, want %v", got, want)
+	}
+}
+
+func TestConfiguredSecretNamesNeedNoSuffix(t *testing.T) {
+	tm := scrubTestServer(t)
+	town := t.TempDir()
+	for rel, body := range map[string]string{
+		"settings/config.json":     `{"type":"town-settings","version":1,"assistant":{"sweep":{"jira":{"token_env":"ACME_JIRA_CRED"},"github":{"token_env":"ACME_FORGE_CRED"}}},"role_secrets":{"witness":["ACME_EXTRA_CRED"]}}`,
+		"settings/telegraph.toml":  "[telegraph.providers.github]\nsecret_env = \"ACME_WEBHOOK_HMAC\"\n",
+		"rig/settings/config.json": `{"merge_queue":{"reviewer_token_env":"ACME_REVIEWER_CRED"}}`,
+	} {
+		path := filepath.Join(town, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := []string{"ACME_EXTRA_CRED", "ACME_FORGE_CRED", "ACME_JIRA_CRED", "ACME_REVIEWER_CRED", "ACME_WEBHOOK_HMAC"}
+	seedGlobal(t, tm, names...)
+	t.Cleanup(func() {
+		for _, name := range names {
+			_, _ = tm.run("set-environment", "-g", "-u", name)
+		}
+	})
+
+	startScrubSession(t, tm, "gt-scrub-cfg", "rig/polecats/toast", map[string]string{"GT_ROOT": town})
+	if got := listedNames(t, tm, "", names); len(got) != 0 {
+		t.Errorf("global environment still holds %v", got)
+	}
+	if got := listedNames(t, tm, "gt-scrub-cfg", names); len(got) != 0 {
+		t.Errorf("polecat session holds %v", got)
+	}
+
+	// The pane drops them even when they reach it some other way.
+	for _, name := range names {
+		if err := tm.SetEnvironment("gt-scrub-cfg", name, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(t.TempDir(), "names")
+	if err := tm.RespawnPane("gt-scrub-cfg", dumpNamesCommand(out)); err != nil {
+		t.Fatalf("RespawnPane: %v", err)
+	}
+	data := waitForFile(t, out)
+	for _, name := range names {
+		if slices.Contains(strings.Fields(data), name) {
+			t.Errorf("pane holds %s", name)
+		}
 	}
 }

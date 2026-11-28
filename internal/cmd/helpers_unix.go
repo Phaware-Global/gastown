@@ -30,6 +30,8 @@ func attachToTmuxSession(sessionID string) error {
 		baseArgs = append(baseArgs, "-L", socket)
 	}
 
+	tmux.NewTmux().WithholdGlobalSecrets("")
+
 	var args []string
 	if isInSameTmuxSocket() {
 		// Same tmux socket: switch to the target session
