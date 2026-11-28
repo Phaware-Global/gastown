@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/daemon"
+	"github.com/steveyegge/gastown/internal/doltport"
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -748,6 +749,10 @@ func init() {
 		if v, err := strconv.Atoi(p); err == nil {
 			defaultPort = v
 		}
+	}
+
+	if port, ok := doltport.Forced(); ok {
+		defaultPort = port
 	}
 
 	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperCloseOrphanStepsCmd, reaperRunCmd, reaperDatabasesCmd} {

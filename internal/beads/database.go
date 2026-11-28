@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/doltport"
 )
 
 var envKeysCaseInsensitive = runtime.GOOS == "windows"
@@ -97,7 +99,7 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	env := forceNoAutoStart(SuppressBDSideEffects(StripBDTargetEnv(base)))
 	beadsDir = sanitizeBeadsDir(beadsDir)
 	if beadsDir == "" {
-		return addGTDerivedDoltTargetEnv(env)
+		return addGTDerivedDoltTargetEnv(append(env, doltTargetEnvFromBeadsDir("")...))
 	}
 	env = append(env, "BEADS_DIR="+beadsDir)
 	env = append(env, doltTargetEnvFromBeadsDir(beadsDir)...)
@@ -237,10 +239,13 @@ func forceBDMutation(env []string) []string {
 }
 
 func doltTargetEnvFromBeadsDir(beadsDir string) []string {
-	if beadsDir == "" {
-		return nil
+	var meta doltMetadata
+	if beadsDir != "" {
+		meta = readDoltMetadata(beadsDir)
 	}
-	meta := readDoltMetadata(beadsDir)
+	if port, ok := doltport.Forced(); ok {
+		meta.Port = strconv.Itoa(port)
+	}
 	var env []string
 	if meta.Host != "" {
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+meta.Host)

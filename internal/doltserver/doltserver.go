@@ -51,6 +51,7 @@ import (
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/doltport"
 	"github.com/steveyegge/gastown/internal/style"
 	"gopkg.in/yaml.v3"
 )
@@ -471,6 +472,10 @@ func DefaultConfig(townRoot string) *Config {
 	// =info for diagnostics.
 	if config.LogLevel == "" {
 		config.LogLevel = "error"
+	}
+
+	if port, ok := doltport.Forced(); ok {
+		config.Port = port
 	}
 
 	return config
@@ -1860,6 +1865,11 @@ behavior:
 
 // Start starts the Dolt SQL server.
 func Start(townRoot string) error {
+	// A forced port is for keeping clients away from the town's server. A
+	// server started under one would write it into the town's config.yaml.
+	if _, ok := doltport.Forced(); ok {
+		return fmt.Errorf("not starting a Dolt server while %s is set", doltport.ForceEnv)
+	}
 	config := DefaultConfig(townRoot)
 
 	// Ensure daemon directory exists
@@ -3802,11 +3812,13 @@ func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase 
 	// previous bd init) cause "connection refused" errors.
 	wantHost := config.EffectiveHost()
 	wantPort := float64(config.Port) // JSON numbers are float64
-	if existing["dolt_server_host"] != wantHost {
+	// A forced port belongs to this process tree, so it is never recorded.
+	_, forced := doltport.Forced()
+	if !forced && existing["dolt_server_host"] != wantHost {
 		existing["dolt_server_host"] = wantHost
 		changed = true
 	}
-	if existing["dolt_server_port"] != wantPort {
+	if !forced && existing["dolt_server_port"] != wantPort {
 		existing["dolt_server_port"] = wantPort
 		changed = true
 	}

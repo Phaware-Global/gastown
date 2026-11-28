@@ -20,6 +20,7 @@ func CleanGTEnv(extraEnv ...string) []string {
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "GT_") &&
 			!strings.HasPrefix(e, "GT_DOLT_PORT=") &&
+			!strings.HasPrefix(e, "GT_DOLT_FORCE_PORT=") &&
 			!strings.HasPrefix(e, "GT_DOLT_HOST=") &&
 			!strings.HasPrefix(e, "GT_TEST_EXTERNAL_DOLT=") {
 			continue

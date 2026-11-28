@@ -13,6 +13,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql" // required by testcontainers Dolt module
+	"github.com/steveyegge/gastown/internal/doltport"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/dolt"
 )
@@ -116,6 +117,9 @@ func startSharedDoltContainer() {
 	os.Setenv("GT_DOLT_PORT", doltCtrPort)    //nolint:tenv // intentional process-wide env
 	os.Setenv("BEADS_DOLT_PORT", doltCtrPort) //nolint:tenv // intentional process-wide env
 	os.Setenv("GT_TEST_EXTERNAL_DOLT", "1")   //nolint:tenv // integration tests reuse this container
+	if _, ok := doltport.Forced(); ok {
+		os.Setenv(doltport.ForceEnv, doltCtrPort) //nolint:tenv // the container replaces the forced port
+	}
 }
 
 // StartIsolatedDoltContainer starts a per-test Dolt container and returns the
@@ -148,6 +152,9 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 
 	portStr := port.Port()
 	t.Setenv("GT_DOLT_PORT", portStr)
+	if _, ok := doltport.Forced(); ok {
+		t.Setenv(doltport.ForceEnv, portStr)
+	}
 	return portStr
 }
 

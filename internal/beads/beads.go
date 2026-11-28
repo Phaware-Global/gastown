@@ -16,6 +16,7 @@ import (
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/doltport"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/util"
@@ -883,6 +884,12 @@ func overrideDoltEnvFromBeadsDir(env []string, beadsDir string) []string {
 // beads directory. The per-directory port file is authoritative when present;
 // metadata.json is used as a fallback and to supply the server host/database.
 func doltConnectionFromBeadsDir(beadsDir string) (port string, host string, database string) {
+	// A forced port replaces whatever the directory records.
+	defer func() {
+		if forced, ok := doltport.Forced(); ok {
+			port = strconv.Itoa(forced)
+		}
+	}()
 	if beadsDir == "" {
 		return "", "", ""
 	}
