@@ -344,7 +344,7 @@ How the worker treats an attach to a session:
 | `resume` matches | `detached` | resume from `offset` |
 | `resume` matches | `exited` | send remaining output, then the exit frame |
 | `resume` unknown | any | `error` code `no_exec`; never start an agent |
-| any, container mode (phase 3) | container not running, or not confirmed (§4) | `error` code `no_session` after the session is stopped, or `busy` (retryable) when the check itself failed |
+| any except `resume` matching an `exited` exec, container mode (phase 3) | container not running, or not confirmed (§4) | `error` code `no_session` after the session is stopped, or `busy` (retryable) when the check itself failed. A `resume` matching an `exited` exec is served by its row above first, and only then is the session stopped (§4) |
 
 A `resume` attach ignores `argv` and `env`; nothing is executed. "Replace" is
 what an old launcher gets. In native mode its end state equals today's (old
