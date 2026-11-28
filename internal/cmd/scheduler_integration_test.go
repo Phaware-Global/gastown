@@ -27,6 +27,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 // schedulerTestCounter generates unique prefixes for each test to isolate Dolt
@@ -1327,6 +1328,11 @@ func TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", beads.DatabaseNameFromMetadata(filepath.Join(hqPath, ".beads")))
 	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(hqPath, ".wrong-dolt-data"))
 
+	// dispatchScheduledWork runs in this process: resolve beads from the test
+	// town, and keep its rig boot off the installed gt.
+	prodguard.Stub(t, "gt")
+	t.Chdir(hqPath)
+
 	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
 	if err != nil {
 		t.Fatalf("dispatchScheduledWork: %v", err)
@@ -1374,6 +1380,11 @@ func TestSchedulerDispatchFailureRecordedInContextSourceDB(t *testing.T) {
 		}
 		return nil, fmt.Errorf("forced spawn failure")
 	}
+
+	// dispatchScheduledWork runs in this process: resolve beads from the test
+	// town, and keep its rig boot off the installed gt.
+	prodguard.Stub(t, "gt")
+	t.Chdir(hqPath)
 
 	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
 	if err != nil {

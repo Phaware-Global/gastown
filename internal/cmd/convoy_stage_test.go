@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 // U-01: Simple 2-node cycle A→B→A
@@ -1455,6 +1457,7 @@ func TestRenderDAGTree_OutputOrdering(t *testing.T) {
 // U-22: Parked rig detected and warned
 // This test uses the isRigParkedFn seam to mock parked rig detection.
 func TestDetectWarnings_ParkedRig(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// Set up a temp dir as town root and cd there for workspace.FindFromCwd()
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
@@ -1503,6 +1506,7 @@ func TestDetectWarnings_ParkedRig(t *testing.T) {
 
 // Regression test for #2120 review item #1: docked rigs should also be detected.
 func TestDetectWarnings_DockedRig(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
 		t.Fatalf("failed to create .beads: %v", err)
@@ -1556,6 +1560,7 @@ func TestDetectWarnings_DockedRig(t *testing.T) {
 
 // U-23: Orphan detection for epic input
 func TestDetectWarnings_OrphanEpicInput(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// 3 tasks under an epic: A blocks B (connected), C is isolated.
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"epic-1": {ID: "epic-1", Type: "epic", Children: []string{"gt-a", "gt-b", "gt-c"}},
@@ -1582,6 +1587,7 @@ func TestDetectWarnings_OrphanEpicInput(t *testing.T) {
 
 // U-24: Missing integration branch warning
 func TestDetectWarnings_MissingBranch(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"root-epic": {ID: "root-epic", Type: "epic", Children: []string{"sub-epic"}},
 		"sub-epic":  {ID: "sub-epic", Type: "epic", Parent: "root-epic", Children: []string{"gt-a", "gt-b"}},
@@ -1614,6 +1620,7 @@ func TestDetectWarnings_MissingBranch(t *testing.T) {
 
 // U-34: Cross-rig routing mismatch warned
 func TestDetectWarnings_CrossRig(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"gt-a": {ID: "gt-a", Type: "task", Rig: "gastown"},
 		"gt-b": {ID: "gt-b", Type: "task", Rig: "gastown"},
@@ -1645,6 +1652,7 @@ func TestDetectWarnings_CrossRig(t *testing.T) {
 
 // U-35: Capacity estimation
 func TestDetectWarnings_Capacity(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// Create a DAG where wave 1 has 6 independent tasks (all in-degree 0).
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"t1": {ID: "t1", Type: "task", Rig: "gastown"},
@@ -1690,6 +1698,7 @@ func TestDetectWarnings_Capacity(t *testing.T) {
 
 // IT-43: Orphan detection skipped for task-list input
 func TestDetectWarnings_NoOrphansForTaskList(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// Same DAG as orphan test but with task-list input.
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"gt-a": {ID: "gt-a", Type: "task", Rig: "gastown", Blocks: []string{"gt-b"}},
@@ -1765,6 +1774,7 @@ func TestRenderWarnings_Format(t *testing.T) {
 
 // Test detectWarnings clean DAG — no warnings
 func TestDetectWarnings_Clean(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	// Override isRigBlockedFn so the test doesn't depend on real rig state.
 	origFn := isRigBlockedFn
 	isRigBlockedFn = func(townRoot, rigName string) (bool, string) { return false, "" }
@@ -1786,6 +1796,7 @@ func TestDetectWarnings_Clean(t *testing.T) {
 
 // Test renderWarnings with empty findings
 func TestRenderWarnings_Empty(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	output := renderWarnings(nil)
 	if output != "" {
 		t.Errorf("expected empty string for nil findings, got %q", output)
@@ -2318,6 +2329,7 @@ func TestJSONOutput_ValidWithAllFields(t *testing.T) {
 // U-32: JSON output: errors array populated on failure.
 // Build a DAG with a cycle, verify the errors array has the cycle finding.
 func TestJSONOutput_ErrorsPopulatedOnCycle(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"gt-a": {ID: "gt-a", Type: "task", Rig: "gastown",
 			Blocks: []string{"gt-b"}, BlockedBy: []string{"gt-b"}},

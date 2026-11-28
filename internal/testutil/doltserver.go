@@ -119,7 +119,8 @@ func startSharedDoltContainer() {
 }
 
 // StartIsolatedDoltContainer starts a per-test Dolt container and returns the
-// mapped host port. GT_DOLT_PORT is set via t.Setenv (scoped to the test).
+// mapped host port. GT_DOLT_PORT and BEADS_DOLT_PORT are set via t.Setenv
+// (scoped to the test).
 // The container is terminated automatically when the test finishes.
 func StartIsolatedDoltContainer(t *testing.T) string {
 	t.Helper()
@@ -148,6 +149,7 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 
 	portStr := port.Port()
 	t.Setenv("GT_DOLT_PORT", portStr)
+	t.Setenv("BEADS_DOLT_PORT", portStr)
 	return portStr
 }
 

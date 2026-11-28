@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 func setupSlingTestRegistry(t *testing.T) {
@@ -86,6 +87,7 @@ func TestNudgeRefinerySessionName(t *testing.T) {
 // nudges the witness, not the refinery. The refinery should only be nudged
 // when an MR is actually created (via nudgeRefinery), not at polecat dispatch time.
 func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
+	prodguard.Stub(t, "bd", "gt")
 	logPath := filepath.Join(t.TempDir(), "nudge.log")
 	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
 

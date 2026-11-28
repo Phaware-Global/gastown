@@ -6,9 +6,12 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 func TestMain(m *testing.M) {
+	done := prodguard.Install()
+
 	// Start an ephemeral Dolt container for this package's tests.
 	// setupTestStore sets BEADS_TEST_MODE=1, which causes the beads SDK
 	// to create testdb_<hash> databases. By routing those to an isolated
@@ -17,11 +20,11 @@ func TestMain(m *testing.M) {
 	// accumulation in the shared production Dolt data dir.
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "convoy TestMain: skipping — %v\n", err)
-		os.Exit(0)
+		os.Exit(done(0))
 	}
 
 	code := m.Run()
 
 	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	os.Exit(done(code))
 }

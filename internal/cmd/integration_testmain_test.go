@@ -9,9 +9,12 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 func TestMain(m *testing.M) {
+	done := prodguard.Install()
+
 	// Force sequential test execution to avoid bd file locks on Windows.
 	_ = flag.Set("test.parallel", "1")
 	flag.Parse()
@@ -41,5 +44,5 @@ func TestMain(m *testing.M) {
 
 	// Clean up the shared Dolt container.
 	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	os.Exit(done(code))
 }

@@ -1876,8 +1876,8 @@ func TestEnsureMetadata_RepairsStalePort(t *testing.T) {
 		t.Fatalf("parsing metadata: %v", err)
 	}
 
-	// Port should now be the default (3307), not the stale 13729
-	wantPort := float64(DefaultPort)
+	// Port should now be the configured one, not the stale 13729
+	wantPort := float64(DefaultConfig(townRoot).Port)
 	if meta["dolt_server_port"] != wantPort {
 		t.Errorf("dolt_server_port = %v, want %v", meta["dolt_server_port"], wantPort)
 	}
@@ -2437,6 +2437,7 @@ func TestListDatabases_MixedContent(t *testing.T) {
 // =============================================================================
 
 func TestGetConnectionString(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "") // expects the built-in default; connects to nothing
 	townRoot := t.TempDir()
 	s := GetConnectionString(townRoot)
 	if s != "root@tcp(127.0.0.1:3307)/" {
@@ -2445,6 +2446,7 @@ func TestGetConnectionString(t *testing.T) {
 }
 
 func TestGetConnectionStringForRig(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "") // expects the built-in default; connects to nothing
 	townRoot := t.TempDir()
 	s := GetConnectionStringForRig(townRoot, "hq")
 	if s != "root@tcp(127.0.0.1:3307)/hq" {
@@ -3902,6 +3904,7 @@ func TestDefaultConfig_EnvVarOverrides(t *testing.T) {
 }
 
 func TestDefaultConfig_EnvVarPartialOverride(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "") // expects the built-in default; connects to nothing
 	townRoot := t.TempDir()
 
 	// Only override host, rest should keep defaults
@@ -4944,14 +4947,16 @@ func TestCountDoltDatabases(t *testing.T) {
 // refuses to delete databases with >1MB of data when the server is offline
 // and --force is not set. (gt-xvh)
 func TestRemoveDatabase_RefusesLargeDBWhenServerDown(t *testing.T) {
-	// Skip if a real Dolt server is running on the default port — IsRunning
-	// would detect it and take the SQL-check path instead of the size-check path.
-	if conn, err := net.DialTimeout("tcp", "127.0.0.1:3307", time.Second); err == nil {
+	townRoot := t.TempDir()
+
+	// Skip if a server answers on the configured port: IsRunning would detect
+	// it and take the SQL-check path instead of the size-check path.
+	addr := DefaultConfig(townRoot).HostPort()
+	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
 		conn.Close()
-		t.Skip("skipping: real Dolt server running on port 3307 would bypass size check")
+		t.Skipf("skipping: a server on %s would bypass the size check", addr)
 	}
 
-	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")
 	setupDoltDB(t, dataDir, "big_db")
 

@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/testutil/prodguard"
 )
 
 // captureStdout redirects os.Stdout to a pipe, calls fn, then returns whatever
@@ -135,6 +136,7 @@ func TestGetAgentBeadID_UsesRigPrefix(t *testing.T) {
 }
 
 func TestPrimeFlagCombinations(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	gtBin := buildGT(t)
 
 	cases := []struct {
@@ -181,6 +183,7 @@ func TestPrimeFlagCombinations(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command(gtBin, tc.args...)
+			cmd.Dir = t.TempDir() // prime reads whatever town it is run in
 			output, err := cmd.CombinedOutput()
 
 			if tc.wantError {
@@ -920,6 +923,7 @@ func TestCheckSlungWork_StandaloneFormulaUsesWorkflowOutput(t *testing.T) {
 // the polecats-no-gt-done bug: after long work sessions, compaction drops the
 // formula checklist and the agent forgets to call gt done.
 func TestCompactResumeReminder_PolecatGetsGtDone(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	ctx := RoleContext{Role: RolePolecat}
 	// Simulate compact source
 	primeHookSource = "compact"
@@ -937,6 +941,7 @@ func TestCompactResumeReminder_PolecatGetsGtDone(t *testing.T) {
 // TestCompactResumeReminder_NonPolecatNoGtDone verifies that non-polecat roles
 // do NOT get the gt done reminder (it's polecat-specific).
 func TestCompactResumeReminder_NonPolecatNoGtDone(t *testing.T) {
+	prodguard.Stub(t, "bd")
 	ctx := RoleContext{Role: RoleCrew}
 	primeHookSource = "compact"
 	defer func() { primeHookSource = "" }()
