@@ -313,3 +313,38 @@ func TestConfiguredSecretNamesNeedNoSuffix(t *testing.T) {
 		}
 	}
 }
+
+// A session started by an agent, whose own environment is scrubbed, still gets
+// its role's secrets from the ones the server withholds.
+func TestScrubbedStarterStillGivesSessionItsSecrets(t *testing.T) {
+	tm := scrubTestServer(t)
+	for _, name := range scrubFixtures {
+		t.Setenv(name, "") // restores the variable after the test
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first start withholds the secrets and kills nothing that holds them.
+	startScrubSession(t, tm, "gt-scrub-first", "rig/polecats/toast", nil)
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "names")
+	session := "gt-scrub-restarted"
+	_ = tm.KillSession(session)
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+	env := map[string]string{"GT_ROLE": "rig/refinery", "GT_ROOT": dir}
+	if err := tm.NewSessionWithCommandAndEnv(session, dir, dumpNamesCommand(out), env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+
+	want := []string{"ANTHROPIC_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "GT_REVIEWER_GITHUB_TOKEN"}
+	if got := readFixtureNames(t, out); !slices.Equal(got, want) {
+		t.Errorf("refinery pane secrets = %v, want %v", got, want)
+	}
+	if got := listedNames(t, tm, "", scrubFixtures); len(got) != 0 {
+		t.Errorf("show-environment -g prints %v", got)
+	}
+	if got, want := listedNames(t, tm, "gt-scrub-first", scrubFixtures), []string{"ANTHROPIC_API_KEY"}; !slices.Equal(got, want) {
+		t.Errorf("polecat session secrets = %v, want %v", got, want)
+	}
+}

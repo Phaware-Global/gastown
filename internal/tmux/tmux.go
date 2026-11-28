@@ -302,12 +302,12 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	held := t.WithholdGlobalSecrets("")
+	t.WithholdGlobalSecrets("")
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
 	// A server started by that call took this process's environment.
-	t.isolateSecrets(name, "", "", held)
+	t.isolateSecrets(name, "", "")
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
@@ -363,11 +363,11 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	held := t.WithholdGlobalSecrets("")
+	t.WithholdGlobalSecrets("")
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
-	t.isolateSecrets(name, "", "", held)
+	t.isolateSecrets(name, "", "")
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
@@ -453,11 +453,11 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		}
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
 	}
-	held := t.WithholdGlobalSecrets(townRoot)
+	t.WithholdGlobalSecrets(townRoot)
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
-	t.isolateSecrets(name, env["GT_ROLE"], townRoot, held)
+	t.isolateSecrets(name, env["GT_ROLE"], townRoot)
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
