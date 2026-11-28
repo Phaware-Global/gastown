@@ -56,6 +56,19 @@ not actionable and must be dropped:
   source to its sink, against how the code is actually reached.
 - `codegraph_node` — read surrounding code when the diff alone is ambiguous.
 
+**Running PR code.** Anything that executes code from this checkout (tests,
+builds, scripts, a reproduction) runs through `gt reviewer exec`, never
+directly:
+
+```bash
+gt reviewer exec -- go test ./internal/foo/
+gt reviewer exec -- sh -c 'cd web && npm test'
+```
+
+It keeps the code away from the town's tmux and Dolt servers, so a test that
+needs a live town or the shared database fails there; that failure is not a
+finding.
+
 ### 4. Evidence standard
 Report **only** findings you can ground in a concrete `file:line` plus an
 explicit failure or exploit scenario — the input, interleaving, or call path

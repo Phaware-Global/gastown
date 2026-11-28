@@ -278,6 +278,9 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 // at the keyboard, so they also get privilegeGuardEntries.
 var autonomousOverrideKeys = []string{"polecats", "witness", "refinery", "deacon", "boot", "reviewer", "assistant"}
 
+// reviewerExecMatcher selects every Bash call for the reviewer-exec guard.
+const reviewerExecMatcher = "^Bash$"
+
 // privilegeGuardEntries send sudo and system package installs to the
 // dangerous-command guard. They were in the autonomous settings template
 // only, so gt hooks sync dropped them; mayor and crew keep the interactive
@@ -542,6 +545,16 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// wildcarded so that stays visible.
 		"reviewer": {
 			PreToolUse: []HookEntry{
+				// PR code runs only through `gt reviewer exec`; the guard reads
+				// the command itself. "^Bash$" rather than "Bash": a role entry
+				// replaces the base entry that has the same matcher.
+				{
+					Matcher: reviewerExecMatcher,
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard reviewer-exec"),
+					}},
+				},
 				{
 					Matcher: "Bash(*gh pr review*)",
 					Hooks: []Hook{{
