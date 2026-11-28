@@ -100,12 +100,12 @@ type PRProvider interface {
 	// count. Used to enforce pr_required_approvals > 1.
 	CountApprovals(prNumber int) (int, error)
 
-	// ChecksRollup returns the CI status rollup for the PR:
-	//   state: "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown
-	//   done:  true once every check has reached a terminal state
-	// When no checks are configured on the PR, state="NO_CHECKS" and done=false
-	// so callers decide whether the absence of checks is acceptable (rather
-	// than the provider silently greenlighting the merge).
+	// ChecksRollup returns the CI status of the PR's current head commit:
+	//   state: "SUCCESS", "FAILURE", "PENDING", "NO_CHECKS", or "" if unknown
+	//   done:  true once the verdict is final
+	// SUCCESS requires every check the base branch requires to be present and
+	// finished on that commit. A head with no checks is state="NO_CHECKS"
+	// done=false, so the absence of checks never greenlights a merge.
 	ChecksRollup(prNumber int) (state string, done bool, err error)
 
 	// PostComment posts body as a new top-level PR comment. Used by the
