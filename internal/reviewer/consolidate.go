@@ -6,7 +6,7 @@ import (
 )
 
 // PerspectiveResult is the structured output a single perspective review pass
-// (one subagent) returns: a required one-line verdict plus zero or more
+// returns: a required one-line verdict plus zero or more
 // findings. It is the deterministic machine contract between a perspective pass
 // and the consolidation step — the reviewer collects one of these per enabled
 // perspective and consolidates them into the single posted review.
@@ -117,6 +117,10 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 		return nil, fmt.Errorf("perspective result (%s): %s", r.Perspective, dispositionError(r.Disposition))
 	}
 	for i := range r.Findings {
+		if f := r.Findings[i]; len(f.Sources)+len(f.Reworded) > 0 || f.ReviewerNote != "" {
+			return nil, fmt.Errorf("perspective result (%s): finding[%d] sets sources, reworded or "+
+				"reviewer_note, which only consolidation may set", r.Perspective, i)
+		}
 		// The execution contract requires every finding's perspective to match
 		// the pass. Canonicalize to the pass perspective when empty OR a
 		// case-variant (so downstream tags never differ only by casing); reject a
@@ -273,9 +277,12 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffM
 				// duplicate's paths would let a lens that omitted them mask a
 				// lens that named them honestly — and the merged finding would
 				// post as a blocking demand for work in untouched files. Whether
-				// that happened would depend on subagent arrival order.
+				// that happened would depend on pass order.
 				out[idx].RemediationPaths = mergeRemediationPaths(
 					out[idx].RemediationPaths, f.RemediationPaths)
+				out[idx].Sources = mergeRemediationPaths(out[idx].Sources, f.Sources)
+				out[idx].Reworded = mergeRemediationPaths(out[idx].Reworded, f.Reworded)
+				out[idx].ReviewerNote = mergeText(out[idx].ReviewerNote, f.ReviewerNote)
 				// Preserve perspective-specific detail rather than discarding the
 				// duplicate's body/suggestion.
 				out[idx].Body = mergeText(out[idx].Body, f.Body)
@@ -377,6 +384,8 @@ func collapseLowFindings(in []Finding) []Finding {
 			seed := f
 			seed.Body = mergeText("", nitEntry(f))
 			seed.Suggestion = ""
+			// nitEntry carries these beside the entry they belong to.
+			seed.Reworded, seed.ReviewerNote = nil, ""
 			out = append(out, seed)
 			merged[f.Path] = len(out) - 1
 			continue
@@ -385,6 +394,7 @@ func collapseLowFindings(in []Finding) []Finding {
 			out[idx].Line = f.Line
 		}
 		out[idx].Perspective = mergePerspectives(out[idx].Perspective, f.Perspective)
+		out[idx].Sources = mergeRemediationPaths(out[idx].Sources, f.Sources)
 		out[idx].Body = mergeText(out[idx].Body, nitEntry(f))
 	}
 
@@ -404,11 +414,18 @@ func nitEntry(f Finding) string {
 		fmt.Fprintf(&b, " [%s]", f.Perspective)
 	}
 	fmt.Fprintf(&b, ": %s", strings.TrimSpace(f.Title))
+	if len(f.Reworded) > 0 {
+		fmt.Fprintf(&b, " (wording by the reviewer: %s)", strings.Join(f.Reworded, "; "))
+	}
 	if body := strings.TrimSpace(f.Body); body != "" {
 		fmt.Fprintf(&b, "\n  %s", strings.ReplaceAll(body, "\n", "\n  "))
 	}
 	if sug := strings.TrimSpace(f.Suggestion); sug != "" {
 		fmt.Fprintf(&b, "\n  Suggested fix: %s", strings.ReplaceAll(sug, "\n", "\n  "))
+	}
+	if note := strings.TrimSpace(f.ReviewerNote); note != "" {
+		fmt.Fprintf(&b, "\n  Reviewer note (not from a perspective pass): %s",
+			strings.ReplaceAll(note, "\n", "\n  "))
 	}
 	return b.String()
 }

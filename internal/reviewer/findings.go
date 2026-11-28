@@ -60,6 +60,15 @@ type Finding struct {
 	// read from the payload. Findings outside the diff are demoted to
 	// non-blocking rather than dropped.
 	Scope Scope `json:"scope,omitempty"`
+
+	// The following are set by consolidation; a pass may not set them.
+
+	// Sources are the raw ids this finding was built from.
+	Sources []string `json:"sources,omitempty"`
+	// Reworded names the sources whose wording is the reviewer's.
+	Reworded []string `json:"reworded,omitempty"`
+	// ReviewerNote is the reviewer's own text, shown apart from the lens's.
+	ReviewerNote string `json:"reviewer_note,omitempty"`
 }
 
 // Findings is the full payload `gt reviewer post --findings <json>` consumes.
@@ -87,6 +96,10 @@ type Findings struct {
 	// diff line, which normalizeFinding's path+line requirement makes
 	// inexpressible as a finding.
 	Disposition string `json:"disposition,omitempty"`
+	// Edits are the coordinator's changes to the pass results.
+	Edits *Edits `json:"edits,omitempty"`
+	// Dropped lists the raw findings the edits left out.
+	Dropped []DroppedFinding `json:"dropped,omitempty"`
 }
 
 // Length budgets for a single finding, in runes.
@@ -112,6 +125,7 @@ const (
 	MaxTitleLen      = 120
 	MaxBodyLen       = 1200
 	MaxSuggestionLen = 800
+	MaxNoteLen       = 800
 )
 
 // validPriorities is the closed set of priorities the badge/parser pair models.
@@ -305,6 +319,7 @@ func normalizeFinding(f *Finding, ctx string) error {
 	f.Perspective = strings.TrimSpace(f.Perspective)
 	f.Body = strings.TrimSpace(f.Body)
 	f.Suggestion = strings.TrimSpace(f.Suggestion)
+	f.ReviewerNote = strings.TrimSpace(f.ReviewerNote)
 	// Enforce the length budgets last, so the sizes reported are the ones the
 	// trimmed payload actually carries.
 	for _, lim := range []struct {
@@ -315,6 +330,7 @@ func normalizeFinding(f *Finding, ctx string) error {
 		{"title", f.Title, MaxTitleLen},
 		{"body", f.Body, MaxBodyLen},
 		{"suggestion", f.Suggestion, MaxSuggestionLen},
+		{"reviewer_note", f.ReviewerNote, MaxNoteLen},
 	} {
 		// Count runes, not bytes: a budget measured in bytes would silently
 		// halve for non-ASCII findings.
@@ -352,6 +368,10 @@ func (f Finding) FormatBody() string {
 	} else {
 		fmt.Fprintf(&b, "**%s**\n", f.Title)
 	}
+	if len(f.Reworded) > 0 {
+		fmt.Fprintf(&b, "\n_Some wording is by the reviewer, not the pass (wording by the reviewer: %s)._\n",
+			strings.Join(f.Reworded, "; "))
+	}
 	if strings.TrimSpace(f.Body) != "" {
 		b.WriteString("\n")
 		b.WriteString(strings.TrimRight(f.Body, "\n"))
@@ -360,6 +380,11 @@ func (f Finding) FormatBody() string {
 	if strings.TrimSpace(f.Suggestion) != "" {
 		b.WriteString("\nSuggested fix:\n")
 		b.WriteString(strings.TrimRight(f.Suggestion, "\n"))
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(f.ReviewerNote) != "" {
+		b.WriteString("\n**Reviewer note** (not from a perspective pass):\n")
+		b.WriteString(strings.TrimRight(f.ReviewerNote, "\n"))
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
@@ -403,11 +428,24 @@ func (fs *Findings) SummaryBody(reviewedSHA string) string {
 			if f.Perspective != "" {
 				fmt.Fprintf(&b, " [%s]", f.Perspective)
 			}
+			if len(f.Reworded) > 0 {
+				b.WriteString(" (reworded by reviewer)")
+			}
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
 	}
 	fs.Summary.render(&b)
+	if len(fs.Dropped) > 0 {
+		fmt.Fprintf(&b, "\n### Dropped by reviewer (%d)\n\n", len(fs.Dropped))
+		for _, d := range fs.Dropped {
+			fmt.Fprintf(&b, "- `%s:%d` %s — %s [%s]. Reason: %s\n",
+				d.Path, d.Line, d.Priority, d.Title, d.ID, d.Reason)
+		}
+	}
+	if edits := fs.Edits.describe(); edits != "" {
+		fmt.Fprintf(&b, "\n_Reviewer edits: %s._\n", edits)
+	}
 	b.WriteString("\n---\n\n")
 	b.WriteString(fs.countLine())
 	sha := reviewedSHA

@@ -40,6 +40,8 @@ type ReviewSummary struct {
 type PerspectiveVerdict struct {
 	Perspective string `json:"perspective"`
 	Verdict     string `json:"verdict"`
+	// Reworded marks a verdict whose wording is the reviewer's.
+	Reworded bool `json:"reworded,omitempty"`
 }
 
 // Content budgets for the summary template, in runes.
@@ -172,7 +174,11 @@ func (s *ReviewSummary) Normalize(ctx string) error {
 func (s *ReviewSummary) render(b *strings.Builder) {
 	b.WriteString("### Verdicts\n\n")
 	for _, v := range s.Verdicts {
-		fmt.Fprintf(b, "- **%s** — %s\n", v.Perspective, v.Verdict)
+		fmt.Fprintf(b, "- **%s** — %s", v.Perspective, v.Verdict)
+		if v.Reworded {
+			b.WriteString(" _(reworded by reviewer)_")
+		}
+		b.WriteString("\n")
 	}
 	if len(s.Opportunities) == 0 {
 		return
