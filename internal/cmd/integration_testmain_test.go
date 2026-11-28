@@ -9,12 +9,14 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/testutil/gitenv"
 )
 
 func TestMain(m *testing.M) {
 	// Force sequential test execution to avoid bd file locks on Windows.
 	_ = flag.Set("test.parallel", "1")
 	flag.Parse()
+	gitenv.ClearInheritedConfig()
 
 	// Match CI's Integration job env (ci.yml sets BD_DISABLE_METRICS=1) for the
 	// whole process. Many tests call exec.Command("bd", ...) without a cmd.Env,
