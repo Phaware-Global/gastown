@@ -75,15 +75,23 @@ func getTmuxSessionPIDs() map[int]bool {
 
 	// Scan all tmux sockets in the socket directory.
 	// Each Gas Town instance (and any personal tmux servers) gets its own socket.
-	socketDir := tmux.SocketDir()
-	entries, err := os.ReadDir(socketDir)
-	if err == nil {
+	// The default directory is read too: servers started without this
+	// process's TMUX_TMPDIR live there, and missing them would get their
+	// processes killed.
+	socketDirs := []string{tmux.SocketDir()}
+	if dir := tmux.DefaultSocketDir(); dir != socketDirs[0] {
+		socketDirs = append(socketDirs, dir)
+	}
+	for _, socketDir := range socketDirs {
+		entries, err := os.ReadDir(socketDir)
+		if err != nil {
+			continue
+		}
 		for _, entry := range entries {
 			if entry.IsDir() {
 				continue
 			}
-			socketPath := filepath.Join(socketDir, entry.Name())
-			collectPanePIDs(socketPath, childMap, pids)
+			collectPanePIDs(filepath.Join(socketDir, entry.Name()), childMap, pids)
 		}
 	}
 

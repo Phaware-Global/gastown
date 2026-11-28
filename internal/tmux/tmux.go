@@ -20,6 +20,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/tmuxguard"
 )
 
 // sessionNudgeLocks serializes nudges to the same session.
@@ -160,10 +161,19 @@ func GetDefaultSocket() string {
 	return defaultSocket
 }
 
-// SocketDir returns the directory where tmux stores its socket files.
-// On macOS, tmux uses /tmp (not $TMPDIR which points to /var/folders/...),
-// so we must use /tmp directly rather than os.TempDir().
+// SocketDir returns the directory where tmux stores its socket files: under
+// TMUX_TMPDIR when that is set, as tmux itself does, else DefaultSocketDir.
 func SocketDir() string {
+	if dir := os.Getenv("TMUX_TMPDIR"); dir != "" {
+		return filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()))
+	}
+	return DefaultSocketDir()
+}
+
+// DefaultSocketDir is the socket directory of a tmux started without
+// TMUX_TMPDIR. On macOS, tmux uses /tmp (not $TMPDIR which points to
+// /var/folders/...), so we must use /tmp directly rather than os.TempDir().
+func DefaultSocketDir() string {
 	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
 }
 
@@ -195,7 +205,9 @@ func BuildCommand(args ...string) *exec.Cmd {
 // BuildCommandContext is like BuildCommand but honors a context for cancellation.
 func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	allArgs := []string{"-u"}
-	if sock := GetDefaultSocket(); sock != "" {
+	sock := GetDefaultSocket()
+	tmuxguard.Check(sock)
+	if sock != "" {
 		allArgs = append(allArgs, "-L", sock)
 	}
 	allArgs = append(allArgs, args...)
@@ -248,6 +260,7 @@ func NewTmuxWithSocket(socket string) *Tmux {
 func (t *Tmux) run(args ...string) (string, error) {
 	// Prepend global flags: -u (UTF-8 mode, PATCH-004) and optionally -L (socket).
 	// The -L flag must come before the subcommand, so it goes in the prefix.
+	tmuxguard.Check(t.socketName)
 	allArgs := []string{"-u"}
 	if t.socketName != "" {
 		allArgs = append(allArgs, "-L", t.socketName)
