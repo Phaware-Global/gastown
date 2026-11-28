@@ -3,15 +3,28 @@ package tmux
 import (
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
 
-// Secrets are kept out of the printed global environment of the server: they are
-// held there as hidden variables, which no pane inherits, and each session is
-// given the ones its role may hold in its own session environment. This guards
-// against accidental printing only; "show-environment -gh" still reads them.
+// Secrets are kept out of the printed global environment of the server. Those
+// some role may hold are held there as hidden variables, which no pane inherits,
+// and the rest are removed. Each session is given the ones its role may hold in
+// its own session environment. This guards against accidental printing only;
+// "show-environment -gh" still reads the hidden ones.
+
+// sessionRole returns the GT_ROLE of the named session according to gt's own
+// naming. A session's environment is never asked: its agent can write it.
+var sessionRole = func(string) (string, bool) { return "", false }
+
+// SetSessionRoleResolver sets how an existing session's role is established. A
+// session the resolver does not know is granted no secrets. The session package,
+// which owns the naming, registers it; call it only during initialization.
+func SetSessionRoleResolver(resolve func(session string) (gtRole string, ok bool)) {
+	sessionRole = resolve
+}
 
 // scrubSecrets prefixes a POSIX pane command so that it starts without the
 // secret variables its role may not hold, however they reached the pane. It runs
@@ -49,23 +62,22 @@ func isEnvName(s string) bool {
 }
 
 // secretTownRoot returns the town whose config names the secrets: hint, else
-// what the server or this process says.
+// what this process says, else the server, whose environment any pane can write.
 func (t *Tmux) secretTownRoot(hint string) string {
-	if hint != "" {
-		return hint
+	for _, root := range []string{hint, os.Getenv("GT_TOWN_ROOT"), os.Getenv("GT_ROOT")} {
+		if root != "" {
+			return root
+		}
 	}
-	if root, err := t.GetGlobalEnvironment("GT_TOWN_ROOT"); err == nil && root != "" {
-		return root
-	}
-	if root := os.Getenv("GT_TOWN_ROOT"); root != "" {
-		return root
-	}
-	return os.Getenv("GT_ROOT")
+	root, _ := t.GetGlobalEnvironment("GT_TOWN_ROOT")
+	return root
 }
 
-// WithholdGlobalSecrets hides every secret in the server's global environment.
-// Each existing session first gets, in its own environment, the secrets its role
-// may hold, so that its next respawn still has them. townRoot may be empty.
+// WithholdGlobalSecrets takes every secret out of the printed global environment
+// of the server, hiding those some role may hold and removing the rest. Each
+// existing session gets, in its own environment, those of the server's secrets
+// its role may hold, so that its next respawn still has them. townRoot may be
+// empty.
 // Without a running server there is nothing to do.
 //
 // Values are read one name at a time and never logged.
@@ -96,21 +108,28 @@ func (t *Tmux) WithholdGlobalSecrets(townRoot string) {
 		return
 	}
 	// Hide before granting: grantSecrets reads the hidden variables.
+	holdable := config.AllSessionSecretNames(townRoot)
 	for name, value := range visible {
-		_, _ = t.run("set-environment", "-g", "-h", name, value)
+		if slices.Contains(holdable, name) {
+			_, _ = t.run("set-environment", "-g", "-h", name, value)
+		} else {
+			_, _ = t.run("set-environment", "-g", "-u", name)
+		}
 	}
 	if sessions, err := t.ListSessions(); err == nil {
 		for _, session := range sessions {
-			gtRole, _ := t.GetEnvironment(session, "GT_ROLE")
-			t.grantSecrets(session, gtRole, townRoot)
+			if gtRole, ok := sessionRole(session); ok {
+				t.grantSecrets(session, gtRole, townRoot, false)
+			}
 		}
 	}
 }
 
 // grantSecrets sets, in the session's environment, each secret its role may hold
 // that the session does not already have: the one the server holds hidden, so
-// that it does not matter who starts the session, else this process's own.
-func (t *Tmux) grantSecrets(session, gtRole, townRoot string) {
+// that it does not matter who starts the session, else, with fromCaller, this
+// process's own. fromCaller is only for a session this process is creating.
+func (t *Tmux) grantSecrets(session, gtRole, townRoot string, fromCaller bool) {
 	configured := config.ConfiguredSecretEnvNames(townRoot)
 	for _, name := range envNames(config.SessionSecretAllowlist(gtRole, townRoot)) {
 		// The allowlist can name variables that are not secrets by name.
@@ -123,7 +142,10 @@ func (t *Tmux) grantSecrets(session, gtRole, townRoot string) {
 		out, err := t.run("show-environment", "-g", "-h", name)
 		value, ok := strings.CutPrefix(out, name+"=")
 		if err != nil || !ok {
-			value = os.Getenv(name)
+			value = ""
+			if fromCaller {
+				value = os.Getenv(name)
+			}
 		}
 		if value != "" {
 			_ = t.SetEnvironment(session, name, value)
@@ -131,26 +153,33 @@ func (t *Tmux) grantSecrets(session, gtRole, townRoot string) {
 	}
 }
 
-// isolateSecrets hides the secrets in the global environment and gives session
-// the ones its role may hold.
+// isolateSecrets withholds the global secrets and gives session, which this
+// process has just created, the ones its role may hold. An empty gtRole is
+// looked up by the session's name.
 func (t *Tmux) isolateSecrets(session, gtRole, townRoot string) {
 	if runtime.GOOS == "windows" {
 		return
 	}
 	townRoot = t.secretTownRoot(townRoot)
+	if gtRole == "" {
+		gtRole, _ = sessionRole(session)
+	}
 	t.WithholdGlobalSecrets(townRoot)
-	t.grantSecrets(session, gtRole, townRoot)
+	t.grantSecrets(session, gtRole, townRoot, true)
 }
 
-// scrubForTarget prepares a respawn of the target pane, using the role recorded
-// in the environment of the session that owns it.
+// scrubForTarget prepares a respawn of the target pane, using the role of the
+// session that owns it. An unknown session is granted nothing.
 func (t *Tmux) scrubForTarget(target, command string) string {
+	townRoot := t.secretTownRoot("")
+	var gtRole string
 	session, err := t.run("display-message", "-p", "-t", target, "#{session_name}")
-	var gtRole, townRoot string
-	if session = strings.TrimSpace(session); err == nil && session != "" {
-		gtRole, _ = t.GetEnvironment(session, "GT_ROLE")
-		townRoot, _ = t.GetEnvironment(session, "GT_ROOT")
-		t.isolateSecrets(session, gtRole, townRoot)
+	if session = strings.TrimSpace(session); err == nil && session != "" && runtime.GOOS != "windows" {
+		t.WithholdGlobalSecrets(townRoot)
+		var ok bool
+		if gtRole, ok = sessionRole(session); ok {
+			t.grantSecrets(session, gtRole, townRoot, false)
+		}
 	}
-	return scrubSecrets(gtRole, t.secretTownRoot(townRoot), command)
+	return scrubSecrets(gtRole, townRoot, command)
 }

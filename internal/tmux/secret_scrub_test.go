@@ -25,12 +25,25 @@ var scrubFixtures = []string{
 	"UNRELATED_SERVICE_PAT",
 }
 
+// scrubRoles stands in for gt's session naming, which this package cannot see.
+var scrubRoles = map[string]string{}
+
 // scrubTestServer starts the shared test server and seeds its global
 // environment with fixture values, as a server started from a shell holding
 // them would.
 func scrubTestServer(t *testing.T) *Tmux {
 	t.Helper()
 	tm := newTestTmux(t)
+	town := t.TempDir()
+	t.Setenv("GT_TOWN_ROOT", town)
+	t.Setenv("GT_ROOT", town)
+	previous := sessionRole
+	scrubRoles = map[string]string{}
+	SetSessionRoleResolver(func(session string) (string, bool) {
+		role, ok := scrubRoles[session]
+		return role, ok
+	})
+	t.Cleanup(func() { sessionRole = previous })
 	keeper := "gt-scrub-keeper"
 	_ = tm.KillSession(keeper)
 	if err := tm.NewSession(keeper, ""); err != nil {
@@ -144,6 +157,7 @@ func TestSessionEnvHoldsExactlyTheRoleSecrets(t *testing.T) {
 			t.Cleanup(func() { _ = tm.KillSession(session) })
 
 			seedGlobal(t, tm, scrubFixtures...)
+			scrubRoles[session] = tc.role
 			if err := tm.NewSessionWithCommandAndEnv(session, dir, dumpNamesCommand(out), env); err != nil {
 				t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
 			}
@@ -152,7 +166,7 @@ func TestSessionEnvHoldsExactlyTheRoleSecrets(t *testing.T) {
 			}
 
 			// A handoff or restart respawns the pane; the role comes from the
-			// session environment.
+			// session's name.
 			for name, respawn := range map[string]func(string) error{
 				"respawn": func(cmd string) error { return tm.RespawnPane(session, cmd) },
 				"respawn-workdir": func(cmd string) error {
@@ -194,6 +208,7 @@ func startScrubSession(t *testing.T, tm *Tmux, session, role string, env map[str
 		env = map[string]string{}
 	}
 	env["GT_ROLE"] = role
+	scrubRoles[session] = role
 	if env["GT_ROOT"] == "" {
 		env["GT_ROOT"] = t.TempDir()
 	}
@@ -267,6 +282,7 @@ func TestSessionSecretsComeFromStartingProcess(t *testing.T) {
 func TestConfiguredSecretNamesNeedNoSuffix(t *testing.T) {
 	tm := scrubTestServer(t)
 	town := t.TempDir()
+	t.Setenv("GT_TOWN_ROOT", town)
 	for rel, body := range map[string]string{
 		"settings/config.json":     `{"type":"town-settings","version":1,"assistant":{"sweep":{"jira":{"token_env":"ACME_JIRA_CRED"},"github":{"token_env":"ACME_FORGE_CRED"}}},"role_secrets":{"witness":["ACME_EXTRA_CRED"]}}`,
 		"settings/telegraph.toml":  "[telegraph.providers.github]\nsecret_env = \"ACME_WEBHOOK_HMAC\"\n",
@@ -333,6 +349,7 @@ func TestScrubbedStarterStillGivesSessionItsSecrets(t *testing.T) {
 	_ = tm.KillSession(session)
 	t.Cleanup(func() { _ = tm.KillSession(session) })
 	env := map[string]string{"GT_ROLE": "rig/refinery", "GT_ROOT": dir}
+	scrubRoles[session] = "rig/refinery"
 	if err := tm.NewSessionWithCommandAndEnv(session, dir, dumpNamesCommand(out), env); err != nil {
 		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
 	}

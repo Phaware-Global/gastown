@@ -92,6 +92,25 @@ func SessionSecretAllowlist(gtRole, townRoot string) []string {
 	return sortedNames(allowed)
 }
 
+// AllSessionSecretNames returns the sorted names that are on the allowlist of at
+// least one role.
+func AllSessionSecretNames(townRoot string) []string {
+	var names []string
+	// The mayor's list covers every rig's reviewer token name.
+	for _, role := range []string{"", constants.RolePolecat, constants.RoleReviewer,
+		constants.RoleRefinery, constants.RoleCrew, constants.RoleMayor, constants.RoleAssistant} {
+		names = append(names, SessionSecretAllowlist(role, townRoot)...)
+	}
+	if townRoot != "" {
+		if ts := loadTownSettingsIfValid(townRoot); ts != nil {
+			for _, extra := range ts.RoleSecrets {
+				names = append(names, extra...)
+			}
+		}
+	}
+	return sortedNames(names)
+}
+
 // ConfiguredSecretEnvNames returns the sorted names of the environment
 // variables the town's config says hold secrets, whatever they end in: reviewer
 // tokens, telegraph webhook secrets, assistant sweep tokens and role_secrets.
