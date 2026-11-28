@@ -202,6 +202,12 @@ type Daemon struct {
 	// diskGuard holds the disk-free check's escalation-throttling state.
 	diskGuard *diskGuard
 
+	// lastGoTmpSweep is touched only by the heartbeat goroutine.
+	// goTmpSweepRunning keeps one background sweep at a time. Shutdown does not
+	// wait for it: an interrupted removal is finished by a later sweep.
+	lastGoTmpSweep    time.Time
+	goTmpSweepRunning atomic.Bool
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
@@ -1050,6 +1056,9 @@ func (d *Daemon) heartbeat(state *State) {
 	// is independent of every later phase: it only stats a path.
 	if d.isPatrolActive("disk_guard") {
 		d.checkDiskFree()
+	}
+	if d.isPatrolActive("go_tmp_sweep") {
+		d.maybeSweepGoTmp()
 	}
 
 	// 0a. Reload prefix registry so new/changed rigs get correct session names.
