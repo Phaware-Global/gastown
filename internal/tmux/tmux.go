@@ -161,10 +161,19 @@ func GetDefaultSocket() string {
 	return defaultSocket
 }
 
-// SocketDir returns the directory where tmux stores its socket files.
-// On macOS, tmux uses /tmp (not $TMPDIR which points to /var/folders/...),
-// so we must use /tmp directly rather than os.TempDir().
+// SocketDir returns the directory where tmux stores its socket files: under
+// TMUX_TMPDIR when that is set, as tmux itself does, else DefaultSocketDir.
 func SocketDir() string {
+	if dir := os.Getenv("TMUX_TMPDIR"); dir != "" {
+		return filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()))
+	}
+	return DefaultSocketDir()
+}
+
+// DefaultSocketDir is the socket directory of a tmux started without
+// TMUX_TMPDIR. On macOS, tmux uses /tmp (not $TMPDIR which points to
+// /var/folders/...), so we must use /tmp directly rather than os.TempDir().
+func DefaultSocketDir() string {
 	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
 }
 

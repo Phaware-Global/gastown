@@ -290,6 +290,13 @@ func TestNudgeInvalidPriority(t *testing.T) {
 	}
 }
 
+// leaveTown moves out of any town around the checkout. runNudge would otherwise
+// select that town's tmux socket for the rest of the test binary.
+func leaveTown(t *testing.T) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+}
+
 func TestNudgeValidModesAccepted(t *testing.T) {
 	// Verify all valid modes pass the validation check (they'll fail later
 	// on tmux operations, but should NOT fail on mode validation).
@@ -316,6 +323,8 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 	nudgeStdinFlag = false
 	nudgeMessageFlag = "test"
 	nudgePriorityFlag = "normal"
+
+	leaveTown(t)
 
 	for _, mode := range []string{NudgeModeImmediate, NudgeModeQueue, NudgeModeWaitIdle} {
 		t.Run(mode, func(t *testing.T) {
@@ -477,6 +486,8 @@ func TestNudgeTrailingSlashNormalization(t *testing.T) {
 	nudgeMessageFlag = "test"
 	nudgePriorityFlag = "normal"
 	nudgeModeFlag = NudgeModeImmediate
+
+	leaveTown(t)
 
 	for _, target := range []string{"mayor/", "deacon/", "witness/", "refinery/"} {
 		t.Run(target, func(t *testing.T) {
