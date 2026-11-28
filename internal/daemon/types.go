@@ -150,6 +150,7 @@ type PatrolsConfig struct {
 	QuotaDog             *QuotaDogConfig             `json:"quota_dog,omitempty"`
 	RestartTracker       *RestartTrackerConfig       `json:"restart_tracker,omitempty"`
 	Telegraph            *TelegraphServerConfig      `json:"telegraph,omitempty"`
+	GoTmpSweep           *GoTmpSweepConfig           `json:"go_tmp_sweep,omitempty"` // default enabled
 }
 
 // DiskGuardConfig holds configuration for the disk_guard patrol.
@@ -474,6 +475,10 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 	case "disk_guard":
 		if config.Patrols.DiskGuard != nil {
 			return config.Patrols.DiskGuard.Enabled == nil || *config.Patrols.DiskGuard.Enabled
+		}
+	case "go_tmp_sweep":
+		if config.Patrols.GoTmpSweep != nil {
+			return config.Patrols.GoTmpSweep.Enabled == nil || *config.Patrols.GoTmpSweep.Enabled
 		}
 	}
 	return true // Default: enabled
