@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
@@ -178,15 +179,6 @@ func (m *Manager) Start(agentOverride string, extraEnv map[string]string) error 
 		runtimeConfigDir = os.Getenv("CLAUDE_CONFIG_DIR")
 	}
 
-	runtimeConfig := config.ResolveRoleAgentConfig("reviewer", townRoot, m.rig.Path)
-	reviewerSettingsDir := config.RoleSettingsDir("reviewer", m.rig.Path)
-	if err := runtime.EnsureSettingsForRole(reviewerSettingsDir, reviewerRigDir, "reviewer", runtimeConfig); err != nil {
-		return fmt.Errorf("ensuring runtime settings: %w", err)
-	}
-	if err := rig.EnsureGitignorePatterns(reviewerRigDir); err != nil {
-		style.PrintWarning("could not update reviewer .gitignore: %v", err)
-	}
-
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("reviewer", "", m.rig.Name),
 		Sender:    "refinery",
@@ -204,6 +196,23 @@ func (m *Manager) Start(agentOverride string, extraEnv map[string]string) error 
 	}, m.rig.Path, initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
+	}
+
+	// Settings are set up only after the command is built: building it refuses
+	// an agent that would load configuration from the PR checkout.
+	runtimeConfig := config.ResolveRoleAgentConfig("reviewer", townRoot, m.rig.Path)
+	reviewerSettingsDir := config.RoleSettingsDir("reviewer", m.rig.Path)
+	if err := runtime.EnsureSettingsForRole(reviewerSettingsDir, reviewerRigDir, "reviewer", runtimeConfig); err != nil {
+		return fmt.Errorf("ensuring runtime settings: %w", err)
+	}
+	// Rendered afresh on every start: this file carries the reviewer's tool
+	// guards, and an earlier session could have edited it.
+	settingsFile := config.RoleSettingsFile(runtimeConfig, "reviewer", m.rig.Path)
+	if err := hooks.RenderClaudeSettings(settingsFile, m.rig.Name+"/reviewer", "reviewer"); err != nil {
+		return fmt.Errorf("rendering reviewer settings: %w", err)
+	}
+	if err := rig.EnsureGitignorePatterns(reviewerRigDir); err != nil {
+		style.PrintWarning("could not update reviewer .gitignore: %v", err)
 	}
 
 	envVars := config.AgentEnv(config.AgentEnvConfig{
