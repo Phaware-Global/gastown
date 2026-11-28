@@ -868,6 +868,9 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		}
 	}
 	var runtimeCmd string
+	// Set for roles in a PR checkout; the exported env must come from the same
+	// config as the command.
+	var checkoutConfig *config.RuntimeConfig
 	if config.RunsInPRCheckout(simpleRole) {
 		rc, err := config.PRCheckoutRuntimeConfig(simpleRole, rigPath, currentAgent)
 		if err != nil {
@@ -882,6 +885,7 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 				return "", fmt.Errorf("rendering reviewer settings: %w", err)
 			}
 		}
+		checkoutConfig = rc
 		runtimeCmd = rc.BuildCommandWithPrompt(beacon)
 	} else if currentAgent != "" {
 		var err error
@@ -919,7 +923,9 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		// the active agent's env (e.g., NODE_OPTIONS from [agents.X.env]).
 		// Otherwise, fall back to role-based resolution.
 		var runtimeConfig *config.RuntimeConfig
-		if currentAgent != "" {
+		if checkoutConfig != nil {
+			runtimeConfig = checkoutConfig
+		} else if currentAgent != "" {
 			rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, rigPath, currentAgent)
 			if err == nil {
 				runtimeConfig = rc
