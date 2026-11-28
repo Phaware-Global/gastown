@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,8 +26,9 @@ const (
 	maintainGCTimeout = 5 * time.Minute
 	// maintainBackupTimeout is the timeout for dolt backup sync on a single database.
 	maintainBackupTimeout = 2 * time.Minute
-	// maintainBackupListTimeout is the timeout for listing a database's backup remotes.
-	maintainBackupListTimeout = 10 * time.Second
+	// defaultMaintainBackupListTimeout is the default timeout for listing a
+	// database's backup remotes. A loaded host can take well over 10s.
+	defaultMaintainBackupListTimeout = 60 * time.Second
 	// maintainQueryTimeout is the timeout for individual SQL queries during flatten.
 	maintainQueryTimeout = 30 * time.Second
 )
@@ -35,6 +37,8 @@ var (
 	maintainForce     bool
 	maintainDryRun    bool
 	maintainThreshold int
+
+	maintainBackupListTimeout time.Duration
 )
 
 var maintainCmd = &cobra.Command{
@@ -51,6 +55,11 @@ This encapsulates the maintenance procedure:
   3. Flatten databases over commit threshold
   4. Run dolt_gc() on each database
 
+Flatten and gc destroy history, so they run on a database only after its
+<name>-backup remote was synced successfully in the same run. A database with
+no such remote is skipped. If the remotes cannot be listed or the sync fails,
+the database is skipped and the command exits non-zero.
+
 Use --force for non-interactive mode (daemon/cron), or run interactively
 to review the plan before proceeding.
 
@@ -66,6 +75,7 @@ func init() {
 	maintainCmd.Flags().BoolVar(&maintainForce, "force", false, "Non-interactive mode (skip confirmation)")
 	maintainCmd.Flags().BoolVar(&maintainDryRun, "dry-run", false, "Preview without making changes")
 	maintainCmd.Flags().IntVar(&maintainThreshold, "threshold", defaultMaintainThreshold, "Commit count threshold for flatten")
+	maintainCmd.Flags().DurationVar(&maintainBackupListTimeout, "backup-list-timeout", defaultMaintainBackupListTimeout, "Timeout for listing a database's backup remotes")
 	rootCmd.AddCommand(maintainCmd)
 }
 
@@ -74,6 +84,8 @@ type maintainDBInfo struct {
 	name        string
 	commitCount int
 	hasBackup   bool
+	// listErr means it is unknown whether a backup remote is configured.
+	listErr error
 }
 
 func runMaintain(cmd *cobra.Command, args []string) error {
@@ -115,12 +127,17 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s Maintenance plan:\n", style.Bold.Render("●"))
 	for _, db := range dbInfos {
 		tags := ""
-		if db.commitCount >= maintainThreshold {
-			tags += fmt.Sprintf(" %s", style.Warning.Render("→ flatten"))
-			flattenCount++
-		}
-		if db.hasBackup {
-			tags += fmt.Sprintf(" %s", style.Dim.Render("[backup]"))
+		switch {
+		case db.listErr != nil:
+			tags = " " + style.Warning.Render(fmt.Sprintf("[backup unknown, will skip: %v]", db.listErr))
+		case !db.hasBackup:
+			tags = " " + style.Dim.Render("[no backup, will skip]")
+		default:
+			if db.commitCount >= maintainThreshold {
+				tags = " " + style.Warning.Render("→ flatten")
+				flattenCount++
+			}
+			tags += " " + style.Dim.Render("[backup]")
 			backupCount++
 		}
 		fmt.Printf("  %s: %d commits%s\n", db.name, db.commitCount, tags)
@@ -128,11 +145,17 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n  Databases: %d\n", len(dbInfos))
 	fmt.Printf("  Will backup: %d\n", backupCount)
 	fmt.Printf("  Will flatten: %d (threshold: %d commits)\n", flattenCount, maintainThreshold)
-	fmt.Printf("  Will gc: %d\n", len(dbInfos))
+	fmt.Printf("  Will gc: %d\n", backupCount)
 
 	if maintainDryRun {
 		fmt.Printf("\n%s Dry run complete — no changes made\n", style.Dim.Render("ℹ"))
-		return nil
+		var unknown []string
+		for _, db := range dbInfos {
+			if db.listErr != nil {
+				unknown = append(unknown, db.name)
+			}
+		}
+		return maintainUnconfirmedError(unknown)
 	}
 
 	// Interactive confirmation.
@@ -163,7 +186,7 @@ func maintainPlanDatabases(dataDir string, databases []string, count func(string
 		if n, err := count(dbName); err == nil {
 			info.commitCount = n
 		}
-		info.hasBackup = maintainHasBackup(dataDir, dbName, listTimeout)
+		info.hasBackup, info.listErr = maintainHasBackup(dataDir, dbName, listTimeout)
 		dbInfos = append(dbInfos, info)
 	}
 	return dbInfos
@@ -194,18 +217,26 @@ func maintainExecute(dataDir string, dbInfos []maintainDBInfo, threshold int, op
 	// No need to park rigs or stop the server — all operations (flatten, gc)
 	// are safe on a running server per Tim Sehn (2026-02-28).
 
-	// Phase 2: Backup.
+	// Phase 2: Backup. Only databases in backedUp may be flattened or gc'd.
+	backedUp := make(map[string]bool, len(dbInfos))
+	var unconfirmed, noBackup []string
 	if backupCount > 0 {
 		fmt.Printf("\n%s Backing up databases...\n", style.Bold.Render("●"))
-		for _, db := range dbInfos {
-			if !db.hasBackup {
-				continue
-			}
-			backupName := db.name + "-backup"
-			if err := maintainBackupSync(dataDir, db.name, backupName); err != nil {
-				fmt.Printf("  %s %s: backup failed: %v\n", style.Warning.Render("!"), db.name, err)
+	}
+	for _, db := range dbInfos {
+		switch {
+		case db.listErr != nil:
+			fmt.Printf("  %s %s: cannot list backups, will not flatten or gc: %v\n", style.Bold.Render("✗"), db.name, db.listErr)
+			unconfirmed = append(unconfirmed, db.name)
+		case !db.hasBackup:
+			noBackup = append(noBackup, db.name)
+		default:
+			if err := maintainBackupSync(dataDir, db.name, db.name+"-backup"); err != nil {
+				fmt.Printf("  %s %s: backup failed, will not flatten or gc: %v\n", style.Bold.Render("✗"), db.name, err)
+				unconfirmed = append(unconfirmed, db.name)
 			} else {
 				fmt.Printf("  %s %s backed up\n", style.Bold.Render("✓"), db.name)
+				backedUp[db.name] = true
 			}
 		}
 	}
@@ -230,7 +261,7 @@ func maintainExecute(dataDir string, dbInfos []maintainDBInfo, threshold int, op
 	if flattenCount > 0 {
 		fmt.Printf("\n%s Flattening databases...\n", style.Bold.Render("●"))
 		for _, db := range dbInfos {
-			if db.commitCount < threshold {
+			if db.commitCount < threshold || !backedUp[db.name] {
 				continue
 			}
 			preCount := db.commitCount
@@ -248,6 +279,9 @@ func maintainExecute(dataDir string, dbInfos []maintainDBInfo, threshold int, op
 	gcCount := 0
 	fmt.Printf("\n%s Running GC (via SQL on running server)...\n", style.Bold.Render("●"))
 	for _, db := range dbInfos {
+		if !backedUp[db.name] {
+			continue
+		}
 		gcStart := time.Now()
 		if err := ops.gc(db.name); err != nil {
 			fmt.Printf("  %s %s: gc failed: %v\n", style.Warning.Render("!"), db.name, err)
@@ -263,8 +297,20 @@ func maintainExecute(dataDir string, dbInfos []maintainDBInfo, threshold int, op
 	fmt.Printf("  Wisps reaped: %d\n", totalReaped)
 	fmt.Printf("  Databases flattened: %d\n", totalFlattened)
 	fmt.Printf("  Databases gc'd: %d\n", gcCount)
+	if len(noBackup) > 0 {
+		fmt.Printf("  Not flattened or gc'd (no <name>-backup remote): %s\n", strings.Join(noBackup, ", "))
+	}
 
-	return nil
+	return maintainUnconfirmedError(unconfirmed)
+}
+
+// maintainUnconfirmedError fails the command for databases whose backup could
+// not be confirmed.
+func maintainUnconfirmedError(databases []string) error {
+	if len(databases) == 0 {
+		return nil
+	}
+	return fmt.Errorf("backup unconfirmed, not flattened or gc'd: %s", strings.Join(databases, ", "))
 }
 
 // maintainCountCommits returns the number of Dolt commits in a database.
@@ -287,26 +333,35 @@ func maintainCountCommits(config *doltserver.Config, dbName string) (int, error)
 }
 
 // maintainHasBackup checks if a database has a <name>-backup remote configured.
-func maintainHasBackup(dataDir, dbName string, timeout time.Duration) bool {
+// An error means the answer is unknown, not that there is no remote.
+func maintainHasBackup(dataDir, dbName string, timeout time.Duration) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	dbDir := filepath.Join(dataDir, dbName)
 	cmd := exec.CommandContext(ctx, "dolt", "backup")
-	cmd.Dir = dbDir
+	cmd.Dir = filepath.Join(dataDir, dbName)
+	// A grandchild holding the output pipe must not outlast the timeout.
+	cmd.WaitDelay = time.Second
 
 	output, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return false, fmt.Errorf("dolt backup timed out after %v", timeout)
+	}
 	if err != nil {
-		return false
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return false, fmt.Errorf("dolt backup: %w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return false, fmt.Errorf("dolt backup: %w", err)
 	}
 
 	backupName := dbName + "-backup"
 	for _, line := range strings.Split(string(output), "\n") {
 		if strings.TrimSpace(line) == backupName {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // maintainBackupSync runs dolt backup sync for a single database.
