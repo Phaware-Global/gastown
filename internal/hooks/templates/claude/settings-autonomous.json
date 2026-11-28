@@ -26,6 +26,10 @@
           },
           {
             "type": "command",
+            "command": "{{GT_BIN}} tap guard env-dump"
+          },
+          {
+            "type": "command",
             "command": "{{GT_BIN}} tap guard memory-write"
           }
         ]
