@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -98,6 +99,27 @@ func TestEnvDumpGuardBlocks(t *testing.T) {
 		"env | tee /tmp/e | cut -d= -f1",
 		"env | grep -o 'ghp_.*' | cut -d= -f1",
 		"set | cut -d= -f1",
+		// Cutting a listing to names does not hide multi-line values.
+		"env | cut -d= -f1",
+		"env | cut -s -d= -f1",
+		"env | cut -d '=' -f 1 | sort",
+		"env | grep ^GT_ | cut -d= -f1",
+		"env | sort | cut -s -d= -f1",
+		"env 2>/dev/null | cut -d= -f1",
+		"printenv | cut -d= -f1",
+		`env | awk -F= '{print $1}'`,
+		// Descriptors above 2.
+		"env 3>&1",
+		"env 3>&1 1>/dev/null",
+		"env 3>/tmp/dump",
+		"env {fd}>&1",
+		"printenv {fd}>/tmp/dump",
+		"exec 3>&1; env >&3",
+		`echo "$GH_TOKEN" 3>&1`,
+		// A secret piped into a consumer: the guard cannot tell it from a
+		// command that displays its input.
+		`echo "$DB_PASSWORD" | docker login -u me --password-stdin`,
+		`printf %s "$GH_TOKEN" | gh auth login --with-token`,
 		// A secret variable by name.
 		"printenv GH_TOKEN",
 		"printenv HOME WEBHOOK_SECRET",
@@ -139,6 +161,10 @@ func TestEnvDumpGuardBlocks(t *testing.T) {
 		`echo "$(env)"`,
 		"echo `printenv`",
 		`diff <(env) /tmp/old`,
+		"cat <(env)",
+		"diff <(env) x",
+		"cat < <(printenv)",
+		"tee >(env) </dev/null",
 		`sh -c 'env'`,
 		`bash -lc "echo \$GH_TOKEN"`,
 		`zsh -c 'printenv | head'`,
@@ -176,15 +202,9 @@ func TestEnvDumpGuardBlocks(t *testing.T) {
 func TestEnvDumpGuardAllows(t *testing.T) {
 	commands := []string{
 		// Names only.
-		"env | cut -d= -f1",
-		"env | cut -d '=' -f 1 | sort",
-		"env | grep ^GT_ | cut -d= -f1",
-		"env | sort | cut -s -d= -f1",
-		"env 2>/dev/null | cut -d= -f1",
-		"printenv | cut -d= -f1",
-		`env | awk -F= '{print $1}'`,
 		"compgen -e",
 		"compgen -e | grep TOKEN",
+		"bash -c 'compgen -e'",
 		// Presence checks.
 		`test -n "$GH_TOKEN" && echo set`,
 		`[ -n "$GH_TOKEN" ] && echo set || echo unset`,
@@ -270,9 +290,59 @@ func TestEnvDumpGuardFailsClosed(t *testing.T) {
 
 func TestEnvDumpGuardMessageNamesSafeCheck(t *testing.T) {
 	_, out := runEnvDumpGuard(t, envDumpPayload(t, "echo $GH_TOKEN"))
-	for _, want := range []string{`test -n "$VAR" && echo set`, "compgen -e"} {
+	for _, want := range []string{
+		`test -n "$VAR" && echo set`,
+		"bash -c 'compgen -e'",
+		"GH_TOKEN",
+		"cmd --password-stdin < file",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("block message lacks %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "cut ") {
+		t.Errorf("block message recommends cut:\n%s", out)
+	}
+}
+
+// Every command the guard allows here must keep a multi-line value off its
+// output, including the lines that carry no = or end in one.
+func TestEnvDumpGuardAllowedFormsHideMultiLineValues(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not found")
+	}
+	value := "marker-first\nmarker-bare\nmarker-padded==\nmarker-last"
+	environment := []string{"PATH=" + os.Getenv("PATH"), "DEMO_PRIVATE_KEY=" + value}
+
+	for command, advised := range map[string]bool{
+		"compgen -e":                              true,
+		"bash -c 'compgen -e'":                    true,
+		"compgen -e | grep KEY":                   true,
+		`test -n "$DEMO_PRIVATE_KEY" && echo set`: true,
+		`echo "${DEMO_PRIVATE_KEY:+set}"`:         true,
+		"env | cut -d= -f1":                       false,
+		"env | cut -s -d= -f1":                    false,
+		`env | awk -F= '{print $1}'`:              false,
+		"printenv | cut -d= -f1":                  false,
+	} {
+		t.Run(command, func(t *testing.T) {
+			blocked, _ := runEnvDumpGuard(t, envDumpPayload(t, command))
+			if blocked {
+				if advised {
+					t.Errorf("command %q was blocked", command)
+				}
+				return
+			}
+			run := exec.Command(bash, "-c", command)
+			run.Env = environment
+			out, err := run.CombinedOutput()
+			if err != nil {
+				t.Fatalf("running %q: %v", command, err)
+			}
+			if strings.Contains(string(out), "marker-") {
+				t.Errorf("allowed command %q prints the value", command)
+			}
+		})
 	}
 }
