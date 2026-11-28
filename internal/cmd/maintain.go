@@ -151,6 +151,34 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	return maintainExecute(config.DataDir, dbInfos, maintainThreshold, maintainOps{
+		reap:    func(db string) (int, error) { return doltserver.PurgeClosedEphemerals(townRoot, db, false) },
+		count:   func(db string) (int, error) { return maintainCountCommits(config, db) },
+		flatten: func(db string) error { return maintainFlattenDB(config, db) },
+		gc:      func(db string) error { return maintainGCDatabase(config, db) },
+	})
+}
+
+// maintainOps are the server-side steps of a maintenance run.
+type maintainOps struct {
+	reap    func(db string) (int, error)
+	count   func(db string) (int, error)
+	flatten func(db string) error
+	gc      func(db string) error
+}
+
+// maintainExecute runs the backup, reap, flatten and gc phases of a plan.
+func maintainExecute(dataDir string, dbInfos []maintainDBInfo, threshold int, ops maintainOps) error {
+	backupCount, flattenCount := 0, 0
+	for _, db := range dbInfos {
+		if db.hasBackup {
+			backupCount++
+		}
+		if db.commitCount >= threshold {
+			flattenCount++
+		}
+	}
+
 	start := time.Now()
 
 	// No need to park rigs or stop the server — all operations (flatten, gc)
@@ -164,7 +192,7 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			backupName := db.name + "-backup"
-			if err := maintainBackupSync(config.DataDir, db.name, backupName); err != nil {
+			if err := maintainBackupSync(dataDir, db.name, backupName); err != nil {
 				fmt.Printf("  %s %s: backup failed: %v\n", style.Warning.Render("!"), db.name, err)
 			} else {
 				fmt.Printf("  %s %s backed up\n", style.Bold.Render("✓"), db.name)
@@ -176,7 +204,7 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s Reaping closed wisps...\n", style.Bold.Render("●"))
 	totalReaped := 0
 	for _, db := range dbInfos {
-		purged, err := doltserver.PurgeClosedEphemerals(townRoot, db.name, false)
+		purged, err := ops.reap(db.name)
 		if err != nil {
 			fmt.Printf("  %s %s: reap failed: %v\n", style.Warning.Render("!"), db.name, err)
 		} else if purged > 0 {
@@ -192,14 +220,14 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 	if flattenCount > 0 {
 		fmt.Printf("\n%s Flattening databases...\n", style.Bold.Render("●"))
 		for _, db := range dbInfos {
-			if db.commitCount < maintainThreshold {
+			if db.commitCount < threshold {
 				continue
 			}
 			preCount := db.commitCount
-			if err := maintainFlattenDB(config, db.name); err != nil {
+			if err := ops.flatten(db.name); err != nil {
 				fmt.Printf("  %s %s: flatten failed: %v\n", style.Bold.Render("✗"), db.name, err)
 			} else {
-				postCount, _ := maintainCountCommits(config, db.name)
+				postCount, _ := ops.count(db.name)
 				fmt.Printf("  %s %s: %d → %d commits\n", style.Bold.Render("✓"), db.name, preCount, postCount)
 				totalFlattened++
 			}
@@ -211,7 +239,7 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s Running GC (via SQL on running server)...\n", style.Bold.Render("●"))
 	for _, db := range dbInfos {
 		gcStart := time.Now()
-		if err := maintainGCDatabase(config, db.name); err != nil {
+		if err := ops.gc(db.name); err != nil {
 			fmt.Printf("  %s %s: gc failed: %v\n", style.Warning.Render("!"), db.name, err)
 		} else {
 			fmt.Printf("  %s %s: gc completed (%v)\n",
