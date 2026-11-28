@@ -3607,3 +3607,24 @@ func TestPushAndRemoteQueries_QualifyBareBranch(t *testing.T) {
 		t.Errorf("RemoteBranchExists(--exit-code) = (%v, %v), want (false, nil)", exists, err)
 	}
 }
+
+func TestDisableHooksForProcessKeepsInheritedConfig(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "user.name")
+	t.Setenv("GIT_CONFIG_VALUE_0", "inherited")
+	t.Setenv("GIT_CONFIG_KEY_1", "")
+	t.Setenv("GIT_CONFIG_VALUE_1", "")
+
+	if err := DisableHooksForProcess(); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"user.name": "inherited", "core.hooksPath": "/dev/null"} {
+		out, err := exec.Command("git", "config", "--get", key).Output()
+		if err != nil {
+			t.Fatalf("git config --get %s: %v", key, err)
+		}
+		if got := strings.TrimSpace(string(out)); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}

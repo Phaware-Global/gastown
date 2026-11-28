@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -919,6 +920,9 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		envMap["GT_ROLE"] = gtRole
 		envMap["BD_ACTOR"] = gtRole
 		envMap["GIT_AUTHOR_NAME"] = gtRole
+		if simpleRole == constants.RoleRefinery {
+			maps.Copy(envMap, constants.GitHooksDisabledEnv())
+		}
 		if runtimeConfig.Session != nil && runtimeConfig.Session.SessionIDEnv != "" {
 			envMap["GT_SESSION_ID_ENV"] = runtimeConfig.Session.SessionIDEnv
 		}
