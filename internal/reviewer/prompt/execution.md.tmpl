@@ -60,14 +60,18 @@ not actionable and must be dropped:
 builds, scripts, a reproduction) runs through `gt reviewer exec`, never
 directly:
 
+The command starts in a temporary directory, not in the checkout, so name the
+checkout (`$PWD` in your shell). Run one command per call:
+
 ```bash
-gt reviewer exec -- go test ./internal/foo/
-gt reviewer exec -- sh -c 'cd web && npm test'
+gt reviewer exec -- go -C "$PWD" test ./internal/foo/
+gt reviewer exec -- env -C "$PWD/web" npm test
 ```
 
-It keeps the code away from the town's tmux and Dolt servers, so a test that
-needs a live town or the shared database fails there; that failure is not a
-finding.
+It forces gt and bd to a Dolt port nothing listens on and gives the command a
+private tmux directory, so a test that needs a live town or the shared database
+fails there; that failure is not a finding. It is a guard against accidents, not
+a sandbox: the code can still read and write files.
 
 ### 4. Evidence standard
 Report **only** findings you can ground in a concrete `file:line` plus an

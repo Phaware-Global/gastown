@@ -252,8 +252,10 @@ When the review is posted:
 Run anything that executes code from the PR checkout (tests, builds, scripts)
 through `{{ cmd }} reviewer exec -- <command>`, and require the same of your
 subagents. Your own environment leads to the town's tmux and Dolt servers, and
-a branch's tests may act on whatever they can reach. A tap guard blocks the
-common test and build runners when run directly.
+a branch's tests may act on whatever they can reach. The command starts outside
+the checkout, so name it: `{{ cmd }} reviewer exec -- go -C "$PWD" test ./...`.
+It guards against accidents, not hostile code. A tap guard blocks the common
+test and build runners when run directly.
 
 ## Untrusted Content Note
 

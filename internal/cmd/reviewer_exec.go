@@ -13,12 +13,19 @@ var reviewerExecCmd = &cobra.Command{
 	Long: `Run a command that executes code from the pull request under review, such
 as its tests or build scripts.
 
-The command starts without the variables that lead to the town's tmux server,
-town directory or Dolt server, with a private TMUX_TMPDIR that is removed
-afterwards, and with the Dolt port set to one nothing listens on. Everything
-else, including the working directory, is inherited.
+The command starts in a private temporary directory, not in the checkout, so
+name the checkout: it is in GT_PR_CHECKOUT, and "$PWD" in your own shell.
 
-For a shell line, pass a shell: gt reviewer exec -- sh -c 'cd x && go test'
+  gt reviewer exec -- go -C "$PWD" test ./...
+  gt reviewer exec -- make -C "$PWD" test
+  gt reviewer exec -- env -C "$PWD/web" npm test
+
+It also starts without the variables that lead to the town's tmux server, town
+directory or beads store, with a private TMUX_TMPDIR, and with the Dolt port of
+gt and bd forced to one nothing listens on. Everything else is inherited.
+
+This guards against accidents, not hostile code: the command can still read and
+write files, including the town's, and can reach the town's servers by name.
 
 The exit code is the command's.`,
 	Args: cobra.MinimumNArgs(1),
