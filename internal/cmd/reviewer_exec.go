@@ -22,12 +22,14 @@ For a shell line, pass a shell: gt reviewer exec -- sh -c 'cd x && go test'
 
 The exit code is the command's.`,
 	Args: cobra.MinimumNArgs(1),
-	RunE: func(_ *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		code, err := reviewer.RunPRCommand(args, os.Stdin, os.Stdout, os.Stderr)
 		if err != nil {
 			return err
 		}
 		if code != 0 {
+			// The command's own output is the report; add nothing to it.
+			cmd.SilenceUsage, cmd.SilenceErrors = true, true
 			return NewSilentExit(code)
 		}
 		return nil
