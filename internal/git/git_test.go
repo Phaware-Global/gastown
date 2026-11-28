@@ -3608,15 +3608,21 @@ func TestPushAndRemoteQueries_QualifyBareBranch(t *testing.T) {
 	}
 }
 
-func TestDisableHooksForProcessKeepsInheritedConfig(t *testing.T) {
+func TestSetHooksPathForProcessKeepsInheritedConfig(t *testing.T) {
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "user.name")
 	t.Setenv("GIT_CONFIG_VALUE_0", "inherited")
 	t.Setenv("GIT_CONFIG_KEY_1", "")
 	t.Setenv("GIT_CONFIG_VALUE_1", "")
 
-	if err := DisableHooksForProcess(); err != nil {
-		t.Fatal(err)
+	// Applying it twice leaves one hooks path entry.
+	for range 2 {
+		if err := SetHooksPathForProcess("/dev/null"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := os.Getenv("GIT_CONFIG_COUNT"); got != "2" {
+		t.Errorf("GIT_CONFIG_COUNT = %s, want 2", got)
 	}
 	for key, want := range map[string]string{"user.name": "inherited", "core.hooksPath": "/dev/null"} {
 		out, err := exec.Command("git", "config", "--get", key).Output()

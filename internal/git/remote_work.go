@@ -3,6 +3,7 @@ package git
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/constants"
@@ -74,7 +75,7 @@ func (g *Git) RemoteWorkBranches() ([]string, error) {
 // hook may run on their account.
 func HooksDisabledEnv() []string {
 	var env []string
-	for k, v := range constants.GitHooksDisabledEnv() {
+	for k, v := range constants.GitHooksPathEnv(constants.NoHooksPath, os.Getenv) {
 		env = append(env, k+"="+v)
 	}
 	return env

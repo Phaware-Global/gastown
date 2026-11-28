@@ -20,6 +20,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/githooks"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -921,7 +922,11 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		envMap["BD_ACTOR"] = gtRole
 		envMap["GIT_AUTHOR_NAME"] = gtRole
 		if simpleRole == constants.RoleRefinery {
-			maps.Copy(envMap, constants.GitHooksDisabledEnv())
+			hooksEnv, err := githooks.RefineryEnv(townRoot)
+			if err != nil {
+				return "", err
+			}
+			maps.Copy(envMap, hooksEnv)
 		}
 		if runtimeConfig.Session != nil && runtimeConfig.Session.SessionIDEnv != "" {
 			envMap["GT_SESSION_ID_ENV"] = runtimeConfig.Session.SessionIDEnv

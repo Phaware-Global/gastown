@@ -120,9 +120,10 @@ func TestPRCheckoutGitRunsNoHooks(t *testing.T) {
 		for name, steps := range sessionOps {
 			t.Run(role+" session "+name, func(t *testing.T) {
 				clearGitConfigEnv(t)
+				town := newTestTown(t)
 				work, marker := newHookedCheckout(t)
 				_ = os.Remove(marker)
-				for k, v := range config.AgentEnv(config.AgentEnvConfig{Role: role, Rig: "rig"}) {
+				for k, v := range config.AgentEnv(config.AgentEnvConfig{Role: role, Rig: "rig", TownRoot: town}) {
 					if strings.HasPrefix(k, "GIT_CONFIG_") {
 						t.Setenv(k, v)
 					}
@@ -168,6 +169,7 @@ func TestPRCheckoutGitRunsNoHooks(t *testing.T) {
 	for _, op := range commandOps {
 		t.Run("gt "+op.name, func(t *testing.T) {
 			clearGitConfigEnv(t)
+			newTestTown(t)
 			work, marker := newHookedCheckout(t)
 			_ = os.Remove(marker)
 			if err := disableHooksForPRCheckoutCommands(op.cmd); err != nil {
@@ -177,6 +179,94 @@ func TestPRCheckoutGitRunsNoHooks(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertNoHookRan(t, marker)
+		})
+	}
+}
+
+// newTestTown makes a town root and runs the rest of the test inside it.
+func newTestTown(t *testing.T) string {
+	t.Helper()
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(town, "mayor", "town.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(town)
+	return town
+}
+
+// The refinery keeps the integration landing guard: only the checkout's hooks
+// are off in its session.
+func TestRefinerySessionRefusesUnlandedIntegrationPush(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need a POSIX shell")
+	}
+	clearGitConfigEnv(t)
+	town := newTestTown(t)
+	work, marker := newHookedCheckout(t)
+	hookTestGit(t, work, "checkout", "-b", "integration/epic", "origin/main")
+	hookTestGit(t, work, "commit", "--allow-empty", "-m", "epic")
+	hookTestGit(t, work, "push", "origin", "integration/epic")
+	hookTestGit(t, work, "checkout", "-B", "main", "origin/main")
+	hookTestGit(t, work, "merge", "--no-ff", "--no-edit", "integration/epic")
+	_ = os.Remove(marker)
+
+	env := config.AgentEnv(config.AgentEnvConfig{Role: constants.RoleRefinery, Rig: "rig", TownRoot: town})
+	for k, v := range env {
+		if strings.HasPrefix(k, "GIT_CONFIG_") {
+			t.Setenv(k, v)
+		}
+	}
+	push := exec.Command("git", "push", "origin", "main")
+	push.Dir = work
+	out, err := push.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "BLOCKED") {
+		t.Fatalf("push of integration content to main was not refused by the guard: err=%v\n%s", err, out)
+	}
+	assertNoHookRan(t, marker)
+
+	t.Setenv("GT_INTEGRATION_LAND", "1")
+	hookTestGit(t, work, "push", "origin", "main")
+	assertNoHookRan(t, marker)
+}
+
+// Only the commands that run git over pull request content change the hooks
+// path. Anything that can start a session must not, or a new tmux server would
+// hand the setting to polecats.
+func TestHooksPathSetOnlyForPRCheckoutCommands(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  *cobra.Command
+		want bool
+	}{
+		{"reviewer checkout", reviewerCheckoutCmd, true},
+		{"mq integration land", mqIntegrationLandCmd, true},
+		{"refinery pr sync-branch", refineryPrSyncBranchCmd, true},
+		{"refinery pr push-branch", refineryPrPushBranchCmd, true},
+		{"refinery pr dispatch-review-fix", refineryPrDispatchReviewFixCmd, false},
+		{"refinery pr await-review", refineryPrAwaitReviewCmd, false},
+		{"refinery pr create", refineryPrCreateCmd, false},
+		{"refinery pr wait-ci", refineryPrWaitCICmd, false},
+		{"refinery pr request-review", refineryPrRequestReviewCmd, false},
+		{"refinery pr threads", refineryPrThreadsCmd, false},
+		{"refinery pr wait-approval", refineryPrWaitApprovalCmd, false},
+		{"refinery pr merge", refineryPrMergeCmd, false},
+		{"refinery start", refineryStartCmd, false},
+		{"reviewer request", reviewerRequestCmd, false},
+		{"mq submit", mqSubmitCmd, false},
+		{"sling", slingCmd, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearGitConfigEnv(t)
+			newTestTown(t)
+			if err := disableHooksForPRCheckoutCommands(tc.cmd); err != nil {
+				t.Fatal(err)
+			}
+			if got := os.Getenv("GIT_CONFIG_COUNT") != "0"; got != tc.want {
+				t.Errorf("hooks path set = %v, want %v", got, tc.want)
+			}
 		})
 	}
 }

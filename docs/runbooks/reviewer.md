@@ -196,11 +196,21 @@ the Reviewer's defining advantage over a diff-only reviewer.
 
 A tracked hooks directory (`core.hooksPath` pointing at `.githooks`, `.husky`,
 and so on) lets a PR branch choose the git hooks that run. Reviewer and refinery
-sessions, and the `gt reviewer checkout`, `gt refinery pr` and
-`gt mq integration land` commands, therefore run git with `core.hooksPath=/dev/null`, set through
-`GIT_CONFIG_*` environment variables. The shared repo config is not changed, so
-polecats keep their hooks. The tracked `pre-push` guard does not run in these two
-roles either. Restart sessions that were already running to pick this up.
+sessions, and the `gt reviewer checkout`, `gt refinery pr sync-branch`,
+`gt refinery pr push-branch` and `gt mq integration land` commands, therefore
+override `core.hooksPath` through `GIT_CONFIG_*` environment variables. The
+shared repo config is not changed, so polecats keep their hooks.
+
+- The reviewer uses `/dev/null`: no hooks.
+- The refinery uses `<town>/.runtime/trusted-hooks`, which gt writes itself and
+  which holds only the integration-branch landing guard (`pre-push`). The other
+  checks in a repository's own hooks do not run.
+- gt refuses that directory if it is not a real directory, is owned by another
+  user, or is group or world writable. The refinery then does not start, and git
+  fails in any session built without the guard. Fix the ownership or mode, or
+  delete the directory so gt recreates it.
+
+Restart sessions that were already running to pick this up.
 
 Never run package installs or lifecycle scripts (`npm`/`yarn`/`pnpm install`,
 `prepare`, `postinstall`) or `make` targets from the PR in a PR checkout.

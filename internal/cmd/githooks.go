@@ -1,23 +1,37 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/githooks"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-// disableHooksForPRCheckoutCommands turns git hooks off for the commands that
-// run git over pull request content. Their agent sessions already carry the
-// same setting; this covers an invocation from anywhere else.
+// disableHooksForPRCheckoutCommands keeps a checkout's hooks from running in
+// the commands that run git over pull request content. Their agent sessions
+// already carry the same setting; this covers an invocation from anywhere else.
 //
-// Commands that start sessions stay out: a tmux server started by one of them
-// would hand its environment to every later session, polecats included.
+// Commands are listed one by one. One that starts sessions must stay out: a
+// tmux server started by it would hand its environment to every later session,
+// polecats included.
 func disableHooksForPRCheckoutCommands(cmd *cobra.Command) error {
-	for c := cmd; c != nil; c = c.Parent() {
-		switch c {
-		case reviewerCheckoutCmd, refineryPrCmd, mqIntegrationLandCmd:
-			return git.DisableHooksForProcess()
+	switch cmd {
+	case reviewerCheckoutCmd:
+		return git.SetHooksPathForProcess(constants.NoHooksPath)
+	case refineryPrSyncBranchCmd, refineryPrPushBranchCmd, mqIntegrationLandCmd:
+		townRoot, err := workspace.FindFromCwdOrError()
+		if err != nil {
+			return fmt.Errorf("locating trusted git hooks: %w", err)
 		}
+		dir, err := githooks.Install(townRoot)
+		if err != nil {
+			return err
+		}
+		return git.SetHooksPathForProcess(dir)
 	}
 	return nil
 }

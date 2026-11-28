@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/githooks"
 )
 
 // IdentityEnvVars are agent identity env vars that must not leak across
@@ -152,8 +153,9 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["BD_ACTOR"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		// The refinery and reviewer run git over pull request content, including
-		// git typed in the session, so their sessions run no git hooks.
-		maps.Copy(env, constants.GitHooksDisabledEnv())
+		// git typed in the session, so neither runs the checkout's hooks. The
+		// refinery pushes to shared branches and keeps gt's own guard.
+		maps.Copy(env, githooks.RefinerySessionEnv(cfg.TownRoot))
 
 	case constants.RoleReviewer:
 		// Without this case the reviewer session spawned with no GT_ROLE, so
@@ -166,7 +168,7 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["GT_RIG"] = cfg.Rig
 		env["BD_ACTOR"] = fmt.Sprintf("%s/reviewer", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/reviewer", cfg.Rig)
-		maps.Copy(env, constants.GitHooksDisabledEnv())
+		maps.Copy(env, constants.GitHooksPathEnv(constants.NoHooksPath, os.Getenv))
 
 	case constants.RolePolecat:
 		env["GT_ROLE"] = fmt.Sprintf("%s/polecats/%s", cfg.Rig, cfg.AgentName)
