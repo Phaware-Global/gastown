@@ -227,20 +227,33 @@ project settings from the PR's checkout, and gets only the codegraph MCP server.
 
 `consolidate` and `post` fail unless every enabled perspective has a receipt
 (`receipt-<name>.json`: pass id, PR, commit, prompt and result hashes, start and
-end times) matching its result and prompt. `post` also rebuilds the payload from
-those results and refuses a different one. The coordinator trims through
-`consolidate --drop`, `--drop-opportunity`, `--reanchor` and `--verdict`; the
-review body lists those edits and each pass's end time. Receipts are unsigned,
-so this stops shortcuts, not deliberate forgery by a session with shell access.
+end times) matching its raw result and prompt. Both live in
+`<rig>/reviewer/passes/pr<N>/`. Receipts are unsigned, so this stops shortcuts,
+not deliberate forgery by a session with shell access.
+
+The coordinator never edits raw results. Changes go in `consolidate --edits
+<file>` (`gt reviewer consolidate --help` shows the shape): drop with a reason,
+merge, reword, add a note, re-anchor, shorten a verdict, drop an opportunity.
+Every posted finding names its raw ids, and `post` refuses one that does not, or
+any payload that differs from what the raw results and edits produce. The body
+lists dropped findings with reasons and each pass's end time, and labels
+reworded and added text as the reviewer's.
+
+`--carried-from <old-sha>` reuses the passes of an earlier head. It is refused
+unless the PR's diff against its base, including line numbers, is the same at
+both heads; the body names the head the passes ran at.
 
 Dedup keys on `(path, line)`, keeps the highest priority, and unions the
 perspective tags; the summary carries a verdict line for **every** perspective.
 
 ### Findings JSON shape (consumed by `gt reviewer post`)
 
+`gt reviewer consolidate` writes it; do not author or edit it.
+
 ```json
 {
-  "summary": "per-perspective verdicts + counts",
+  "summary": {"verdicts": [{"perspective": "adversarial", "verdict": "one line",
+              "pass_finished_at": "2026-01-02T15:04:05Z"}]},
   "reviewed_sha": "abc123…",
   "findings": [
     {
@@ -248,7 +261,8 @@ perspective tags; the summary carries a verdict line for **every** perspective.
       "priority": "high", "perspective": "adversarial",
       "title": "one-line summary",
       "body": "explanation with codegraph evidence",
-      "suggestion": "concrete change"
+      "suggestion": "concrete change",
+      "sources": ["adversarial:1"]
     }
   ]
 }
@@ -257,9 +271,8 @@ perspective tags; the summary carries a verdict line for **every** perspective.
 `priority` is `high|medium|low`. The post wrapper emits each finding with a
 neutral shields.io priority badge and a `[perspective]` tag — the exact format
 the refinery's `parseThreadPriority` understands, so findings flow into the
-review-fix loop with priorities intact. A review with inline findings is always
-anchored to a commit SHA (`--sha`, else the payload's `reviewed_sha`, else the
-PR head); GitHub rejects an inline review without one.
+review-fix loop with priorities intact. The review is anchored to the payload's
+`reviewed_sha`.
 
 ---
 

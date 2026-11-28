@@ -43,6 +43,8 @@ type PerspectiveVerdict struct {
 	// PassFinishedAt and ExtraInstructions come from the pass receipt.
 	PassFinishedAt    string `json:"pass_finished_at,omitempty"`
 	ExtraInstructions bool   `json:"extra_instructions,omitempty"`
+	// Reworded marks a verdict whose wording is the reviewer's.
+	Reworded bool `json:"reworded,omitempty"`
 }
 
 // Content budgets for the summary template, in runes.
@@ -177,7 +179,11 @@ func (s *ReviewSummary) render(b *strings.Builder) {
 	for _, v := range s.Verdicts {
 		fmt.Fprintf(b, "- **%s** — %s", v.Perspective, v.Verdict)
 		if v.PassFinishedAt != "" {
-			fmt.Fprintf(b, " _(pass finished %s", v.PassFinishedAt)
+			b.WriteString(" _(")
+			if v.Reworded {
+				b.WriteString("reworded by reviewer; ")
+			}
+			fmt.Fprintf(b, "pass finished %s", v.PassFinishedAt)
 			if v.ExtraInstructions {
 				b.WriteString("; prompt had extra instructions")
 			}

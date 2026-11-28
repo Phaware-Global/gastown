@@ -166,38 +166,175 @@ func TestRunPassRepairsAnInvalidAnswerOnce(t *testing.T) {
 	}
 }
 
-func TestConsolidatePassesEditsAndStamps(t *testing.T) {
+// twoLensPasses runs a security and an adversarial pass that disagree about
+// where one defect is.
+func twoLensPasses(t *testing.T) []VerifiedPass {
+	t.Helper()
 	dir := t.TempDir()
-	runTestPass(t, dir)
-	passes, err := VerifyPasses(dir, []string{"security"}, 7, testSHA)
+	answers := map[string]string{
+		"security": goodAnswer,
+		"adversarial": `{"perspective":"adversarial","verdict":"same defect","findings":[` +
+			`{"path":"a.go","line":4,"priority":"medium","title":"also first","body":"adv body"}]}`,
+	}
+	for name, answer := range answers {
+		spec := PassSpec{Perspective: name, PR: 7, SHA: testSHA, Prompt: "p"}
+		if _, err := RunPass(context.Background(), dir, spec, answering(answer)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	passes, err := VerifyPasses(dir, []string{"security", "adversarial"}, 7, testSHA)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return passes
+}
+
+func TestConsolidatePassesRefusedEdits(t *testing.T) {
+	long := strings.Repeat("x", 801)
+	tests := []struct {
+		name    string
+		edits   Edits
+		wantErr string
+	}{
+		{"drop without a reason", Edits{Drop: []DropEdit{{ID: "security:1"}}}, "reason"},
+		{"drop with a multi-line reason", Edits{Drop: []DropEdit{{ID: "security:1", Reason: "a\nb"}}}, "reason"},
+		{"drop of an unknown id", Edits{Drop: []DropEdit{{ID: "security:3", Reason: "r"}}}, "no raw finding"},
+		{"note on a finding no pass raised", Edits{Note: []NoteEdit{{ID: "perf:1", Text: "t"}}}, "no raw finding"},
+		{"reword of an unknown id", Edits{Reword: []RewordEdit{{ID: "security:9", Title: "t"}}}, "no raw finding"},
+		{"empty reword", Edits{Reword: []RewordEdit{{ID: "security:1"}}}, "changes nothing"},
+		{"multi-line title", Edits{Reword: []RewordEdit{{ID: "security:1", Title: "a\nb"}}}, "one line"},
+		{"empty note", Edits{Note: []NoteEdit{{ID: "security:1"}}}, "empty"},
+		{"oversized note", Edits{Note: []NoteEdit{{ID: "security:1", Text: long}}}, "limit"},
+		{"merge of one", Edits{Merge: [][]string{{"security:1"}}}, "at least two"},
+		{"merge with an unknown id", Edits{Merge: [][]string{{"security:1", "adversarial:2"}}}, "no raw finding"},
+		{"id merged twice", Edits{Merge: [][]string{{"security:1", "adversarial:1"}, {"security:2", "adversarial:1"}}}, "twice"},
+		{"edit of a dropped finding", Edits{
+			Drop: []DropEdit{{ID: "security:1", Reason: "r"}},
+			Note: []NoteEdit{{ID: "security:1", Text: "t"}},
+		}, "dropped"},
+		{"merge into a dropped finding", Edits{
+			Drop:  []DropEdit{{ID: "security:1", Reason: "r"}},
+			Merge: [][]string{{"security:1", "adversarial:1"}},
+		}, "dropped"},
+		{"reanchor to line zero", Edits{Reanchor: []ReanchorEdit{{ID: "security:1"}}}, "line"},
+		{"unknown opportunity", Edits{DropOpportunity: []string{"adversarial:1"}}, "matches nothing"},
+		{"verdict for no pass", Edits{Verdict: map[string]string{"perf": "v"}}, "no pass"},
+	}
+	passes := twoLensPasses(t)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ConsolidatePasses(passes, &tc.edits, testSHA, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestPassResultMayNotSetReviewerFields(t *testing.T) {
+	for _, field := range []string{`"sources":["security:1"]`, `"reworded":["x"]`, `"reviewer_note":"n"`} {
+		data := `{"perspective":"security","verdict":"v","findings":[{"path":"a.go","line":1,"priority":"low","title":"t",` + field + `}]}`
+		if _, err := ParsePerspectiveResult([]byte(data)); err == nil {
+			t.Errorf("%s: accepted", field)
+		}
+	}
+}
+
+func TestConsolidatePassesAllowedEdits(t *testing.T) {
+	tests := []struct {
+		name       string
+		edits      Edits
+		sources    []string // per posted finding
+		wantInBody []string // summary plus every thread
+	}{
+		{
+			name:    "no edits traces every finding",
+			sources: []string{"security:1", "security:2", "adversarial:1"},
+		},
+		{
+			name:    "drop with a reason is listed",
+			edits:   Edits{Drop: []DropEdit{{ID: "security:1", Reason: "guarded by the caller"}}},
+			sources: []string{"security:2", "adversarial:1"},
+			wantInBody: []string{"### Dropped by reviewer (1)", "`a.go:3` high", "first", "[security:1]",
+				"guarded by the caller"},
+		},
+		{
+			name:       "merge records both ids",
+			edits:      Edits{Merge: [][]string{{"security:1", "adversarial:1"}}},
+			sources:    []string{"security:1+adversarial:1", "security:2"},
+			wantInBody: []string{"**[security, adversarial]**", "adv body", "merged security:1+adversarial:1"},
+		},
+		{
+			name:       "reworded text is marked",
+			edits:      Edits{Reword: []RewordEdit{{ID: "security:1", Title: "shorter", Body: "tight"}}},
+			sources:    []string{"security:1", "security:2", "adversarial:1"},
+			wantInBody: []string{"shorter", "tight", "wording by the reviewer", "security:1 title, body", "(reworded by reviewer)"},
+		},
+		{
+			name:       "added text is marked as the reviewer's",
+			edits:      Edits{Note: []NoteEdit{{ID: "security:1", Text: "reproduced locally"}}},
+			sources:    []string{"security:1", "security:2", "adversarial:1"},
+			wantInBody: []string{"**Reviewer note** (not from a perspective pass):\nreproduced locally"},
+		},
+		{
+			name:       "reanchor and verdict are disclosed",
+			edits:      Edits{Reanchor: []ReanchorEdit{{ID: "security:2", Line: 12}}, Verdict: map[string]string{"security": "trimmed"}},
+			sources:    []string{"security:1", "security:2", "adversarial:1"},
+			wantInBody: []string{"re-anchored security:2 to line 12", "trimmed _(reworded by reviewer;"},
+		},
+		{
+			name:    "dropped opportunity",
+			edits:   Edits{DropOpportunity: []string{"security:1"}},
+			sources: []string{"security:1", "security:2", "adversarial:1"},
+		},
+	}
+	passes := twoLensPasses(t)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, err := ConsolidatePasses(passes, &tc.edits, testSHA, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sources []string
+			body := fs.SummaryBody(testSHA)
+			for _, f := range fs.Findings {
+				sources = append(sources, strings.Join(f.Sources, "+"))
+				body += "\n" + f.FormatBody()
+			}
+			if got, want := strings.Join(sources, " "), strings.Join(tc.sources, " "); got != want {
+				t.Errorf("sources = %q, want %q", got, want)
+			}
+			for _, want := range append(tc.wantInBody, "pass finished "+passes[0].Receipt.FinishedAt.Format(time.RFC3339)) {
+				if !strings.Contains(body, want) {
+					t.Errorf("missing %q in:\n%s", want, body)
+				}
+			}
+			if len(passes[0].Result.Findings) != 2 || passes[0].Result.Findings[1].Line != 9 {
+				t.Error("edits mutated the verified result")
+			}
+		})
+	}
+}
+
+func TestCollapsedNitsKeepSourcesAndLabels(t *testing.T) {
+	passes := []VerifiedPass{{Result: PerspectiveResult{Perspective: "security", Verdict: "nits", Findings: []Finding{
+		{Path: "a.go", Line: 1, Priority: "low", Title: "one", Perspective: "security"},
+		{Path: "a.go", Line: 2, Priority: "low", Title: "two", Perspective: "security"},
+	}}}}
 	fs, err := ConsolidatePasses(passes, &Edits{
-		Drop:            []string{"security:1"},
-		DropOpportunity: []string{"security:1"},
-		Reanchor:        []string{"security:2=12"},
-		Verdict:         []string{"security=trimmed"},
+		Note:   []NoteEdit{{ID: "security:2", Text: "seen"}},
+		Reword: []RewordEdit{{ID: "security:1", Title: "uno"}},
 	}, testSHA, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(fs.Findings) != 1 || fs.Findings[0].Title != "second" || fs.Findings[0].Line != 12 {
+	if len(fs.Findings) != 1 || strings.Join(fs.Findings[0].Sources, " ") != "security:1 security:2" {
 		t.Fatalf("findings = %+v", fs.Findings)
 	}
-	body := fs.SummaryBody(testSHA)
-	stamp := passes[0].Receipt.FinishedAt.Format(time.RFC3339)
-	for _, want := range []string{"trimmed", "pass finished " + stamp, "dropped findings security:1", "rewrote the security verdict"} {
+	body := fs.Findings[0].FormatBody()
+	for _, want := range []string{"Reviewer note (not from a perspective pass): seen", "wording by the reviewer: security:1 title"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("body missing %q:\n%s", want, body)
-		}
-	}
-	if len(passes[0].Result.Findings) != 2 {
-		t.Error("edits mutated the verified result")
-	}
-	for _, bad := range []*Edits{{Drop: []string{"security:3"}}, {Drop: []string{"nobody:1"}}, {Verdict: []string{"security="}}} {
-		if _, err := ConsolidatePasses(passes, bad, testSHA, nil); err == nil {
-			t.Errorf("edit %+v: want error", bad)
+			t.Errorf("missing %q in:\n%s", want, body)
 		}
 	}
 }

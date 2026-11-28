@@ -54,12 +54,10 @@ var (
 
 	reviewerDonePR int
 
-	reviewerPassDir             string
-	reviewerConsolidatePR       int
-	reviewerEditDrop            []string
-	reviewerEditDropOpportunity []string
-	reviewerEditReanchor        []string
-	reviewerEditVerdict         []string
+	reviewerPassDir                string
+	reviewerConsolidatePR          int
+	reviewerConsolidateEdits       string
+	reviewerConsolidateCarriedFrom string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -122,6 +120,10 @@ rejected, since an approving disposition can only be a no-op or a
 de-escalation. This is why a "comment" from one perspective can never suppress
 another perspective's high finding.
 
+The payload must be the one 'gt reviewer consolidate' wrote: post re-verifies
+the pass receipts, requires every finding to trace to a raw finding, rebuilds the
+payload from the raw results and the recorded edits, and refuses any difference.
+
 The findings file (--findings, or "-" for stdin) is a JSON object. "summary"
 follows a fixed template — one verdict line per perspective plus any
 out-of-scope opportunities — which is rendered into GitHub markdown here, with
@@ -138,13 +140,13 @@ text, in characters:
       "verdicts": [{"perspective": "adversarial", "verdict": "one line"}],
       "opportunities": ["<optional; out-of-scope follow-up candidates>"]
     },
-    "reviewed_sha": "<optional; --sha overrides>",
+    "reviewed_sha": "<required; --sha must match>",
     "disposition": "<optional; request_changes|comment — escalation only>",
     "findings": [
       {"path": "internal/foo.go", "line": 42, "priority": "high",
        "perspective": "adversarial", "title": "nil deref",
        "body": "explanation with codegraph evidence",
-       "suggestion": "guard it"}
+       "suggestion": "guard it", "sources": ["adversarial:1"]}
     ]
   }`,
 	RunE: runReviewerPost,
@@ -215,12 +217,23 @@ var reviewerConsolidateCmd = &cobra.Command{
 	Short: "Merge per-perspective results into one findings payload for post",
 	Long: `Consolidate per-perspective pass results into a single findings payload.
 
-The inputs are the results 'gt reviewer run' wrote to --dir, one per enabled
+The inputs are the raw results 'gt reviewer run' wrote, one per enabled
 perspective. Consolidation fails unless every one has a receipt matching the
-result, the prompt, the PR and the commit; hand-written or edited results are
-refused. To change what is posted, use the edit flags, which address findings and
-opportunities by 1-based position in the result file and are disclosed in the
-review body.
+result, the prompt, the PR and the commit. Never edit them: state your changes
+in --edits, addressing findings by raw id "perspective:N" (1-based):
+
+  {"drop":    [{"id": "security:1", "reason": "one line, required"}],
+   "merge":   [["security:2", "adversarial:1"]],
+   "reword":  [{"id": "security:2", "title": "...", "body": "..."}],
+   "note":    [{"id": "security:2", "text": "your own verification"}],
+   "reanchor":[{"id": "adversarial:2", "line": 40}],
+   "verdict": {"security": "shorter verdict"},
+   "drop_opportunity": ["security:1"]}
+
+Every posted finding traces to a raw id. The review body lists each dropped
+finding with its reason, and labels reworded and added text as the reviewer's.
+--carried-from <sha> reuses the passes of an earlier head when this PR's own
+diff is unchanged, and the body names that head.
 
 The output is the findings JSON that 'gt reviewer post' consumes:
 
@@ -256,7 +269,7 @@ func init() {
 		`findings JSON file, or "-" for stdin (required)`)
 	reviewerPostCmd.Flags().StringVar(&reviewerPostSHA, "sha", "",
 		"reviewed head SHA (must match the findings payload; default: its reviewed_sha)")
-	reviewerPostCmd.Flags().StringVar(&reviewerPassDir, "dir", ".", "directory holding the pass results and receipts")
+	reviewerPostCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
 	_ = reviewerPostCmd.MarkFlagRequired("pr")
 	_ = reviewerPostCmd.MarkFlagRequired("findings")
 
@@ -302,15 +315,11 @@ func init() {
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
 		"reviewed head SHA; the pass receipts must be for it (required)")
 	reviewerConsolidateCmd.Flags().IntVar(&reviewerConsolidatePR, "pr", 0, "PR number under review (required)")
-	reviewerConsolidateCmd.Flags().StringVar(&reviewerPassDir, "dir", ".", "directory holding the pass results and receipts")
-	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditDrop, "drop", nil,
-		"drop a finding: perspective:N (repeatable)")
-	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditDropOpportunity, "drop-opportunity", nil,
-		"drop an opportunity: perspective:N (repeatable)")
-	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditReanchor, "reanchor", nil,
-		"move a finding to another line: perspective:N=LINE (repeatable)")
-	reviewerConsolidateCmd.Flags().StringArrayVar(&reviewerEditVerdict, "verdict", nil,
-		"shorten a verdict: perspective=text (repeatable)")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateEdits, "edits", "",
+		`JSON file of your changes to the raw findings (or "-" for stdin)`)
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateCarriedFrom, "carried-from", "",
+		"earlier head the passes ran at; allowed only if the PR's own diff is unchanged at --sha")
 	_ = reviewerConsolidateCmd.MarkFlagRequired("pr")
 	_ = reviewerConsolidateCmd.MarkFlagRequired("sha")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
@@ -332,7 +341,7 @@ func init() {
 		"file of extra execution instructions (disclosed in the review body)")
 	reviewerRunCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0, "per-pass finding cap")
 	reviewerRunCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0, "soft wall-clock budget per pass")
-	reviewerRunCmd.Flags().StringVar(&reviewerPassDir, "dir", ".", "directory to write results and receipts to")
+	reviewerRunCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
 	_ = reviewerRunCmd.MarkFlagRequired("pr")
 	_ = reviewerRunCmd.MarkFlagRequired("sha")
 
@@ -570,12 +579,6 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 		target = shortSHA(target)
 	}
 	fmt.Printf("Checked out PR #%d (%s) in %s\n", prNumber, target, cwd)
-
-	if names, err := reviewerEnabledPerspectives(); err != nil {
-		style.PrintWarning("earlier pass results not cleared: %v", err)
-	} else if err := reviewer.RemovePassArtifacts(cwd, names); err != nil {
-		return err
-	}
 
 	// Deterministically (re)build the codegraph index for the checked-out head so
 	// the review runs against a real index instead of silently degrading to
@@ -831,14 +834,21 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	if reviewerConsolidatePR <= 0 {
 		return fmt.Errorf("--pr must be a positive PR number")
 	}
-	edits := &reviewer.Edits{
-		Drop:            reviewerEditDrop,
-		DropOpportunity: reviewerEditDropOpportunity,
-		Reanchor:        reviewerEditReanchor,
-		Verdict:         reviewerEditVerdict,
-		BaseSHA:         strings.TrimSpace(reviewerConsolidateBaseSHA),
+	edits := &reviewer.Edits{}
+	raw, err := readOptionalInput(reviewerConsolidateEdits)
+	if err != nil {
+		return fmt.Errorf("reading --edits: %w", err)
 	}
-	fs, err := consolidateVerifiedPasses(reviewerConsolidatePR, reviewerConsolidateSHA, edits)
+	if raw != "" {
+		if edits, err = reviewer.ParseEdits([]byte(raw)); err != nil {
+			return err
+		}
+	}
+	if base := strings.TrimSpace(reviewerConsolidateBaseSHA); base != "" {
+		edits.BaseSHA = base
+	}
+	fs, err := consolidateVerifiedPasses(reviewerConsolidatePR, reviewerConsolidateSHA,
+		reviewerConsolidateCarriedFrom, edits)
 	if err != nil {
 		return err
 	}
@@ -878,7 +888,7 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// 'post' enforces the finding budgets, and the payload cannot be hand-edited,
 	// so an overrun has to surface here.
 	if _, err := reviewer.ParseFindings(encoded); err != nil {
-		return fmt.Errorf("%w\n\nUse --drop or --reanchor and re-run consolidate; nothing was written", err)
+		return fmt.Errorf("%w\n\nDrop or reword the finding in --edits and re-run consolidate; nothing was written", err)
 	}
 
 	if reviewerConsolidateOut != "" {

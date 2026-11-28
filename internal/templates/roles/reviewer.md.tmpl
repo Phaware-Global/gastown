@@ -99,9 +99,10 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
      [--prior-threads prior-threads.txt]
    ```
    It outlasts a foreground shell timeout, so start it with
-   `run_in_background: true` and **wait for it to exit**. For each perspective it
-   writes `perspective-<name>.json` and `receipt-<name>.json`. If a pass fails,
-   re-run it alone: `{{ cmd }} reviewer run <name> --pr <pr> --sha <sha> ...`.
+   `run_in_background: true` and **wait for it to exit**. It writes each pass's
+   raw `perspective-<name>.json` and `receipt-<name>.json`, and prints the
+   directory. If a pass fails, re-run it alone:
+   `{{ cmd }} reviewer run <name> --pr <pr> --sha <sha> ...`.
 
 5. **Never write or edit a result or receipt file.** `consolidate` and `post`
    refuse unless every enabled perspective has a receipt matching its result,
@@ -109,24 +110,35 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
 
    **You are still the gatekeeper.** The passes are inputs; the posted review is
    yours, and you are accountable for it being on-topic, in-scope, and
-   productive. Read each result, then trim with `consolidate`'s edit flags, which
-   address entries by 1-based position in the result file:
+   productive. Read the raw results, then state your changes in an `edits.json`
+   (omit it to change nothing). Findings are addressed by raw id
+   `perspective:N`, 1-based:
 
-   - `--drop <perspective>:<n>` — an out-of-scope, unproductive or nitpick
-     finding,
-   - `--drop-opportunity <perspective>:<n>`,
-   - `--reanchor <perspective>:<n>=<line>` — a finding anchored outside the diff,
-   - `--verdict <perspective>=<text>` — a shorter verdict.
+   ```json
+   {"drop":     [{"id": "security:1", "reason": "one line, required"}],
+    "merge":    [["security:2", "adversarial:1"]],
+    "reword":   [{"id": "security:2", "title": "...", "body": "..."}],
+    "note":     [{"id": "security:2", "text": "what you verified yourself"}],
+    "reanchor": [{"id": "adversarial:2", "line": 40}],
+    "verdict":  {"security": "shorter verdict"},
+    "drop_opportunity": ["security:1"]}
+   ```
 
-   Every edit is listed in the review body. Remaining nits are not a reason to
-   withhold approval — a PR whose findings are all medium or below is APPROVED,
-   with the nits posted as threads to fix.
+   The review body lists every dropped finding with your reason. Reworded text
+   is labelled as yours, and a `note` is posted as your own, not a lens's. You
+   cannot add a finding no pass raised, or change a priority. Remaining nits are
+   not a reason to withhold approval — a PR whose findings are all medium or
+   below is APPROVED, with the nits posted as threads to fix.
+
+   **Carried review.** If the new head only merges the base branch, you may skip
+   the run: `consolidate --sha <new> --carried-from <old> ...`. The command
+   verifies that this PR's own diff is unchanged and refuses otherwise.
 
 6. **Consolidate** all per-perspective results into one findings payload. This
    deduplicates overlapping findings (same `file:line` and title) deterministically and
    builds a summary that accounts for every perspective's verdict:
    ```bash
-   {{ cmd }} reviewer consolidate --pr <pr> --sha <sha> --out findings.json
+   {{ cmd }} reviewer consolidate --pr <pr> --sha <sha> [--edits edits.json] --out findings.json
    ```
    Findings are classified against the PR's diff: anything anchored outside it,
    or whose fix lives in files this PR never touched, posts as non-blocking.
@@ -211,7 +223,7 @@ markdown and are not charged for it — the budgets count authored text only:
 
 `consolidate` enforces those budgets and **fails without writing** if the fold
 of verdicts overruns, naming what to trim. That is yours to fix with
-`--verdict` or `--drop-opportunity`, then re-run consolidate.
+`verdict` or `drop_opportunity` in `edits.json`, then re-run consolidate.
 
 ## Completing Work
 
