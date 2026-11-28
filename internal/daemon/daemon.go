@@ -364,6 +364,10 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: failed to set GT_TOWN_ROOT in tmux global env: %v", err)
 	}
 
+	// Secrets belong in session environments only; a server started from a
+	// shell holding them has them in its global one.
+	t.WithholdGlobalSecrets(config.TownRoot)
+
 	// Clear any agent identity vars that leaked into tmux global env.
 	// Only GT_TOWN_ROOT should be global. Leaked identity vars cause sessions
 	// without their own session-level overrides to inherit a stale identity,

@@ -74,6 +74,11 @@ type TownSettings struct {
 	// Example: {"bob": "codex", "alice": "claude"}
 	CrewAgents map[string]string `json:"crew_agents,omitempty"`
 
+	// RoleSecrets adds secret environment variable names to a role's session
+	// allowlist (see SessionSecretAllowlist). Keys are role names.
+	// Example: {"polecat": ["JIRA_API_TOKEN"]}
+	RoleSecrets map[string][]string `json:"role_secrets,omitempty"`
+
 	// AgentEmailDomain is the domain used for agent git identity emails.
 	// Agent addresses like "gastown/crew/jack" become "gastown.crew.jack@{domain}".
 	// Default: "gastown.local"
