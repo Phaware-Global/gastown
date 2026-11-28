@@ -2707,11 +2707,24 @@ func (m *Manager) List() ([]*Polecat, error) {
 // that can be reused by gt sling without creating a new worktree.
 // Persistent polecat model (gt-4ac).
 func (m *Manager) FindIdlePolecat() (*Polecat, error) {
+	return m.FindIdlePolecatContext(context.Background(), nil)
+}
+
+// FindIdlePolecatContext is FindIdlePolecat that stops between polecats once ctx
+// is done. progress, if non-nil, is told how many of the rig's polecats have
+// been checked.
+func (m *Manager) FindIdlePolecatContext(ctx context.Context, progress func(checked, total int)) (*Polecat, error) {
 	polecats, err := m.List()
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range polecats {
+	for i, p := range polecats {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if progress != nil {
+			progress(i, len(polecats))
+		}
 		if p.State == StateIdle && m.reuseDecisionForPolecat(p.Name, p.State).Reusable {
 			return p, nil
 		}
