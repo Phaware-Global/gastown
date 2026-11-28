@@ -2111,68 +2111,6 @@ func (g *Git) GhPrUnresolvedThreads(prNumber int) ([]GhReviewThread, error) {
 	return out, nil
 }
 
-// GhPrChecksRollup returns the CI status rollup for a PR:
-//   - state:  "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown
-//   - done:   true if all checks have finished (success or failure)
-//
-// On a freshly-created PR, the checks list can be empty for a short window
-// before CI systems register their status. Rather than silently greenlighting
-// that case (which would let a caller merge before CI ran), return
-// state="NO_CHECKS" done=false so the caller's polling loop waits. After the
-// caller's configured timeout they can treat "NO_CHECKS" as acceptable if
-// that's their policy.
-func (g *Git) GhPrChecksRollup(prNumber int) (state string, done bool, err error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
-		"--json", "statusCheckRollup")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
-	if err != nil {
-		return "", false, fmt.Errorf("gh pr view (statusCheckRollup) failed: %w", err)
-	}
-	var resp struct {
-		StatusCheckRollup []struct {
-			Status     string `json:"status"`     // QUEUED, IN_PROGRESS, COMPLETED (checks API)
-			Conclusion string `json:"conclusion"` // SUCCESS, FAILURE, … (checks API)
-			State      string `json:"state"`      // SUCCESS, FAILURE, PENDING, ERROR (statuses API)
-		} `json:"statusCheckRollup"`
-	}
-	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
-		return "", false, fmt.Errorf("parsing statusCheckRollup: %w", jerr)
-	}
-
-	if len(resp.StatusCheckRollup) == 0 {
-		// Could be a brand-new PR whose CI hasn't registered yet, or a repo
-		// with no required checks. Either way we can't prove SUCCESS.
-		return "NO_CHECKS", false, nil
-	}
-
-	allDone := true
-	anyFailure := false
-	for _, c := range resp.StatusCheckRollup {
-		switch {
-		case c.Status != "" && c.Status != "COMPLETED":
-			allDone = false
-		case c.Status == "COMPLETED":
-			if c.Conclusion != "SUCCESS" && c.Conclusion != "NEUTRAL" && c.Conclusion != "SKIPPED" {
-				anyFailure = true
-			}
-		case c.State == "PENDING":
-			allDone = false
-		case c.State != "" && c.State != "SUCCESS":
-			anyFailure = true
-		}
-	}
-
-	switch {
-	case !allDone:
-		return "PENDING", false, nil
-	case anyFailure:
-		return "FAILURE", true, nil
-	default:
-		return "SUCCESS", true, nil
-	}
-}
-
 // ghReview is the minimal review payload we need for approval calculations.
 //
 // Commit.OID identifies the head commit of the PR at the moment the review

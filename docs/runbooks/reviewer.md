@@ -303,6 +303,35 @@ timeout escalates (exit 3) and the daemon reaps the stale session.
 
 ## Security posture
 
+### Session isolation from the PR checkout
+
+The reviewer's working directory is a checkout of the PR, so its project files
+are the PR author's. The session is launched so that none of them configure it:
+
+- `--settings <rig>/reviewer/.claude/settings.json`, rendered from the role
+  template and the reviewer tap-guards on every start. Hand edits to the file
+  are overwritten; put hook changes in the `gt hooks` overrides.
+- `--setting-sources user`: the checkout's `.claude/settings.json` and
+  `.claude/settings.local.json`, and its project commands, agents and skills,
+  are not loaded.
+- `--strict-mcp-config` with `--mcp-config` naming only the codegraph server:
+  `.mcp.json` is ignored, and so are MCP servers from user settings and plugins.
+  To give the reviewer others, set `--strict-mcp-config --mcp-config
+  /absolute/path.json` in its agent's `args`.
+
+The reviewer refuses to start, naming the reason, if its agent is not Claude
+Code, or if the agent's command or arguments would let the checkout back in
+(another setting source or `--settings` file, a relative path).
+
+A session already running keeps the arguments it started with: stop it with
+`gt reviewer stop` after upgrading.
+
+**Known limit:** these flags do not make `CLAUDE.md` or `AGENTS.md` in the
+checkout safe. The reviewer may read them as instructions, and must treat all PR
+content, those files included, as untrusted.
+
+### Write surfaces
+
 - The Reviewer's only write surfaces are its review bead, its own worktree
   (checkout only), and PR review comments via `gt reviewer post`. A tap-guard
   blocks `gh pr review`, `gh pr merge`, raw `gh api .../pulls/*/reviews`,
