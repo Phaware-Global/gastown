@@ -383,7 +383,7 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, commandInWorkDir(workDir, command))
+		respawnArgs = append(respawnArgs, scrubSecrets("", "", commandInWorkDir(workDir, command)))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -463,7 +463,7 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, commandInWorkDir(workDir, command))
+		respawnArgs = append(respawnArgs, scrubSecrets(env["GT_ROLE"], env["GT_ROOT"], commandInWorkDir(workDir, command)))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -3983,7 +3983,7 @@ func (t *Tmux) RespawnPane(pane, command string) error {
 		_, err := t.run("send-keys", "-t", pane, command, "Enter")
 		return err
 	}
-	_, err := t.run("respawn-pane", "-k", "-t", pane, command)
+	_, err := t.run("respawn-pane", "-k", "-t", pane, t.scrubForTarget(pane, command))
 	return err
 }
 
@@ -4008,7 +4008,7 @@ func (t *Tmux) RespawnPaneWithWorkDir(pane, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	args = append(args, commandInWorkDir(workDir, command))
+	args = append(args, t.scrubForTarget(pane, commandInWorkDir(workDir, command)))
 	_, err := t.run(args...)
 	return err
 }
