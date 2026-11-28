@@ -19,7 +19,7 @@ func TestIsolateLeavesNoWayToTheRunningServer(t *testing.T) {
 			t.Errorf("%s is still set", name)
 		}
 	}
-	if dir := os.Getenv("TMUX_TMPDIR"); !strings.Contains(filepath.Base(dir), "gt-tmux-") {
+	if dir := os.Getenv("TMUX_TMPDIR"); !strings.Contains(filepath.Base(dir), "gt-test-tmux-") {
 		t.Errorf("TMUX_TMPDIR is not a private directory")
 	}
 }
