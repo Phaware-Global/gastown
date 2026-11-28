@@ -30,8 +30,8 @@ const (
 //	os.Exit(done(m.Run()))
 //
 // It drops the variables that point at a live town or its tmux server, points
-// BEADS_DOLT_PORT at a dead port, and puts wrappers for bd and gt first on
-// PATH. A wrapper refuses a call that names port 3307, or that runs against the
+// GT_DOLT_PORT and BEADS_DOLT_PORT at a dead port, and puts wrappers for bd and
+// gt first on PATH. A wrapper refuses a call that names port 3307, or that runs against the
 // town or the source checkout (whose .beads redirects to the town's database),
 // and the returned function then fails the binary, even if the calling test
 // ignored the error. Tests that put their own stub first on PATH never reach
@@ -42,13 +42,16 @@ const (
 func Install() func(code int) int {
 	roots := protectedRoots()
 	for _, key := range []string{
-		"GT_TOWN_ROOT", "GT_ROOT", "GT_DOLT_PORT", "BEADS_DIR",
+		"GT_TOWN_ROOT", "GT_ROOT", "BEADS_DIR",
 		// A bare tmux client follows $TMUX onto the town's server, whose
 		// panes inherit the production environment.
 		"TMUX", "TMUX_PANE", "GT_TOWN_SOCKET",
 	} {
 		_ = os.Unsetenv(key)
 	}
+	// Unset, these fall back to the production port in code that connects
+	// without running bd or gt.
+	_ = os.Setenv("GT_DOLT_PORT", deadDoltPort)
 	_ = os.Setenv("BEADS_DOLT_PORT", deadDoltPort)
 	_ = os.Setenv("BEADS_DOLT_AUTO_START", "0")
 

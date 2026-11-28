@@ -99,6 +99,7 @@ func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
 }
 
 func TestGetServerAddr(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "") // expects the built-in default; connects to nothing
 	check := NewDoltServerReachableCheck()
 
 	tests := []struct {
