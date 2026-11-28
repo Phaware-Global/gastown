@@ -74,6 +74,7 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 	for _, e := range privilegeGuardEntries() {
 		shared[e.Matcher] = true
 	}
+	shared[reviewerExecMatcher] = true // likewise decides for itself
 	for _, entry := range rev.PreToolUse {
 		if shared[entry.Matcher] {
 			continue
@@ -261,4 +262,24 @@ func anyMatcherRegexMatches(entries []HookEntry, tool string) bool {
 		}
 	}
 	return false
+}
+
+// The reviewer-exec guard has to reach the reviewer without displacing the
+// guards every role runs on Bash calls.
+func TestReviewerRunsExecGuardAlongsideBaseBashGuards(t *testing.T) {
+	merged := MergeHooks(DefaultBase(), DefaultOverrides(), "gastown/reviewer")
+	commands := map[string]string{}
+	for _, entry := range merged.PreToolUse {
+		for _, h := range entry.Hooks {
+			commands[entry.Matcher] += h.Command + "\n"
+		}
+	}
+	for matcher, guard := range map[string]string{
+		reviewerExecMatcher: "tap guard reviewer-exec",
+		"Bash":              "tap guard memory-write",
+	} {
+		if !strings.Contains(commands[matcher], guard) {
+			t.Errorf("matcher %q does not run %q", matcher, guard)
+		}
+	}
 }
