@@ -54,7 +54,8 @@ var (
 
 	reviewerDonePR int
 
-	reviewerPassDir string
+	reviewerPassDir          string
+	reviewerConsolidateEdits string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -139,7 +140,7 @@ text, in characters:
       {"path": "internal/foo.go", "line": 42, "priority": "high",
        "perspective": "adversarial", "title": "nil deref",
        "body": "explanation with codegraph evidence",
-       "suggestion": "guard it"}
+       "suggestion": "guard it", "sources": ["adversarial:1"]}
     ]
   }`,
 	RunE: runReviewerPost,
@@ -211,7 +212,21 @@ var reviewerConsolidateCmd = &cobra.Command{
 
 Each input is a PerspectiveResult JSON object (perspective + verdict + findings),
 one per enabled perspective. Pass them as file arguments, or pipe a JSON array of
-them on stdin. The output is the findings JSON that 'gt reviewer post' consumes:
+them on stdin. Never edit a result: state your changes
+in --edits, addressing findings by raw id "perspective:N" (1-based):
+
+  {"drop":    [{"id": "security:1", "reason": "one line, required"}],
+   "merge":   [["security:2", "adversarial:1"]],
+   "reword":  [{"id": "security:2", "title": "...", "body": "..."}],
+   "note":    [{"id": "security:2", "text": "your own verification"}],
+   "reanchor":[{"id": "adversarial:2", "line": 40}],
+   "verdict": {"security": "shorter verdict"},
+   "drop_opportunity": ["security:1"]}
+
+Every consolidated finding names its raw ids. The review body lists each dropped
+finding with its reason, and labels reworded and added text as the reviewer's.
+
+The output is the findings JSON that 'gt reviewer post' consumes:
 
   - the summary lists every perspective's verdict (perspectives with no findings
     are still accounted for — never silent),
@@ -289,6 +304,8 @@ func init() {
 
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
 		"reviewed head SHA to record in the consolidated payload")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateEdits, "edits", "",
+		`JSON file of your changes to the raw findings (or "-" for stdin)`)
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
 		"merge-base the PR is diffed against; enables scope classification "+
 			"(findings outside the diff post as non-blocking)")
@@ -816,6 +833,23 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// on the heartbeat, so the record stays complete across the phase change.
 	touchReviewerPhase(reviewer.PhaseConsolidate)
 
+	if reviewerConsolidateEdits == "-" && len(args) == 0 {
+		return fmt.Errorf("--edits - needs result file arguments: stdin cannot carry both")
+	}
+	edits := &reviewer.Edits{}
+	rawEdits, err := readOptionalInput(reviewerConsolidateEdits)
+	if err != nil {
+		return fmt.Errorf("reading --edits: %w", err)
+	}
+	if rawEdits != "" {
+		if edits, err = reviewer.ParseEdits([]byte(rawEdits)); err != nil {
+			return err
+		}
+	}
+	if base := strings.TrimSpace(reviewerConsolidateBaseSHA); base != "" {
+		edits.BaseSHA = base
+	}
+
 	var results []reviewer.PerspectiveResult
 
 	if len(args) == 0 {
@@ -865,9 +899,16 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// ScopeUnknown and changes nothing. Scope filtering must never be able to
 	// silently downgrade a review just because git was unavailable — a missing
 	// manifest is missing evidence, not evidence of good scope.
-	manifest := buildDiffManifest(resolveConsolidateBaseSHA(), reviewerConsolidateSHA)
+	base := edits.BaseSHA
+	if base == "" {
+		base = resolveConsolidateBaseSHA()
+	}
+	manifest := buildDiffManifest(base, reviewerConsolidateSHA)
 
-	fs := reviewer.Consolidate(results, reviewerConsolidateSHA, manifest)
+	fs, err := reviewer.ConsolidateWithEdits(results, edits, reviewerConsolidateSHA, manifest)
+	if err != nil {
+		return err
+	}
 
 	// Report the event on STDERR, before the --out branch, so every invocation
 	// gets it. Posting is irreversible and the Reviewer cannot clear its own
@@ -901,6 +942,11 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encoding consolidated findings: %w", err)
 	}
 	encoded = append(encoded, '\n')
+	// 'post' enforces the finding budgets, and the payload cannot be hand-edited,
+	// so an overrun has to surface here.
+	if _, err := reviewer.ParseFindings(encoded); err != nil {
+		return fmt.Errorf("%w\n\nDrop or reword the finding in --edits and re-run consolidate; nothing was written", err)
+	}
 
 	if reviewerConsolidateOut != "" {
 		if err := os.WriteFile(reviewerConsolidateOut, encoded, 0o644); err != nil { //nolint:gosec // operator-facing output

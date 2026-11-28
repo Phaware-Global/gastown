@@ -215,7 +215,7 @@ gt reviewer prompt adversarial --pr <N> --sha <head-sha> --round 1 > prompt-adve
 gt reviewer prompt security    --pr <N> --sha <head-sha> --round 1 > prompt-security.txt
 #   → launch one subagent per prompt IN PARALLEL; each returns a PerspectiveResult JSON
 #     saved to perspective-<name>.json
-gt reviewer consolidate perspective-*.json --sha <head-sha> --out findings.json
+gt reviewer consolidate perspective-*.json --sha <head-sha> [--edits edits.json] --out findings.json
 # Findings outside the PR diff are demoted to non-blocking. The diff base is
 # derived automatically; --base-sha <merge-base> overrides it.
 gt reviewer post --pr <N> --findings findings.json # the ONLY sanctioned posting path
@@ -248,6 +248,12 @@ PR, commit, prompt and result hashes, start and end times) to
 `<rig>/reviewer/passes/pr<N>/`. A failed pass leaves neither. The review
 sequence above does not depend on this command, and nothing checks the receipts.
 
+The coordinator never edits raw results. Changes go in `consolidate --edits
+<file>` (`gt reviewer consolidate --help` shows the shape): drop with a reason,
+merge, reword, add a note, re-anchor, shorten a verdict, drop an opportunity.
+Every consolidated finding names its raw ids. The body lists dropped findings
+with reasons, and labels reworded and added text as the reviewer's.
+
 ### Findings JSON shape (consumed by `gt reviewer post`)
 
 ```json
@@ -260,7 +266,8 @@ sequence above does not depend on this command, and nothing checks the receipts.
       "priority": "high", "perspective": "adversarial",
       "title": "one-line summary",
       "body": "explanation with codegraph evidence",
-      "suggestion": "concrete change"
+      "suggestion": "concrete change",
+      "sources": ["adversarial:1"]
     }
   ]
 }
