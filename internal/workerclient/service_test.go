@@ -829,6 +829,43 @@ func TestSessionOpen_UnsafeDefaultBranchNameIsLeftAlone(t *testing.T) {
 	assert.Equal(t, "origin/"+branch, git(t, worktree, "rev-parse", "--abbrev-ref", "@{upstream}"))
 }
 
+// TestProvision_NewBranchReplacesTheLiveSession: the session id names the
+// polecat, so a polecat started on its next bead finds its previous session
+// still live here. Provisioning it for another branch must give it a worktree
+// on that branch; provisioning it again for the same one must not re-clone.
+func TestProvision_NewBranchReplacesTheLiveSession(t *testing.T) {
+	const first, second = "polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa/gt-def34@mv3cxv4u"
+	proxyURL, ca, townRoot := startProxy(t)
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	git(t, rigRepo, "branch", first, "HEAD")
+	git(t, rigRepo, "branch", second, "HEAD")
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+
+	spec := polecatSpec()
+	spec.Branch = first
+	ep, err := b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Teardown(context.Background(), ep) })
+	eps, err := b.Discover(context.Background(), execution.IdentityTags{})
+	require.NoError(t, err)
+	require.Len(t, eps, 1)
+
+	// Same branch: the live session and its uncommitted work are kept.
+	scratch := filepath.Join(worktree, "uncommitted.txt")
+	require.NoError(t, os.WriteFile(scratch, []byte("wip\n"), 0644))
+	_, err = b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	assert.FileExists(t, scratch, "a reattach must not replace the worktree")
+
+	spec.Branch = second
+	_, err = b.Provision(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Equal(t, second, git(t, worktree, "rev-parse", "--abbrev-ref", "HEAD"))
+	assert.NoFileExists(t, scratch, "the new session must start from a fresh clone")
+}
+
 func TestValidBranch(t *testing.T) {
 	for _, ok := range []string{"polecat/furiosa/gt-abc12@mv3cxv4t", "polecat/furiosa-mv3cxv4t", "main"} {
 		assert.True(t, validBranch(ok), "%q must be accepted", ok)

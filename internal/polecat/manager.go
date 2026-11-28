@@ -3578,7 +3578,7 @@ func (m *Manager) probeLocalStaleness(name, clonePath, defaultBranch string) *St
 	polecatGit := git.NewGit(clonePath)
 	info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
 
-	// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
+	// Check for uncommitted work (excluding .beads/ and files Gas Town provisions itself)
 	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(clonePath)
 	return info
 }
@@ -3625,9 +3625,11 @@ func worktreeMissing(clonePath string) bool {
 	return errors.Is(err, fs.ErrNotExist)
 }
 
-// probeUncommittedWork reports whether the worktree at clonePath has uncommitted work
-// (excluding .beads/ files). A failed git probe is returned as probeErr rather than
-// read as a clean tree.
+// probeUncommittedWork reports whether the worktree at clonePath has uncommitted work:
+// a stash, unpushed commits, unmerged files, any changed tracked file outside
+// .beads/, or any untracked file Gas Town did not put there itself (see
+// isProvisionedPath). A failed git probe is returned as probeErr rather than read as
+// a clean tree.
 func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	if worktreeMissing(clonePath) {
 		return false, ""
@@ -3636,7 +3638,38 @@ func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	if err != nil {
 		return false, fmt.Sprintf("checking uncommitted work: %v", err)
 	}
+	var work []string
+	for _, f := range status.UntrackedFiles {
+		if !isProvisionedPath(f) {
+			work = append(work, f)
+		}
+	}
+	status.UntrackedFiles = work
 	return !status.CleanExcludingBeads(), ""
+}
+
+// isProvisionedPath reports whether an untracked path (relative to the worktree
+// root) is one Gas Town writes into every polecat worktree: .runtime/, the root
+// CLAUDE.local.md, and the slash commands it provisions under .claude/commands/. In
+// a repository that does not git-ignore them they stay untracked forever; counting
+// them as work left every polecat of such a rig unreclaimable and the rig pinned at
+// its directory cap. The list is deliberately narrower than gt done's
+// runtime-artifact policy: that one decides what not to commit, this one decides
+// what may be deleted with the worktree, so anything else under .claude/, coverage/
+// and the like still counts as work.
+func isProvisionedPath(path string) bool {
+	path = filepath.ToSlash(path)
+	if path == "CLAUDE.local.md" || strings.HasPrefix(path, ".runtime/") {
+		return true
+	}
+	if name, ok := strings.CutPrefix(path, ".claude/commands/"); ok {
+		for _, cmd := range templates.CommandNames() {
+			if name == cmd+".md" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ErrNoLongerStale means a polecat chosen for cleanup was re-dispatched (or stopped
@@ -3694,15 +3727,27 @@ func (m *Manager) reassessLocked(prev *StalenessInfo, threshold int) (*Staleness
 
 // applyRedispatchCheck clears info's staleness when p has been re-dispatched since
 // the prev snapshot. Reuse writes agent_state=spawning under the per-polecat lock,
-// but the hook bead that moves p.State/p.Issue lands later, outside it, so an active
-// agent state is the only signal a completed reuse leaves in that gap.
+// but the hook bead that moves p.State/p.Issue lands later, outside it, so the agent
+// state is the only signal a completed reuse leaves in that gap.
+//
+// An active agent state counts as that signal only if it is "spawning", differs
+// from the state seen at detection, or the polecat still has work hooked. A session
+// that died without updating its bead leaves agent_state=working behind for good; it
+// read "working" at detection too, and the polecat still has no session, so nothing
+// has re-dispatched it. Treating that leftover as a reuse made every such polecat
+// permanently unreclaimable. With an issue still hooked, though, the polecat is a
+// stalled worker the witness will restart, and nuking it would burn that issue's
+// molecule, so it stays protected.
 func applyRedispatchCheck(info *StalenessInfo, p *Polecat, prev *StalenessInfo) {
 	if !info.IsStale {
 		return
 	}
-	if p.State == StateWorking || p.Issue != prev.HookedIssue || beads.AgentState(info.AgentState).IsActive() {
+	state := beads.AgentState(info.AgentState)
+	reused := state == beads.AgentStateSpawning ||
+		(state.IsActive() && (info.AgentState != prev.AgentState || p.Issue != ""))
+	if p.State == StateWorking || p.Issue != prev.HookedIssue || reused {
 		info.IsStale = false
-		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q, agent_state=%q)", p.State, p.Issue, prev.HookedIssue, info.AgentState)
+		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q, agent_state=%q, was %q)", p.State, p.Issue, prev.HookedIssue, info.AgentState, prev.AgentState)
 	}
 }
 

@@ -3706,7 +3706,7 @@ const capReliefStopGrace = 60 * time.Second
 
 // runCapReliefCleanup reaps via `gt polecat stale --cleanup`. It reaps only polecats
 // assessStaleness deems stale: session-less AND not paused (protected agent states)
-// AND with no uncommitted or unpushed work (CleanExcludingBeads counts unpushed
+// AND with no uncommitted or unpushed work (probeUncommittedWork counts unpushed
 // commits), and nukePolecatFull does a best-effort push and preserves the remote
 // branch for the refinery. So no unpushed work is lost; a fully-pushed idle polecat
 // is reclaimed even if it has an open MR (the MR branch survives on the remote).
@@ -3742,7 +3742,33 @@ func (d *Daemon) runCapReliefCleanup(parent context.Context, rigName string) {
 		d.logger.Printf("Warning: cap-relief cleanup for rig %s failed: %v\n%s", rigName, err, msg)
 		return
 	}
-	d.logger.Printf("Cap-relief cleanup for rig %s finished", rigName)
+	d.logger.Printf("Cap-relief cleanup for rig %s finished: %s", rigName, capReliefOutcome(string(out)))
+}
+
+// capReliefOutcomeTailBytes caps how much of a long cleanup outcome is logged after
+// its Summary line.
+const capReliefOutcomeTailBytes = 1800
+
+// capReliefOutcome extracts what a successful `gt polecat stale --cleanup` did: its
+// "Summary:" line and everything after it (each nuke, skip and failure), without the
+// per-polecat listing above. A cleanup exits 0 even when every nuke is skipped or
+// fails, so without this a rig that never gets relief logs only "finished". A long
+// outcome keeps the Summary line and the tail, cut at a line start, because the
+// final "Nuked N" tally is printed last.
+func capReliefOutcome(out string) string {
+	out = strings.TrimSpace(out)
+	if i := strings.LastIndex(out, "\nSummary:"); i >= 0 {
+		out = out[i+1:]
+	}
+	summary, rest, _ := strings.Cut(out, "\n")
+	if len(rest) <= capReliefOutcomeTailBytes {
+		return out
+	}
+	tail := rest[len(rest)-capReliefOutcomeTailBytes:]
+	if i := strings.Index(tail, "\n"); i >= 0 {
+		tail = tail[i+1:]
+	}
+	return fmt.Sprintf("%s\n... (%d bytes elided)\n%s", summary, len(rest)-len(tail), tail)
 }
 
 // resolveRigPolecatCap returns the effective polecat-directory cap for a rig

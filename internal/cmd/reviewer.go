@@ -53,6 +53,8 @@ var (
 	reviewerConsolidateOut     string
 
 	reviewerDonePR int
+
+	reviewerPassDir string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -195,9 +197,9 @@ codegraph tooling, the evidence standard, and the exact output JSON schema. The
 perspective markdown supplies only the lens; this command supplies the rest, so
 no part of the procedure is left to per-agent interpretation.
 
-The reviewer role generates one prompt per enabled perspective and hands each to
-a subagent, which reviews from that prompt alone and returns a PerspectiveResult
-JSON object. The prompt is written to stdout.`,
+'gt reviewer run' executes this same prompt for each enabled perspective; this
+command only prints it.
+The prompt is written to stdout.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runReviewerPrompt,
 }
@@ -297,6 +299,20 @@ func init() {
 		"the PR just reviewed; clears the heartbeat only if it records that review "+
 			"(omit to clear unconditionally)")
 
+	reviewerRunCmd.Flags().IntVar(&reviewerPromptPR, "pr", 0, "PR number under review (required)")
+	reviewerRunCmd.Flags().StringVar(&reviewerPromptSHA, "sha", "", "exact head SHA to review (required)")
+	reviewerRunCmd.Flags().IntVar(&reviewerPromptRound, "round", 1, "review round (>=2 is a fix round)")
+	reviewerRunCmd.Flags().StringVar(&reviewerPromptPriorThreads, "prior-threads", "",
+		"file of prior-round thread context; only used when round >= 2")
+	reviewerRunCmd.Flags().StringVar(&reviewerPromptInstructions, "instructions", "",
+		"file of extra execution instructions (recorded in the receipt)")
+	reviewerRunCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0, "per-pass finding cap")
+	reviewerRunCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0, "soft wall-clock budget per pass")
+	reviewerRunCmd.Flags().StringVar(&reviewerPassDir, "dir", "", "pass directory (default: <rig>/reviewer/passes/pr<N>)")
+	_ = reviewerRunCmd.MarkFlagRequired("pr")
+	_ = reviewerRunCmd.MarkFlagRequired("sha")
+
+	reviewerCmd.AddCommand(reviewerRunCmd)
 	reviewerCmd.AddCommand(reviewerPostCmd)
 	reviewerCmd.AddCommand(reviewerCheckoutCmd)
 	reviewerCmd.AddCommand(reviewerPerspectivesCmd)
@@ -694,11 +710,6 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	// still leaves evidence that the review reached the prompt phase.
 	touchReviewerPhase(reviewer.PhasePrompt)
 
-	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
-	if err != nil {
-		return err
-	}
-
 	// stdin can only be consumed once, so both inputs cannot read from it.
 	if reviewerPromptPriorThreads == "-" && reviewerPromptInstructions == "-" {
 		return fmt.Errorf("--prior-threads and --instructions cannot both read from stdin (\"-\")")
@@ -712,6 +723,24 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("reading --instructions: %w", err)
 	}
 
+	out, err := buildReviewerPassPrompt(townRoot, rigName, rigPath, reviewCfg, perspective,
+		resolveReviewBaseSHA(reviewerPromptPR, reviewerPromptSHA), priorThreads, extra)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+// buildReviewerPassPrompt renders one perspective's prompt from the
+// reviewerPrompt* flags and the already-read inputs.
+func buildReviewerPassPrompt(townRoot, rigName, rigPath string, reviewCfg *config.ReviewConfig,
+	perspective, baseSHA, priorThreads, extra string) (string, error) {
+	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
+	if err != nil {
+		return "", err
+	}
+
 	maxFindings := reviewerPromptMaxFindings
 	if maxFindings <= 0 && reviewCfg != nil {
 		// GetMaxFindingsPerPerspective is itself nil-safe; the explicit guard
@@ -719,24 +748,19 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		maxFindings = reviewCfg.GetMaxFindingsPerPerspective()
 	}
 
-	out, err := reviewer.BuildPerspectivePrompt(reviewer.PromptParams{
+	return reviewer.BuildPerspectivePrompt(reviewer.PromptParams{
 		Perspective:       rp.Name,
 		Lens:              rp.Content,
 		RigName:           rigName,
 		PR:                reviewerPromptPR,
 		SHA:               reviewerPromptSHA,
-		BaseSHA:           resolveReviewBaseSHA(reviewerPromptPR, reviewerPromptSHA),
+		BaseSHA:           baseSHA,
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
 		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
-	if err != nil {
-		return err
-	}
-	fmt.Print(out)
-	return nil
 }
 
 // resolveReviewBaseSHA computes the pinned diff base for a review pass: the

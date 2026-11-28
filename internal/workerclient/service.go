@@ -461,6 +461,7 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 		summary: sockproto.SessionSummary{
 			Session: m.Session, Rig: m.Rig, Polecat: m.Polecat,
 			State: "starting", StartedAt: time.Now().UTC(),
+			Branch: m.Branch,
 		},
 		certCh:    make(chan *sockproto.Message, 1),
 		done:      make(chan struct{}),

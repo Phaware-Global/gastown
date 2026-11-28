@@ -3,6 +3,7 @@ package git
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/constants"
@@ -68,18 +69,16 @@ func (g *Git) RemoteWorkBranches() ([]string, error) {
 	return branches, nil
 }
 
-// hooksDisabledEnv makes git run no client-side hook. It is used wherever the
-// host publishes commits written on another machine: the repository's hooks
-// path may resolve inside a worktree, and no hook may run on their account.
-var hooksDisabledEnv = []string{
-	"GIT_CONFIG_COUNT=1",
-	"GIT_CONFIG_KEY_0=core.hooksPath",
-	"GIT_CONFIG_VALUE_0=/dev/null",
-}
-
-// HooksDisabledEnv returns the environment that disables client-side hooks.
+// HooksDisabledEnv returns the environment that disables client-side hooks, as
+// KEY=value entries. The host publishes commits written on another machine
+// under it: the repository's hooks path may resolve inside a worktree, and no
+// hook may run on their account.
 func HooksDisabledEnv() []string {
-	return append([]string(nil), hooksDisabledEnv...)
+	var env []string
+	for k, v := range constants.GitHooksPathEnv(constants.NoHooksPath, os.Getenv) {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 // PublishRemoteWork pushes tip, a commit of the work ref for branch, to remote
@@ -96,7 +95,7 @@ func (g *Git) PublishRemoteWork(branch, tip, remote string) error {
 	if tip == "" {
 		return fmt.Errorf("publishing remote work for %s: no commit given", branch)
 	}
-	return g.PushWithEnv(remote, tip+":refs/heads/"+branch, false, hooksDisabledEnv)
+	return g.PushWithEnv(remote, tip+":refs/heads/"+branch, false, HooksDisabledEnv())
 }
 
 // withRemoteWork folds unpublished remote work for branch into a preservation

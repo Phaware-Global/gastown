@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/githooks"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
@@ -167,6 +168,12 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Ensure runtime settings exist in the shared refinery parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 	townRoot := filepath.Dir(m.rig.Path)
+
+	// Fail here, with the reason, rather than start a session in which git is
+	// disabled.
+	if _, err := githooks.Install(townRoot); err != nil {
+		return err
+	}
 
 	// Resolve CLAUDE_CONFIG_DIR from accounts.json so refinery sessions
 	// use the correct account. Mirrors the daemon restart path (lifecycle.go).

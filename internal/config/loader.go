@@ -1626,12 +1626,23 @@ func isClaudeAgent(rc *RuntimeConfig) bool {
 // settings directory differs from the session working directory. Claude Code
 // resolves project-level settings from its working directory only; the --settings
 // flag tells it where to find them when they live in a parent directory.
+// Roles that run in a PR checkout also get the isolation flags.
 func withRoleSettingsFlag(rc *RuntimeConfig, role, rigPath string) *RuntimeConfig {
 	if rc == nil || rigPath == "" {
 		return rc
 	}
 
 	if !isClaudeAgent(rc) {
+		return rc
+	}
+
+	settingsFile := RoleSettingsFile(rc, role, rigPath)
+	if settingsFile == "" {
+		return rc
+	}
+
+	if runsInPRCheckout(role) {
+		rc.Args = addCheckoutIsolationFlags(rc.Args, settingsFile)
 		return rc
 	}
 
@@ -1642,14 +1653,21 @@ func withRoleSettingsFlag(rc *RuntimeConfig, role, rigPath string) *RuntimeConfi
 		}
 	}
 
+	rc.Args = append(rc.Args, "--settings", settingsFile)
+	return rc
+}
+
+// RoleSettingsFile returns the settings file a role's session is launched with,
+// or "" for roles that load it from their working directory.
+func RoleSettingsFile(rc *RuntimeConfig, role, rigPath string) string {
 	settingsDir := RoleSettingsDir(role, rigPath)
 	if settingsDir == "" {
-		return rc
+		return ""
 	}
 
 	hooksDir := ".claude"
 	settingsFile := "settings.json"
-	if rc.Hooks != nil {
+	if rc != nil && rc.Hooks != nil {
 		if rc.Hooks.Dir != "" {
 			hooksDir = rc.Hooks.Dir
 		}
@@ -1658,8 +1676,7 @@ func withRoleSettingsFlag(rc *RuntimeConfig, role, rigPath string) *RuntimeConfi
 		}
 	}
 
-	rc.Args = append(rc.Args, "--settings", filepath.Join(settingsDir, hooksDir, settingsFile))
-	return rc
+	return filepath.Join(settingsDir, hooksDir, settingsFile)
 }
 
 // RoleSettingsDir returns the shared settings directory for roles whose session
@@ -1667,7 +1684,7 @@ func withRoleSettingsFlag(rc *RuntimeConfig, role, rigPath string) *RuntimeConfi
 // roles where settings and session directory are the same (mayor, deacon).
 func RoleSettingsDir(role, rigPath string) string {
 	switch role {
-	case constants.RoleCrew, constants.RoleWitness, constants.RoleRefinery:
+	case constants.RoleCrew, constants.RoleWitness, constants.RoleRefinery, constants.RoleReviewer:
 		return filepath.Join(rigPath, role)
 	case constants.RolePolecat:
 		return filepath.Join(rigPath, "polecats")
@@ -2715,6 +2732,15 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	}
 
 	SanitizeAgentEnv(resolvedEnv, envVars)
+
+	if runsInPRCheckout(role) {
+		if rigPath == "" {
+			return "", fmt.Errorf("refusing to start in a PR checkout: no rig path to locate the %s settings", role)
+		}
+		if err := verifyCheckoutIsolation(rc, resolvedEnv, RoleSettingsFile(rc, role, rigPath)); err != nil {
+			return "", err
+		}
+	}
 
 	var cmd string
 	if runtime.GOOS == "windows" {

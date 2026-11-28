@@ -61,7 +61,7 @@ to post comments and address them all before submitting to the merge queue.
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work-monorepo"
-version = 2
+version = 3
 
 [[steps]]
 id = "load-context"
@@ -548,6 +548,9 @@ If build_command is set: run {{build_command}}
 If typecheck_command is set: run {{typecheck_command}}
 If lint_command is set: run {{lint_command}}
 If test_command is set: run {{test_command}}
+
+If the test command is a whole-repository Go run (such as `go test ./...`), limit
+package parallelism: run `go test -p 2 ./...` with the configured flags.
 
 Skip any empty/unconfigured commands silently.
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/templates"
 )
 
 // A failed probe means staleness is unknown. Treating it as "clean tree, no agent
@@ -44,21 +45,35 @@ func TestAssessStaleness_NoProbeErrorStillStale(t *testing.T) {
 func TestApplyRedispatchCheck(t *testing.T) {
 	tests := []struct {
 		name      string
+		prevAgent string
 		agent     string
 		p         Polecat
 		wantStale bool
 	}{
-		{"reused, hook not yet landed", "spawning", Polecat{State: StateIdle}, false},
-		{"working agent state", "working", Polecat{State: StateIdle}, false},
-		{"hooked to a different issue", "idle", Polecat{State: StateIdle, Issue: "gt-new"}, false},
-		{"state working", "idle", Polecat{State: StateWorking}, false},
-		{"still idle and unchanged", "idle", Polecat{State: StateIdle}, true},
-		{"no agent bead", "", Polecat{State: StateIdle}, true},
+		// A crashed session with its issue still hooked is the witness's to restart.
+		{"stalled with work still hooked", "working", "working", Polecat{State: StateStalled, Issue: "gt-x"}, false},
+		{"reused, hook not yet landed", "idle", "spawning", Polecat{State: StateIdle}, false},
+		{"became working since detection", "idle", "working", Polecat{State: StateIdle}, false},
+		{"hooked to a different issue", "idle", "idle", Polecat{State: StateIdle, Issue: "gt-new"}, false},
+		{"state working", "idle", "idle", Polecat{State: StateWorking}, false},
+		{"still idle and unchanged", "idle", "idle", Polecat{State: StateIdle}, true},
+		{"no agent bead", "", "", Polecat{State: StateIdle}, true},
+		// A dead session leaves agent_state=working behind; it is not a reuse.
+		{"working left behind by a dead session", "working", "working", Polecat{State: StateIdle}, true},
+		{"running left behind by a dead session", "running", "running", Polecat{State: StateIdle}, true},
+		// Reuse writes spawning before anything else changes, so it always protects,
+		// even when the stale leftover state was already spawning.
+		{"leftover working, then reused", "working", "spawning", Polecat{State: StateIdle}, false},
+		{"spawning at detection and now", "spawning", "spawning", Polecat{State: StateIdle}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			info := &StalenessInfo{Name: "p1", AgentState: tt.agent, IsStale: true, Reason: "stale"}
-			applyRedispatchCheck(info, &tt.p, &StalenessInfo{Name: "p1"})
+			prev := &StalenessInfo{Name: "p1", AgentState: tt.prevAgent}
+			if tt.p.State == StateStalled {
+				prev.HookedIssue = tt.p.Issue // same issue as at detection
+			}
+			applyRedispatchCheck(info, &tt.p, prev)
 			if info.IsStale != tt.wantStale {
 				t.Errorf("IsStale = %v, want %v (reason %q)", info.IsStale, tt.wantStale, info.Reason)
 			}
@@ -106,6 +121,65 @@ func TestProbeUncommittedWork_RealRepo(t *testing.T) {
 	}
 	if has, probeErr := probeUncommittedWork(dir); !has || probeErr != "" {
 		t.Fatalf("dirty repo = (%v, %q), want (true, \"\")", has, probeErr)
+	}
+}
+
+// Gas Town writes these into every polecat worktree. In a repo that does not ignore
+// them they are untracked forever, so counting them as work made every polecat of the
+// rig unreclaimable and left the rig pinned at its directory cap.
+func TestProbeUncommittedWork_IgnoresProvisionedFilesOnly(t *testing.T) {
+	newRepo := func(t *testing.T) string {
+		dir := t.TempDir()
+		write := func(rel string) {
+			path := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("testdata/fixture.db")
+		for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "i"}} {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+		for _, f := range []string{".beads/x.jsonl", ".runtime/session_id", ".claude/commands/" + templates.CommandNames()[0] + ".md", "CLAUDE.local.md"} {
+			write(f)
+		}
+		return dir
+	}
+
+	if has, probeErr := probeUncommittedWork(newRepo(t)); has || probeErr != "" {
+		t.Fatalf("provisioned files only = (%v, %q), want (false, \"\")", has, probeErr)
+	}
+
+	// Real work must still protect the polecat, including under paths gt done's
+	// broader runtime-artifact list would skip.
+	for _, rel := range []string{
+		"notes.txt",
+		".claude/skills/new/SKILL.md",
+		".claude/commands/my-own-command.md",
+		"internal/coverage/report.go",
+		"docs/CLAUDE.local.md",
+		"testdata/fixture.db", // tracked file, modified
+	} {
+		t.Run(rel, func(t *testing.T) {
+			dir := newRepo(t)
+			path := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if has, probeErr := probeUncommittedWork(dir); !has || probeErr != "" {
+				t.Fatalf("with %s = (%v, %q), want (true, \"\")", rel, has, probeErr)
+			}
+		})
 	}
 }
 
